@@ -1,0 +1,7 @@
+fqdn,strong_account,group,policy_name,policy_suffix,assign_groups,domain,description,protocol,ssh_username,domain_joined
+web01.corp.example.com,,SIA-Web-Admins,,,,,,,,
+web01.corp.example.com,,SIA-Platform-Ops,,-ops,Remote Desktop Users,,,,,
+web02.corp.example.com,,SIA-Web-Admins,,,,,,,,
+dmz-app01.dmz.example.com,SA-dmz-localadmin,SIA-DMZ-Admins,SIA-RDP-dmz-app01-custom,,,dmz.example.com,DMZ app server,rdp,,no
+fs01.corp.example.com,SA-corp-domain,SIA-Web-Admins,,,,,File server (shared domain strong account),,,
+app-lnx01.corp.example.com,,SIA-Linux-Admins,,,,,Linux app server,ssh,ec2-user,

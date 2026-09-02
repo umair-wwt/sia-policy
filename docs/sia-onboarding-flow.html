@@ -1,0 +1,279 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>SIA Onboarding Flow</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wght@500;600;700&family=Source+Sans+3:ital,wght@0,400;0,600;1,400&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+  :root {
+    --bg: #F4F6F9;
+    --surface: #FFFFFF;
+    --ink: #1A2333;
+    --muted: #5A6577;
+    --line: #D5DBE4;
+    --accent: #1F4E8C;
+    --accent-soft: #E6EEF9;
+    --code-bg: #EDF1F6;
+    --ok: #1E7F4F;
+    --warn: #A65E0A;
+    --bad: #B42318;
+    --panel: #14345B;
+    --panel-line: #D9E4F5;
+    --panel-muted: #A9BDDB;
+    --panel-mark: #F2B84B;
+    --display: "Archivo", "Helvetica Neue", Arial, sans-serif;
+    --body: "Source Sans 3", "Segoe UI", system-ui, sans-serif;
+    --mono: "IBM Plex Mono", "SFMono-Regular", Menlo, Consolas, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #10161F; --surface: #171E2A; --ink: #E5EAF2; --muted: #9AA6B8; --line: #2A3444;
+      --accent: #8AB0E8; --accent-soft: #1C2A3E; --code-bg: #1F2939;
+      --ok: #4CC38A; --warn: #E3A64B; --bad: #F0776B; --panel: #0F2A4B;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #10161F; --surface: #171E2A; --ink: #E5EAF2; --muted: #9AA6B8; --line: #2A3444;
+    --accent: #8AB0E8; --accent-soft: #1C2A3E; --code-bg: #1F2939;
+    --ok: #4CC38A; --warn: #E3A64B; --bad: #F0776B; --panel: #0F2A4B;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink); font-family: var(--body); font-size: 17px; line-height: 1.55; }
+  main { max-width: 860px; margin: 0 auto; padding: 48px 24px 96px; }
+  .eyebrow { font-family: var(--mono); font-size: 12px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); }
+  h1 { font-family: var(--display); font-weight: 700; font-size: clamp(34px, 5vw, 46px); line-height: 1.08; letter-spacing: -0.015em; margin: 10px 0 18px; text-wrap: balance; }
+  h2 { font-family: var(--display); font-weight: 600; font-size: 24px; line-height: 1.2; margin: 56px 0 14px; letter-spacing: -0.01em; text-wrap: balance; }
+  h3 { font-family: var(--display); font-weight: 600; font-size: 17px; margin: 22px 0 6px; }
+  p, li { max-width: 68ch; }
+  p { margin: 0 0 14px; }
+  .lede { font-size: 21px; line-height: 1.45; color: var(--ink); max-width: 62ch; }
+  .lede strong { font-weight: 600; }
+  code, .mono { font-family: var(--mono); font-size: 0.88em; }
+  code { background: var(--code-bg); padding: 1px 6px; border-radius: 4px; }
+  pre { background: var(--code-bg); padding: 16px 18px; border-radius: 6px; overflow-x: auto; font-family: var(--mono); font-size: 14px; line-height: 1.6; margin: 0 0 14px; }
+  pre code { background: none; padding: 0; font-size: inherit; }
+  .comment { color: var(--muted); }
+  figure { margin: 22px 0 8px; }
+  .panel { background: var(--panel); color: var(--panel-line); border-radius: 10px; padding: 18px 18px 12px; overflow-x: auto; border: 1px solid var(--line); }
+  .panel svg { display: block; min-width: 720px; width: 100%; height: auto; }
+  figcaption { font-size: 15px; color: var(--muted); margin-top: 10px; max-width: 68ch; }
+  .objects { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px; margin: 20px 0 8px; }
+  .object { background: var(--surface); border: 1px solid var(--line); border-top: 3px solid var(--panel-mark); border-radius: 6px; padding: 14px 16px; }
+  .object h3 { margin: 0 0 6px; font-size: 16px; }
+  .object p { font-size: 15px; margin: 0; color: var(--muted); }
+  .object .mono { color: var(--ink); font-size: 13px; display: block; margin-top: 8px; word-break: break-all; }
+  ol.steps { list-style: none; counter-reset: step; padding: 0; margin: 18px 0; display: grid; gap: 12px; }
+  ol.steps li { max-width: none; counter-increment: step; display: grid; grid-template-columns: 44px 1fr; gap: 14px; background: var(--surface); border: 1px solid var(--line); border-radius: 6px; padding: 14px 16px; }
+  ol.steps li::before { content: counter(step); font-family: var(--display); font-weight: 700; font-size: 22px; color: var(--accent); line-height: 1; padding-top: 2px; }
+  ol.steps .title { font-family: var(--display); font-weight: 600; font-size: 17px; margin: 0 0 4px; }
+  ol.steps p { font-size: 16px; margin: 0; }
+  ol.steps .aside { font-size: 14px; color: var(--muted); margin-top: 6px; }
+  table { border-collapse: collapse; width: 100%; font-size: 15.5px; margin: 16px 0 8px; background: var(--surface); border: 1px solid var(--line); border-radius: 6px; overflow: hidden; }
+  th, td { text-align: left; padding: 10px 12px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { font-family: var(--display); font-weight: 600; font-size: 14px; background: var(--accent-soft); }
+  tr:last-child td { border-bottom: none; }
+  .table-wrap { overflow-x: auto; }
+  .status { font-family: var(--mono); font-size: 13px; font-weight: 500; padding: 2px 8px; border-radius: 4px; white-space: nowrap; }
+  .s-ok { color: var(--ok); background: color-mix(in srgb, var(--ok) 12%, transparent); }
+  .s-muted { color: var(--muted); background: var(--code-bg); }
+  .s-warn { color: var(--warn); background: color-mix(in srgb, var(--warn) 14%, transparent); }
+  .s-bad { color: var(--bad); background: color-mix(in srgb, var(--bad) 12%, transparent); }
+  ul.plain { padding-left: 20px; margin: 10px 0; }
+  ul.plain li { margin: 6px 0; }
+  .callout { border-left: 3px solid var(--accent); background: var(--accent-soft); padding: 12px 16px; border-radius: 0 6px 6px 0; margin: 18px 0; }
+  .callout p { margin: 0; font-size: 16px; }
+  .chip { display: inline-block; font-family: var(--mono); font-size: 12.5px; border: 1px solid var(--panel-mark); color: var(--ink); padding: 1px 8px; border-radius: 999px; background: color-mix(in srgb, var(--panel-mark) 18%, transparent); }
+  dl.faq { margin: 16px 0 0; display: grid; gap: 14px; }
+  dl.faq dt { font-family: var(--display); font-weight: 600; font-size: 17px; }
+  dl.faq dd { margin: 4px 0 0; max-width: 68ch; }
+  footer { margin-top: 64px; padding-top: 18px; border-top: 1px solid var(--line); font-size: 14px; color: var(--muted); }
+  @media (max-width: 720px) { .objects { grid-template-columns: 1fr; } body { font-size: 16px; } }
+  @media (prefers-reduced-motion: no-preference) { a { transition: color .15s ease; } }
+  a { color: var(--accent); }
+  a:focus-visible, :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+</style>
+</head>
+<body>
+
+<main>
+  <div class="eyebrow">sia-policy-automation · briefing for CyberArk / Idira engineers</div>
+  <h1>SIA Onboarding Flow</h1>
+  <p class="lede">One set of objects <strong>per server</strong>, created from a spreadsheet: for every Windows server its own strong account (its local administrator, referenced from the Vault), its own target set, and an access policy <strong>named after the server</strong> for the Identity group that may use it — a second row gives a second group its own policy. For Linux servers only the policy (SIA uses an SSH certificate there). Run it again and it changes nothing; change a list and it shows you the difference before touching anything; stop it half-way and it resumes.</p>
+
+  <h2>The one idea to get first</h2>
+  <p>In SIA, the strong account is <em>not</em> a setting on the policy. Three separate objects do the work, and the server's <strong>FQDN is the key that joins them</strong> at connection time. The tool creates the three amber objects below, one set per server; everything dashed must already exist (the local admin account in the Vault can be onboarded by the optional <code>vault</code> stage).</p>
+
+  <figure>
+    <div class="panel">
+      <svg viewBox="0 0 900 400" role="img" aria-label="Schematic: an Identity group is granted RDP to a server by an access policy; the policy's FQDN rule names a target set of the same name, which points at a strong account that is vaulted in PAM Self-Hosted; the connector uses that strong account to create an ephemeral local user on the server. The policy, target set and strong account are created by the tool; the group, server and vault account already exist." font-family="'Source Sans 3', system-ui, sans-serif" font-size="12" fill="currentColor">
+        <defs>
+          <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+            <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/>
+          </marker>
+        </defs>
+
+        <!-- Identity group (exists) -->
+        <rect x="20" y="56" width="170" height="64" rx="6" fill="none" stroke="#A9BDDB" stroke-width="1.5" stroke-dasharray="5 4"/>
+        <text x="105" y="78" text-anchor="middle" font-weight="600" font-size="13">Identity group</text>
+        <text x="105" y="100" text-anchor="middle" font-family="'IBM Plex Mono', monospace" font-size="11.5" fill="#A9BDDB">SIA-Web-Admins</text>
+
+        <!-- Access policy (tool) -->
+        <rect x="250" y="36" width="240" height="104" rx="6" fill="rgba(242,184,75,0.10)" stroke="#F2B84B" stroke-width="1.8"/>
+        <text x="370" y="57" text-anchor="middle" font-weight="600" font-size="13">Access policy · web01.corp.example.com</text>
+        <text x="262" y="78" font-size="11.5"><tspan fill="#A9BDDB">who </tspan>SIA-Web-Admins</text>
+        <text x="262" y="95" font-size="11.5"><tspan fill="#A9BDDB">where </tspan><tspan font-family="'IBM Plex Mono', monospace" font-size="11">EXACTLY web01.corp.example.com</tspan></text>
+        <text x="262" y="112" font-size="11.5"><tspan fill="#A9BDDB">how </tspan>RDP · ephemeral local user · Administrators</text>
+        <text x="262" y="129" font-size="11.5"><tspan fill="#A9BDDB">when </tspan>Mon–Sun · 2 h max · idle 10 min</text>
+
+        <!-- Server (exists) -->
+        <rect x="710" y="56" width="170" height="64" rx="6" fill="none" stroke="#A9BDDB" stroke-width="1.5" stroke-dasharray="5 4"/>
+        <text x="795" y="78" text-anchor="middle" font-weight="600" font-size="13">Windows server</text>
+        <text x="795" y="100" text-anchor="middle" font-family="'IBM Plex Mono', monospace" font-size="11.5" fill="#A9BDDB">web01.corp.example.com</text>
+
+        <!-- Target set (tool) -->
+        <rect x="250" y="240" width="220" height="84" rx="6" fill="rgba(242,184,75,0.10)" stroke="#F2B84B" stroke-width="1.8"/>
+        <text x="360" y="261" text-anchor="middle" font-weight="600" font-size="13">Target set · type Target</text>
+        <text x="262" y="284" font-size="11.5"><tspan fill="#A9BDDB">name </tspan><tspan font-family="'IBM Plex Mono', monospace" font-size="11">web01.corp.example.com</tspan></text>
+        <text x="262" y="302" font-size="11.5"><tspan fill="#A9BDDB">secret_id </tspan>→ the strong account</text>
+        <text x="262" y="318" font-size="11" fill="#A9BDDB">"this server uses that strong account"</text>
+
+        <!-- Strong account (tool) -->
+        <rect x="520" y="240" width="200" height="84" rx="6" fill="rgba(242,184,75,0.10)" stroke="#F2B84B" stroke-width="1.8"/>
+        <text x="620" y="261" text-anchor="middle" font-weight="600" font-size="13">Strong account (VM secret)</text>
+        <text x="532" y="284" font-size="11.5"><tspan fill="#A9BDDB">reference </tspan>to the server's local admin</text>
+        <text x="532" y="302" font-family="'IBM Plex Mono', monospace" font-size="10.5">web01-Administrator_SIA-LocalAdmins</text>
+        <text x="532" y="318" font-size="11" fill="#A9BDDB">one per server, derived from a naming rule</text>
+
+        <!-- Vault (exists) -->
+        <rect x="780" y="240" width="110" height="84" rx="6" fill="none" stroke="#A9BDDB" stroke-width="1.5" stroke-dasharray="5 4"/>
+        <text x="835" y="266" text-anchor="middle" font-weight="600" font-size="13">Vault</text>
+        <text x="835" y="284" text-anchor="middle" font-size="11.5" fill="#A9BDDB">PAM Self-Hosted</text>
+        <text x="835" y="302" text-anchor="middle" font-size="11.5" fill="#A9BDDB">safe SIA-LocalAdmins</text>
+
+        <!-- arrows -->
+        <line x1="190" y1="88" x2="248" y2="88" stroke="currentColor" stroke-width="1.5" marker-end="url(#arrow)"/>
+        <text x="219" y="80" text-anchor="middle" font-size="11" fill="#A9BDDB">member of</text>
+
+        <line x1="490" y1="88" x2="708" y2="88" stroke="currentColor" stroke-width="1.5" marker-end="url(#arrow)"/>
+        <text x="599" y="80" text-anchor="middle" font-size="11" fill="#A9BDDB">grants RDP to</text>
+
+        <line x1="370" y1="140" x2="370" y2="238" stroke="currentColor" stroke-width="1.5" marker-end="url(#arrow)"/>
+        <text x="380" y="186" font-size="11" fill="#A9BDDB">FQDN in the rule</text>
+        <text x="380" y="200" font-size="11" fill="#A9BDDB">= target set name</text>
+
+        <line x1="470" y1="282" x2="518" y2="282" stroke="currentColor" stroke-width="1.5" marker-end="url(#arrow)"/>
+        <text x="494" y="274" text-anchor="middle" font-size="11" fill="#A9BDDB">uses</text>
+
+        <line x1="720" y1="282" x2="778" y2="282" stroke="currentColor" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#arrow)"/>
+        <text x="749" y="274" text-anchor="middle" font-size="11" fill="#A9BDDB">password from</text>
+
+        <polyline points="620,240 620,196 795,196 795,122" fill="none" stroke="currentColor" stroke-width="1.5" marker-end="url(#arrow)"/>
+        <text x="707" y="176" text-anchor="middle" font-size="11" fill="#A9BDDB">connector creates the ephemeral</text>
+        <text x="707" y="189" text-anchor="middle" font-size="11" fill="#A9BDDB">local user over WinRM</text>
+
+        <!-- legend -->
+        <rect x="20" y="362" width="22" height="12" rx="3" fill="rgba(242,184,75,0.10)" stroke="#F2B84B" stroke-width="1.8"/>
+        <text x="50" y="372" font-size="11.5">created and owned by the tool</text>
+        <rect x="260" y="362" width="22" height="12" rx="3" fill="none" stroke="#A9BDDB" stroke-width="1.5" stroke-dasharray="5 4"/>
+        <text x="290" y="372" font-size="11.5">must already exist (group, server + connector, Vault account)</text>
+      </svg>
+    </div>
+    <figcaption>What a user's connection walks through, and where the tool's three objects sit in that path. SIA matches the FQDN from the policy rule to a target set of the same name; the target set names the strong account. Every server has its own set of the three.</figcaption>
+  </figure>
+
+  <div class="objects">
+    <div class="object">
+      <h3>Access policy</h3>
+      <p>Who may connect (Identity group), to which FQDN, how (RDP with an ephemeral local user in chosen local groups) and when. Named after the server; a second group gets a second policy (<span class="mono">-ops</span>).</p>
+      <span class="mono">web01.corp.example.com</span>
+    </div>
+    <div class="object">
+      <h3>Target set</h3>
+      <p>Type <em>Target</em>, named exactly the server FQDN, pointing at a strong account. This is how SIA knows which account to use for that server.</p>
+      <span class="mono">web01.corp.example.com</span>
+    </div>
+    <div class="object">
+      <h3>Strong account</h3>
+      <p>SIA's "VM secret": a reference to the server's own local administrator account in the Vault, derived from one naming rule (safe, account name, user name). Must be local admin on the target.</p>
+      <span class="mono">web01-Administrator_SIA-LocalAdmins</span>
+    </div>
+  </div>
+
+  <p><strong>Linux servers</strong> need only the access policy: SIA's Linux ZSP hands the user a short-lived SSH certificate, so there is no strong account and no target set for them (rows marked <span class="mono">protocol = ssh</span>).</p>
+
+  <h2>What SIA does when someone connects</h2>
+  <p>The tool is not in this path. It sets up the objects the path relies on, and <code>connect-info</code> writes down what the user needs.</p>
+  <ol class="steps">
+    <li><div><p class="title">The user picks <span class="mono">web01.corp.example.com</span> in the portal (Access › Infrastructure › Connect › RDP) or an RDP client</p><p>Nothing is typed: no user name, no password. From an RDP client the gateway is <span class="mono">&lt;subdomain&gt;.rdp.cyberark.cloud</span> and the user name is the connection string <span class="mono">secureaccess /i alice@acme.cyberark.cloud /s acme /a web01.corp.example.com</span>. Their Identity session says who they are and which groups they are in.</p></div></li>
+    <li><div><p class="title">SIA looks for a policy that matches</p><p>Group ∈ principals, FQDN matches the rule, current time inside the access window. Users pick the <em>server</em>; the policy named after it is what applies.</p></div></li>
+    <li><div><p class="title">SIA finds the target set named <span class="mono">web01.corp.example.com</span></p><p>The target set's <code>secret_id</code> says which strong account to use. Without a target set the policy is valid but the connection cannot be provisioned.</p></div></li>
+    <li><div><p class="title">The connector uses the strong account</p><p>Over WinRM it creates a temporary local user named after the connecting user — the first 7 characters of the login plus a random string, 20 characters in all (<span class="mono">alice.sXk3f9Qm2dLp7bR</span>) — and adds it to the local groups the policy names (e.g. Administrators). The strong account's password comes from the Vault.</p></div></li>
+    <li><div><p class="title">Session runs, then the temporary user is removed</p><p>The session ends after the policy's maximum length (2 h by default) or idle time (10 min), with a 30-second warning; the temporary user and its profile are deleted. Reconnecting means a new temporary user (<code>enable_reconnect = false</code>). Zero standing privileges: nothing is left on the box afterwards.</p></div></li>
+  </ol>
+
+  <h2>From your three lists to those objects</h2>
+  <div class="table-wrap">
+  <table>
+    <thead><tr><th>Your file</th><th>One row means</th><th>Becomes in SIA</th></tr></thead>
+    <tbody>
+      <tr><td><code>servers.csv</code></td><td>"this FQDN, for these groups" — one row per policy, so a server may have two rows</td><td>one target set per server + one access policy per row, named after the server (<code>web01.corp.example.com</code>, <code>web01.corp.example.com-ops</code>)</td></tr>
+      <tr><td><code>config.toml</code> naming rule</td><td>"every server's local admin is <code>&lt;hostname&gt;-Administrator</code> in Safe <code>SIA-LocalAdmins</code>"</td><td>one strong account per server, created as a Vault reference named <code>&lt;account&gt;_&lt;safe&gt;</code> (SIA generates that name); onboarded into the Vault first when missing and the <code>vault</code> stage is on</td></tr>
+      <tr><td><code>strong_accounts.csv</code></td><td>the few accounts you name explicitly: <em>existing</em> / a <em>vault</em> reference / raw <em>credentials</em>, e.g. a domain account shared by several servers</td><td>looked up by name, or created as a VM secret</td></tr>
+      <tr><td><code>groups.csv</code> (optional)</td><td>"this group name lives in this directory"</td><td>only used to disambiguate when the same group name exists in two directories</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>Group names are turned into what a UAP policy actually needs — the group's ID plus the directory it came from — by asking Identity's directory service. Passwords are never in a CSV: they come from a protected password file, environment variables or a prompt, and are redacted from every log and error.</p>
+
+  <h2>How a run flows</h2>
+  <ol class="steps">
+    <li><div><p class="title">Read and check the lists</p><p>Every problem is reported with file and line (bad FQDN, unknown strong account, duplicate policy name…). If anything is wrong, nothing else happens.</p></div></li>
+    <li><div><p class="title">Sign in and read what the tenant already has — for this wave only</p><p>The service user gets a platform token. Up to 2,000 servers the tool reads per server (one search each, in parallel); above that it reads one listing of the policies it manages. Rows already finished according to the checkpoint are not read at all (<code>--resume</code>).</p><p class="aside">Identity, SIA (<span class="mono">dpa</span>) and UAP APIs — all read-only at this point.</p></div></li>
+    <li><div><p class="title">Turn names into IDs</p><p>Each group name becomes a principal (ID + source directory). Each strong-account name is matched to a secret.</p></div></li>
+    <li><div><p class="title">Compare desired with actual, per server</p><p>Every object ends up as <span class="status s-ok">create</span> <span class="status s-muted">exists</span> <span class="status s-warn">drift</span> or <span class="status s-bad">blocked</span>. <code>plan</code> stops here and prints the table.</p></div></li>
+    <li><div><p class="title">Apply in dependency order</p><p>Vault accounts (optional), then strong accounts, then target sets (batches of 50), then policies — each policy is read back to confirm it is <em>Active</em>, and every finished row goes into the checkpoint. A report (table, JSON, CSV) is written.</p><p class="aside">A server whose strong account or target set failed has its policies <em>blocked</em>, never created half-way. The first object of each stage is created alone; only then do the workers fan out.</p></div></li>
+  </ol>
+
+  <h2>Why it is safe to run twice</h2>
+  <ul class="plain">
+    <li><strong>Dry run first.</strong> <code>plan</code> changes nothing; <code>apply</code> shows the plan again and asks you to type <em>yes</em>.</li>
+    <li><strong>Idempotent.</strong> Objects are matched by name, so a second run reports <em>exists</em> everywhere and creates nothing. A create that failed uncertainly (timeout, 5xx) is never blindly re-sent — the next run simply finds the object if it landed.</li>
+    <li><strong>It never deletes.</strong> A server removed from the CSV is left alone in SIA.</li>
+    <li><strong>Drift is reported, not silently fixed.</strong> If someone changed a policy in the UI, you see <em>drift</em>. Fixing it needs <code>--update</code>, and only works on objects the tool created — they carry the tag <span class="chip">sia-policy-automation</span> — or ones you explicitly <code>--adopt</code>.</li>
+    <li><strong>Fails fast.</strong> The first 4xx from a create (a payload or permission problem that would repeat for every row) stops the run; the rest is reported as <em>blocked</em>, not sprayed with 200 identical errors.</li>
+    <li><strong>Renames survive.</strong> A tool-created policy renamed in the UI is still recognised by its tag and FQDN rule, and reported as drift instead of being duplicated.</li>
+  </ul>
+
+  <h2>What you actually type</h2>
+<pre><code>python sia_onboard.py preflight                       <span class="comment"># auth OK? which API paths? self-hosted PAM configured? counts</span>
+python sia_onboard.py show-policy "Ref-web09"           <span class="comment"># dump a policy you made by hand → confirm the FQDN/principal encoding</span>
+python sia_onboard.py plan  --input input               <span class="comment"># dry run: the create / exists / drift table</span>
+python sia_onboard.py apply --input input --workers 8   <span class="comment"># do it (asks for "yes"); --resume continues an interrupted run</span>
+python sia_onboard.py verify --input input              <span class="comment"># PASS / MISSING / FAIL per row, for sign-off</span>
+python sia_onboard.py connect-info --input input --rdp-dir out   <span class="comment"># gateway, user name and .rdp file per server</span></code></pre>
+  <div class="callout"><p><strong>First time on a tenant:</strong> create one policy for one server by hand, run <code>show-policy</code> on it, then <code>plan</code> and <code>apply</code> with a one-server CSV. Test the RDP login as a group member (watch the temporary user appear and disappear), run <code>verify</code>, re-run <code>apply</code> (everything must say <em>exists</em>), then load the real lists in waves of a few thousand.</p></div>
+
+  <h2>Questions engineers usually ask</h2>
+  <dl class="faq">
+    <dt>Why isn't the strong account on the policy?</dt>
+    <dd>That is SIA's model, not the tool's: policies decide <em>who</em> and <em>where</em>; target sets decide <em>with what account</em>. Here every server has one of each, joined by the FQDN.</dd>
+    <dt>Why does my vault strong account show up as <code>web01-Administrator_SIA-LocalAdmins</code>?</dt>
+    <dd>SIA generates that name (<code>&lt;account&gt;_&lt;safe&gt;</code>) for vault-referenced accounts and rejects custom names. The tool uses the same name so lookups are deterministic.</dd>
+    <dt>What if the policy already exists?</dt>
+    <dd>It is compared, not recreated. Same principals, same FQDN rule → <em>exists</em>; suspended or in error → <em>inactive</em>. Anything else → <em>drift</em>, with the difference spelled out. A same-name policy made by hand is compared too (SIA refuses the duplicate name) and reported as <em>unmanaged</em>.</dd>
+    <dt>Why did it refuse to update something with <code>--update</code>?</dt>
+    <dd>Because the object has no owner tag — someone made it by hand. Add <code>--adopt &lt;fqdn&gt;</code> to take ownership; the update then also tags it.</dd>
+    <dt>How does a run of 70,000 servers stay manageable?</dt>
+    <dd>Waves (<code>--offset/--limit</code> or one CSV per wave), per-server lookups instead of reading the whole tenant, a checkpoint that <code>--resume</code> skips, a shared request-rate budget for the workers, progress lines every 100 objects, and <code>verify</code> after each wave.</dd>
+    <dt>What does it not do?</dt>
+    <dd>Domain ephemeral users, creating the Windows accounts themselves, deleting anything, and changing tenant settings. Those are deliberate boundaries for this version; Linux/SSH rows are supported (policy only).</dd>
+  </dl>
+
+  <footer>Payload shapes follow the documented Access Control Policies, SIA strong-account/target-set and PVWA APIs and CyberArk's official SDKs. Conventions are confirmed per tenant with <code>preflight</code> and <code>show-policy</code> before bulk runs: the API path families, the FQDN-rule encoding, the principal's source-directory fields and the fields the policy list carries.</footer>
+</main>
+
+</body>
+</html>

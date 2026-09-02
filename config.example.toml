@@ -1,0 +1,95 @@
+# Copy to config.toml and edit. Contains NO secrets (those live in .env, a password file, or are prompted for).
+
+[tenant]
+# Your Identity Security Platform tenant subdomain: https://<subdomain>.cyberark.cloud
+# The script derives https://<subdomain>.dpa.cyberark.cloud and https://<subdomain>.uap.cyberark.cloud from it.
+subdomain = "acme"
+# Identity tenant URL (Identity Administration > Settings > Customization > Tenant URLs), e.g. https://abc1234.id.cyberark.cloud
+# The tenant alias https://acme.cyberark.cloud also works.
+identity_url = "https://abc1234.id.cyberark.cloud"
+# Optional: override the platform root domain if the hosts ever change (default cyberark.cloud)
+# root_domain = "cyberark.cloud"
+
+[defaults]
+# Templates may use {hostname}, {fqdn}, {domain}
+# The policy is named after the server. {fqdn} is always unique; {hostname} collides when the same host name
+# exists in two domains (the tool refuses such a file). A second policy for the same server adds policy_suffix.
+policy_name_template = "{fqdn}"
+description_template = "Automated: {protocol} ZSP access to {fqdn}"   # {protocol} = RDP or SSH
+policy_tags = ["automated"]
+time_zone = "America/New_York"
+
+# --- REQUIRED: the access window is an organizational decision, so it must be written down explicitly ---
+days_of_week = [0, 1, 2, 3, 4, 5, 6]   # Sunday=0 ... Saturday=6
+from_hour = ""                         # "" = all day, else "HH:MM" (both from_hour and to_hour, or neither)
+to_hour = ""
+# --- REQUIRED: validate target server certificates (WinRM over HTTPS). Prefer true once targets have valid certs ---
+target_set_cert_validation = false
+
+# Session limits (the SIA defaults): the session is disconnected after max_session_hours, or after idle_minutes
+# without activity; the temporary user is removed when the session ends.
+max_session_hours = 2                  # 1..24
+idle_minutes = 10                      # 1..120
+assign_local_groups = ["Administrators"]   # local groups for the ephemeral user
+# false: every connection gets a fresh temporary user (once disconnected you cannot go back to the same one).
+# true: the same temporary user can be reused until the original max_session_hours would have ended.
+enable_reconnect = false
+provision_format = ""                  # e.g. "<user>_<session-guid>"; "" = SIA default naming
+# Linux rows (protocol=ssh): username on the SSH certificate when servers.csv leaves ssh_username blank, e.g. "ec2-user"
+ssh_username = ""
+
+# --- Per-server strong accounts (every Windows server has its own local administrator account) ---
+# When servers.csv leaves strong_account blank, the account is derived from these templates:
+#   strong_account_template   its name in the tool and in SIA (for type=vault SIA shows <account_name>_<safe>)
+#   strong_account_type       existing    = only look it up in SIA (it was onboarded there already)
+#                             vault       = create a SIA reference to the account in your Vault (safe + account name)
+#                             credentials = store user name + password in SIA (password from the password file)
+strong_account_template = "ADM-{hostname}"
+strong_account_type = "vault"
+strong_account_safe_template = "SIA-LocalAdmins"              # vault: the Safe holding the account
+strong_account_account_name_template = "{hostname}-Administrator"   # vault: the account's Name in the Vault (PVWA)
+strong_account_username_template = "Administrator"            # vault/credentials: the Windows user name
+strong_account_domain = "local"                               # "local" for a local administrator, else its AD domain
+# Tag added to every generated policy (and marker in target-set descriptions). --update only touches objects
+# carrying it, unless you --adopt them. Letters, digits, '_', '.', '-'.
+owner_tag = "sia-policy-automation"
+# Optional: name of an existing (UI-created) VM/RDP policy whose approved fields (conditions, RDP profile,
+# timeZone, tags) are cloned into every generated policy. Name/description/targets/principals are still generated.
+template_policy = ""
+
+[auth]
+# How the Identity directory lookups (group -> principal) authenticate:
+#   platform_token     the documented OAuth2 client-credentials platform token (also used for SIA/UAP)
+#   service_user_oidc  the service-user flow CyberArk's SDKs use for Identity itself (OAuth2/Token + OAuth2/Authorize)
+# Run `preflight`: if the Identity line fails with 401/403 under one method, switch to the other.
+identity_auth = "platform_token"
+oidc_application = "__idaptive_cybr_user_oidc"
+# Optional CSV with columns name,password (name = strong_accounts.csv name, or the name rendered from
+# strong_account_template). Used for type=credentials accounts and for onboarding into the Vault.
+# Keep it OUTSIDE the repository with owner-only permissions; --passwords FILE on the command line overrides this.
+password_file = ""
+
+[http]
+timeout_seconds = 60
+max_retries = 4
+status_polls = 1          # read-backs after creating a policy while it is still "Validating" (1 = one read, 1..10)
+max_requests_per_second = 0    # global rate limit shared by all --workers (0 = none); raise --workers only with a limit
+lookup_search_max_rows = 2000  # --lookup auto: read per server (search) up to this many servers, else one filtered list
+# SIA path families. "auto" = detect with read-only calls at every run; pin them once `preflight` has printed them.
+secrets_api = "auto"           # auto | public (/api/secrets/public/v1 + v2) | legacy (/api/secrets)
+targetsets_api = "auto"        # auto | legacy (/api/targetsets) | discovery (/api/discovery/targetsets)
+
+[connect]
+# Values used by `connect-info` (what end users type into an RDP client). Nothing here is secret.
+login_suffix = ""         # part after '@' in users' login names; "" = taken from SIA_CLIENT_ID
+gateway_host = ""         # "" = <subdomain>.rdp.cyberark.cloud
+network = ""              # connector network name to add as "/n <network>" (optional for FQDN targets)
+
+[pvwa]
+# Optional: PAM Self-Hosted REST API, used by the `vault` stage to onboard local administrator accounts that are
+# not in the Vault yet (credentials PVWA_USER / PVWA_PASSWORD in .env; passwords of the accounts from the password file).
+# Leave base_url empty to disable the stage.
+base_url = ""             # e.g. "https://pvwa.corp.example.com"
+auth_type = "cyberark"    # cyberark | ldap
+platform_id = "WinServerLocal"
+cpm_managed = true        # let the CPM manage (rotate) the password after onboarding

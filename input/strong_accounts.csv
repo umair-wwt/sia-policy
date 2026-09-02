@@ -1,0 +1,4 @@
+name,type,safe,account_name,username,account_domain,password_env,address
+SA-dmz-localadmin,credentials,,,siaprov,local,SIA_SA_DMZ_LOCALADMIN_PASSWORD,
+SA-corp-domain,vault,SIA-StrongAccounts,svc_sia_rdp,svc_sia_rdp,corp.example.com,,corp.example.com
+SA-legacy,existing,,,,,,

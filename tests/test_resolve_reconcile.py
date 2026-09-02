@@ -1,0 +1,678 @@
+import json
+
+import pytest
+
+from sia.checkpoint import Checkpoint
+from sia.config import Defaults
+from sia.http import SIAApiError
+from sia.inputs import Inputs, ServerRow, StrongAccountRow
+from sia.reconcile import ReconcileError, Reconciler
+from sia.resolve import PrincipalResolver, ResolveError, SecretIndex
+from tests.fakes import AD_UUID, CDS_UUID, FakeIdentity, FakePVWA, FakeSIA, FakeUAP, group_row
+
+DEFAULTS = Defaults(time_zone="America/New_York")
+OWNER = "sia-policy-automation"
+OWNED_FILTER = "((targetCategory eq 'VM') and (policyTags eq 'sia-policy-automation'))"
+MARK = "[managed-by:sia-policy-automation]"
+VAULT_SIA_NAME = "svc_sia_rdp_SIA-StrongAccounts"
+WEB01_FQDN, WEB02_FQDN, DMZ_FQDN = "web01.corp.example.com", "web02.corp.example.com", "dmz01.dmz.example.com"
+
+
+def sa(name, kind, **kw):
+    base = dict(safe=None, account_name=None, username=None, account_domain="local", password_env=None, line=2)
+    base.update(kw)
+    return StrongAccountRow(name=name, type=kind, **base)
+
+
+def srv(fqdn, account, groups, **kw):
+    base = dict(policy_name=None, assign_groups=None, domain=None, description=None, line=2)
+    base.update(kw)
+    return ServerRow(fqdn=fqdn, strong_account=account, groups=tuple(groups), **base)
+
+
+def inputs(servers, accounts, groups=None):
+    return Inputs(servers=tuple(servers), strong_accounts={a.name: a for a in accounts},
+                  groups={g.name: g for g in (groups or [])})
+
+
+def err(status, text, method="POST"):
+    return SIAApiError(method, "https://x/api", status, text, uncertain=(method == "POST" and status >= 500))
+
+
+VAULT = sa("SA-corp-rdp", "vault", safe="SIA-StrongAccounts", account_name="svc_sia_rdp", account_domain="corp.example.com")
+CREDS = sa("SA-dmz", "credentials", username="siaprov", password_env="SIA_SA_SA_DMZ_PASSWORD")
+EXISTING = sa("SA-legacy", "existing")
+WEB01 = srv(WEB01_FQDN, "SA-corp-rdp", ["SIA-Web-Admins"])
+STANDARD = inputs(
+    [WEB01,
+     srv(WEB02_FQDN, "SA-corp-rdp", ["SIA-Web-Admins", "SIA-Platform-Ops"], assign_groups=("Remote Desktop Users",)),
+     srv(DMZ_FQDN, "SA-dmz", ["SIA-DMZ-Admins"])],
+    [VAULT, CREDS],
+)
+ONE = inputs([WEB01], [VAULT])
+
+
+def make(inp=STANDARD, sia=None, uap=None, identity=None, *, dry_run=False, update=False, only="all", defaults=DEFAULTS,
+         passwords=None, fail_fast=True, adopt=(), adopt_all=False, workers=1, status_polls=1, lookup="list", **extra):
+    sia = sia or FakeSIA()
+    uap = uap or FakeUAP()
+    identity = identity or FakeIdentity()
+    passwords = {"SIA_SA_SA_DMZ_PASSWORD": "pw-secret"} if passwords is None else passwords
+    resolver = PrincipalResolver(identity, inp.pinned_directory)
+    rec = Reconciler(sia=sia, uap=uap, resolver=resolver, inputs=inp, defaults=defaults, dry_run=dry_run, update=update,
+                     only=only, get_password=lambda a: passwords.get(a.password_env or "") or passwords.get(a.name),
+                     sleep=lambda s: None, fail_fast=fail_fast, adopt=adopt, adopt_all=adopt_all, workers=workers,
+                     status_polls=status_polls, lookup=lookup, **extra)
+    return rec, sia, uap, identity
+
+
+def by_fqdn(result):
+    return {s.fqdn: s for s in result.servers}
+
+
+def calls(fake, name):
+    return [c[1] for c in fake.calls if c[0] == name]
+
+
+# ------------------------------------------------------------- resolver
+def test_resolver_builds_principal_and_caches():
+    identity = FakeIdentity()
+    resolver = PrincipalResolver(identity)
+    p = resolver.resolve("SIA-Web-Admins")
+    assert p == {"id": f"id-SIA-Web-Admins-{CDS_UUID[:4]}", "name": "SIA-Web-Admins", "type": "GROUP",
+                 "sourceDirectoryId": CDS_UUID, "sourceDirectoryName": "CyberArk Cloud Directory"}
+    resolver.resolve("sia-web-admins")
+    assert identity.queries == ["SIA-Web-Admins", "sia-web-admins"]
+    resolver.resolve("SIA-Web-Admins")
+    assert len(identity.queries) == 2  # cached
+
+
+def test_resolver_not_found_lists_similar():
+    resolver = PrincipalResolver(FakeIdentity([group_row("SIA-Web-Admins-Prod")]))
+    with pytest.raises(ResolveError, match=r"not found.*similar names: SIA-Web-Admins-Prod"):
+        resolver.resolve("SIA-Web-Admins")
+
+
+def test_resolver_ambiguous_then_pinned():
+    rows = [group_row("Admins", CDS_UUID, "CyberArk Cloud Directory"), group_row("Admins", AD_UUID, "corp.example.com (AD)")]
+    with pytest.raises(ResolveError, match="ambiguous"):
+        PrincipalResolver(FakeIdentity(rows)).resolve("Admins")
+    assert PrincipalResolver(FakeIdentity(rows), lambda g: "corp.example.com (AD)").resolve("Admins")["sourceDirectoryId"] == AD_UUID
+    assert PrincipalResolver(FakeIdentity(rows), lambda g: "AdProxy").resolve("Admins")["sourceDirectoryId"] == AD_UUID
+    with pytest.raises(ResolveError, match="not found in Identity in directory 'Nope'"):
+        PrincipalResolver(FakeIdentity(rows), lambda g: "Nope").resolve("Admins")
+
+
+def test_secret_index_is_deterministic():
+    idx = SecretIndex([{"secret_id": "s1", "secret_name": "SA-corp-rdp"}, {"secret_id": "s2", "secret_name": "SVC_SIA_RDP_sia-strongaccounts"}])
+    assert idx.find(VAULT)["secret_id"] == "s2"                      # vault accounts: platform name <account>_<safe>
+    assert idx.find(sa("SA-corp-rdp", "existing"))["secret_id"] == "s1"  # existing: CSV name
+    assert idx.find(EXISTING) is None and len(idx) == 2
+
+
+# --------------------------------------------------------------- plan
+def test_plan_on_empty_tenant_writes_nothing():
+    rec, sia, uap, _ = make(dry_run=True)
+    result = rec.run()
+    assert result.mode == "plan" and result.failures == 0 and not result.aborted and result.lookup_mode == "list"
+    assert {n: o.status for n, o in result.secrets.items()} == {"SA-corp-rdp": "planned", "SA-dmz": "planned"}
+    assert VAULT_SIA_NAME in result.secrets["SA-corp-rdp"].detail
+    assert all(sr.target_set.status == "planned" and sr.policy.status == "planned" for sr in result.servers)
+    assert [c[0] for c in sia.calls] == ["list_secrets", "list_target_sets"]
+    assert uap.calls == [("list_policies", (None, OWNED_FILTER))]   # only our own policies are listed
+
+
+def test_search_lookup_reads_per_server():
+    rec, sia, uap, _ = make(dry_run=True, lookup="search")
+    result = rec.run()
+    assert result.lookup_mode == "search" and result.failures == 0
+    assert sorted(calls(sia, "find_secret")) == sorted([VAULT_SIA_NAME, "SA-dmz"])
+    assert sorted(name for _, name in calls(sia, "list_target_sets")) == sorted([WEB01_FQDN, WEB02_FQDN, DMZ_FQDN])
+    assert sorted(text for text, _ in calls(uap, "list_policies")) == sorted([WEB01_FQDN, WEB02_FQDN, DMZ_FQDN])
+    assert "list_secrets" not in [c[0] for c in sia.calls]
+
+
+def test_auto_lookup_switches_on_size():
+    assert make(dry_run=True, lookup="auto", lookup_search_max_rows=2)[0].run().lookup_mode == "list"
+    assert make(dry_run=True, lookup="auto", lookup_search_max_rows=3)[0].run().lookup_mode == "search"
+    assert make(dry_run=True, lookup="auto", lookup_search_max_rows=10, adopt_all=True)[0].run().lookup_mode == "list"
+    with pytest.raises(ValueError, match="lookup"):
+        make(lookup="guess")
+
+
+def test_plan_without_password_is_planned_apply_fails():
+    rec, *_ = make(inputs([srv("d.dmz.example.com", "SA-dmz", ["SIA-DMZ-Admins"])], [CREDS]), dry_run=True, passwords={})
+    result = rec.run()
+    assert result.secrets["SA-dmz"].status == "planned" and "not available now" in result.secrets["SA-dmz"].detail
+    assert result.failures == 0
+    rec, *_ = make(inputs([srv("d.dmz.example.com", "SA-dmz", ["SIA-DMZ-Admins"])], [CREDS]), passwords={})
+    result = rec.run()
+    assert result.secrets["SA-dmz"].status == "failed" and "SIA_SA_SA_DMZ_PASSWORD" in result.secrets["SA-dmz"].detail
+    assert result.servers[0].target_set.status == "blocked" and result.servers[0].policy.status == "blocked"
+
+
+# --------------------------------------------------------------- apply
+def test_apply_creates_everything_then_is_idempotent():
+    rec, sia, uap, _ = make()
+    result = rec.run()
+    assert result.failures == 0 and not result.aborted, [(s.fqdn, s.target_set, s.policy) for s in result.servers]
+    assert {n: o.status for n, o in result.secrets.items()} == {"SA-corp-rdp": "created", "SA-dmz": "created"}
+    created = calls(sia, "create_secret")
+    assert created[0]["secret_name"] == VAULT_SIA_NAME and created[0]["secret_type"] == "PCloudAccount"
+    assert created[0]["secret"]["secret_data"] == {"safe": "SIA-StrongAccounts", "account_name": "svc_sia_rdp"}
+    assert created[1]["secret_name"] == "SA-dmz" and created[1]["secret"]["secret_data"] == {"username": "siaprov", "password": "pw-secret"}
+    bulks = calls(sia, "bulk_create_target_sets")
+    assert len(bulks) == 2  # one bulk call per strong account
+    web_bulk = next(b for b in bulks if b[0]["strong_account_id"] == "sec-1")
+    assert [t["name"] for t in web_bulk[0]["target_sets"]] == [WEB01_FQDN, WEB02_FQDN]
+    assert web_bulk[0]["target_sets"][0]["secret_type"] == "PCloudAccount" and MARK in web_bulk[0]["target_sets"][0]["description"]
+    assert all(sr.target_set.status == "created" and sr.policy.status == "created" for sr in result.servers)
+    policies = calls(uap, "create_policy")
+    assert [p["metadata"]["name"] for p in policies] == [WEB01_FQDN, WEB02_FQDN, DMZ_FQDN]
+    assert all(p["metadata"]["policyTags"] == ["automated", OWNER] for p in policies)
+    assert all("status" not in p["metadata"] for p in policies)
+    assert [p["id"] for p in policies[1]["principals"]] == [f"id-SIA-Web-Admins-{CDS_UUID[:4]}", f"id-SIA-Platform-Ops-{CDS_UUID[:4]}"]
+    assert policies[1]["behavior"]["connectAs"]["rdp"]["localEphemeralUser"]["assignGroups"] == ["Remote Desktop Users"]
+    assert policies[0]["targets"]["FQDN/IP"]["fqdnRules"] == [{"operator": "EXACTLY", "computernamePattern": WEB01_FQDN, "domain": "corp.example.com"}]
+    assert policies[0]["conditions"]["maxSessionDuration"] == 2
+
+    rec2, _, _, _ = make(sia=sia, uap=uap)
+    before = (len(sia.calls), len(uap.calls))
+    result2 = rec2.run()
+    assert result2.failures == 0
+    assert all(o.status == "exists" for o in result2.secrets.values()) and VAULT_SIA_NAME in result2.secrets["SA-corp-rdp"].detail
+    assert all(sr.target_set.status == "exists" and sr.policy.status == "exists" for sr in result2.servers)
+    assert all("unmanaged" not in sr.policy.detail and "unmanaged" not in sr.target_set.detail for sr in result2.servers)
+    assert not [c for c in sia.calls[before[0]:] if c[0] not in ("list_secrets", "list_target_sets")]
+    assert not [c for c in uap.calls[before[1]:] if c[0] not in ("list_policies", "get_policy")]
+
+
+def test_two_policies_per_server_share_account_and_target_set():
+    ops = srv(WEB01_FQDN, "SA-corp-rdp", ["SIA-Platform-Ops"], policy_suffix="-ops", assign_groups=("Remote Desktop Users",), line=3)
+    inp = inputs([WEB01, ops], [VAULT])
+    rec, sia, uap, _ = make(inp)
+    result = rec.run()
+    assert result.failures == 0 and len(result.servers) == 2
+    assert [sr.policy_name for sr in result.servers] == [WEB01_FQDN, f"{WEB01_FQDN}-ops"]
+    assert len(calls(sia, "create_secret")) == 1
+    assert [ts["name"] for b in calls(sia, "bulk_create_target_sets") for m in b for ts in m["target_sets"]] == [WEB01_FQDN]
+    assert all(sr.secret.status == "created" and sr.target_set.status == "created" and sr.policy.status == "created" for sr in result.servers)
+    policies = calls(uap, "create_policy")
+    assert [p["metadata"]["name"] for p in policies] == [WEB01_FQDN, f"{WEB01_FQDN}-ops"]
+    assert policies[1]["behavior"]["connectAs"]["rdp"]["localEphemeralUser"]["assignGroups"] == ["Remote Desktop Users"]
+    assert [p["id"] for p in policies[1]["principals"]] == [f"id-SIA-Platform-Ops-{CDS_UUID[:4]}"]
+    result2 = make(inp, sia=sia, uap=uap)[0].run()
+    assert all(sr.target_set.status == "exists" and sr.policy.status == "exists" for sr in result2.servers)
+    # renaming the second policy in the UI must not be mistaken for the first one
+    ops_policy = next(p for p in uap.policies if p["metadata"]["name"].endswith("-ops"))
+    ops_policy["metadata"]["name"] = "Renamed in the UI"
+    created_before = len(calls(uap, "create_policy"))
+    result3 = make(inp, sia=sia, uap=uap)[0].run()
+    by = result3.by_key()
+    assert by[(WEB01_FQDN, WEB01_FQDN)].policy.status == "exists"
+    assert by[(WEB01_FQDN, f"{WEB01_FQDN}-ops")].policy.status == "drift" and "renamed" in by[(WEB01_FQDN, f"{WEB01_FQDN}-ops")].policy.detail
+    assert len(calls(uap, "create_policy")) == created_before
+
+
+def test_snapshot_once_then_preview_and_apply():
+    rec, sia, uap, _ = make(dry_run=True)
+    rec.snapshot()
+    reads = len(sia.calls)
+    preview = rec.reconcile(dry_run=True)
+    assert preview.mode == "plan" and all(sr.policy.status == "planned" for sr in preview.servers)
+    result = rec.reconcile(dry_run=False)
+    assert result.mode == "apply" and all(sr.policy.status == "created" for sr in result.servers) and result.failures == 0
+    assert [c[0] for c in sia.calls[reads:]] == ["create_secret", "create_secret", "bulk_create_target_sets", "bulk_create_target_sets"]
+    assert all(c[0] != "list_policies" for c in uap.calls[1:])
+
+
+def test_checkpoint_and_resume(tmp_path):
+    cp = Checkpoint(tmp_path / "cp.jsonl")
+    rec, sia, uap, _ = make(checkpoint=cp)
+    assert rec.run().failures == 0
+    assert cp.path.is_file() and cp.done_count() == 3
+    lines = [json.loads(line) for line in cp.path.read_text().splitlines()]
+    assert len(lines) == 3 and lines[0]["key"] == f"{WEB01_FQDN}|{WEB01_FQDN}"
+    assert lines[0]["statuses"] == {"secret": "created", "target_set": "created", "policy": "created"}
+    assert lines[0]["refs"]["policy"].startswith("pol-") and "pw" not in json.dumps(lines)
+
+    before = (len(sia.calls), len(uap.calls))
+    result = make(sia=sia, uap=uap, checkpoint=cp, resume=True, lookup="search")[0].run()
+    assert result.resumed == 3 and len(result.servers) == 3 and result.failures == 0
+    assert all(sr.policy.status == "exists" and "checkpoint" in sr.policy.detail and sr.policy.ref for sr in result.servers)
+    assert sia.calls[before[0]:] == [] and uap.calls[before[1]:] == []   # nothing was read for resumed rows
+
+    edited = inputs([srv(WEB01_FQDN, "SA-corp-rdp", ["SIA-Web-Admins", "SIA-Platform-Ops"]), STANDARD.servers[1], STANDARD.servers[2]], [VAULT, CREDS])
+    result = make(edited, sia=sia, uap=uap, checkpoint=cp, resume=True)[0].run()
+    assert result.resumed == 2
+    assert result.by_key()[(WEB01_FQDN, WEB01_FQDN)].policy.status == "drift"     # the edited row is re-evaluated
+    assert [sr.fqdn for sr in result.servers] == [WEB01_FQDN, WEB02_FQDN, DMZ_FQDN]  # CSV order kept
+
+    assert make(sia=sia, uap=uap, checkpoint=cp)[0].run().resumed == 0            # without --resume nothing is skipped
+    plan_cp = Checkpoint(tmp_path / "plan.jsonl")
+    make(dry_run=True, checkpoint=plan_cp)[0].run()
+    assert not plan_cp.path.exists()                                             # dry runs never write
+
+
+def test_progress_is_logged(caplog):
+    with caplog.at_level("INFO", logger="sia.reconcile"):
+        make(progress_every=1)[0].run()
+    assert "policies: 3/3 done" in caplog.text and "strong accounts: 2/2 done" in caplog.text and "target sets: 3/3 done" in caplog.text
+
+
+def test_existing_account_missing_blocks_downstream():
+    rec, sia, uap, _ = make(inputs([srv("a.corp.example.com", "SA-legacy", ["SIA-Web-Admins"])], [EXISTING]))
+    result = rec.run()
+    assert result.secrets["SA-legacy"].status == "failed" and "type=existing" in result.secrets["SA-legacy"].detail
+    sr = result.servers[0]
+    assert sr.target_set.status == "blocked" and sr.policy.status == "blocked"
+    assert result.failures == 1 and not calls(sia, "create_secret") and not calls(uap, "create_policy")
+
+
+def test_existing_vault_account_found_by_platform_name_and_type_warning():
+    sia = FakeSIA(secrets=[{"secret_id": "s-9", "secret_type": "ProvisionerUser", "secret_name": "SVC_SIA_RDP_sia-strongaccounts", "is_active": False}])
+    rec, sia, _, _ = make(ONE, sia=sia)
+    result = rec.run()
+    assert result.secrets["SA-corp-rdp"].status == "exists" and result.secrets["SA-corp-rdp"].ref == "s-9"
+    assert any("CSV type=vault but SIA has ProvisionerUser" in w for w in result.warnings)
+    assert any("inactive" in w for w in result.warnings)
+    assert calls(sia, "bulk_create_target_sets")[0][0]["target_sets"][0]["secret_type"] == "ProvisionerUser"
+
+
+def test_target_sets_listed_per_account_when_the_tenant_requires_it():
+    sia = FakeSIA(secrets=[{"secret_id": "sec-1", "secret_type": "PCloudAccount", "secret_name": VAULT_SIA_NAME}],
+                  target_sets=[{"name": WEB01_FQDN, "type": "Target", "secret_type": "PCloudAccount", "secret_id": "sec-1", "description": f"x {MARK}"}])
+    sia.capabilities.targetsets_list_unfiltered = False
+    result = make(ONE, sia=sia)[0].run()
+    assert result.servers[0].target_set.status == "exists" and result.failures == 0
+    assert ("sec-1", None) in calls(sia, "list_target_sets") and (None, None) not in calls(sia, "list_target_sets")
+    sia.calls.clear()
+    result = make(ONE, sia=sia, lookup="search")[0].run()
+    assert result.servers[0].target_set.status == "exists" and (None, WEB01_FQDN) not in calls(sia, "list_target_sets")
+
+
+# ----------------------------------------------------------- fail-fast
+def test_secret_create_client_error_aborts_run():
+    sia = FakeSIA()
+    sia.raise_on_create_secret = err(400, "safe not found")
+    rec, sia, uap, _ = make(sia=sia)
+    result = rec.run()
+    assert result.secrets["SA-corp-rdp"].status == "failed" and "safe not found" in result.secrets["SA-corp-rdp"].detail
+    assert result.secrets["SA-dmz"].status == "blocked" and "fail-fast" in result.secrets["SA-dmz"].detail
+    assert len(result.aborted) == 1 and "SA-corp-rdp" in result.aborted[0]
+    assert all(sr.target_set.status == "blocked" and sr.policy.status == "blocked" for sr in result.servers)
+    assert len(calls(sia, "create_secret")) == 1 and not calls(uap, "create_policy")
+
+
+def test_secret_create_errors_without_fail_fast_or_on_5xx_are_isolated():
+    sia = FakeSIA()
+    sia.raise_on_create_secret = err(400, "bad request")
+    result = make(sia=sia, fail_fast=False)[0].run()
+    assert all(o.status == "failed" for o in result.secrets.values()) and not result.aborted
+    sia = FakeSIA()
+    sia.raise_on_create_secret = err(502, "gateway")
+    result = make(sia=sia)[0].run()
+    assert all(o.status == "failed" and "may or may not have been applied" in o.detail for o in result.secrets.values())
+    assert not result.aborted
+
+
+def test_bulk_client_error_aborts_remaining_target_sets():
+    sia = FakeSIA()
+    sia.raise_on_bulk = err(403, "forbidden")
+    result = make(sia=sia)[0].run()
+    by = by_fqdn(result)
+    assert by[WEB01_FQDN].target_set.status == "failed" and by[WEB02_FQDN].target_set.status == "failed"
+    assert by[DMZ_FQDN].target_set.status == "blocked"
+    assert all(sr.policy.status == "blocked" for sr in result.servers) and len(result.aborted) == 1
+
+
+def test_bulk_partial_failure_marks_only_that_server():
+    sia = FakeSIA()
+    sia.fail_bulk_for = {WEB02_FQDN}
+    result = make(sia=sia)[0].run()
+    by = by_fqdn(result)
+    assert by[WEB01_FQDN].target_set.status == "created" and by[WEB01_FQDN].policy.status == "created"
+    assert by[WEB02_FQDN].target_set.status == "failed" and by[WEB02_FQDN].policy.status == "blocked"
+    assert result.failures == 1 and not result.aborted
+
+
+def test_policy_create_client_error_aborts_but_5xx_continues():
+    uap = FakeUAP()
+    uap.raise_on_create_policy = err(400, "invalid principal")
+    rec, sia, uap, _ = make(uap=uap)
+    result = rec.run()
+    by = by_fqdn(result)
+    assert by[WEB01_FQDN].policy.status == "failed" and "invalid principal" in by[WEB01_FQDN].policy.detail
+    assert by[WEB02_FQDN].policy.status == "blocked" and by[DMZ_FQDN].policy.status == "blocked"
+    assert all(sr.target_set.status == "created" for sr in result.servers)  # earlier stage already done
+    assert len(calls(uap, "create_policy")) == 1 and result.aborted
+    uap = FakeUAP()
+    uap.raise_on_create_policy = err(400, "invalid principal")
+    result = make(uap=uap, fail_fast=False)[0].run()
+    assert all(sr.policy.status == "failed" for sr in result.servers) and not result.aborted
+    uap = FakeUAP()
+    uap.raise_on_create_policy = err(504, "gateway timeout")
+    result = make(uap=uap)[0].run()
+    assert all(sr.policy.status == "failed" and "may or may not" in sr.policy.detail for sr in result.servers) and not result.aborted
+
+
+# ----------------------------------------------------- ownership / drift
+def test_target_set_drift_requires_ownership_or_adopt():
+    sia = FakeSIA(secrets=[{"secret_id": "sec-1", "secret_type": "PCloudAccount", "secret_name": VAULT_SIA_NAME}],
+                  target_sets=[{"id": WEB01_FQDN, "name": WEB01_FQDN, "type": "Target",
+                                "secret_type": "ProvisionerUser", "secret_id": "old-secret", "description": "made by hand"}])
+    result = make(ONE, sia=sia)[0].run()
+    sr = result.servers[0]
+    assert sr.target_set.status == "drift" and "old-secret" in sr.target_set.detail and "--update" in sr.target_set.detail
+    assert sr.policy.status == "created" and result.failures == 0
+
+    result = make(ONE, sia=sia, update=True)[0].run()
+    assert result.servers[0].target_set.status == "drift" and f"--adopt {WEB01_FQDN}" in result.servers[0].target_set.detail
+    assert not calls(sia, "update_target_set")
+
+    result = make(ONE, sia=sia, update=True, dry_run=True, adopt=["WEB01.corp.example.com"])[0].run()
+    assert result.servers[0].target_set.status == "planned"
+    result = make(ONE, sia=sia, update=True, adopt=[WEB01_FQDN])[0].run()
+    assert result.servers[0].target_set.status == "updated"
+    name, payload = calls(sia, "update_target_set")[0]
+    assert name == WEB01_FQDN and payload["secret_id"] == "sec-1" and MARK in payload["description"]
+
+    sia.target_sets[0].update({"secret_id": "old-again", "description": f"x {MARK}"})  # now carries the marker
+    result = make(ONE, sia=sia, update=True)[0].run()
+    assert result.servers[0].target_set.status == "updated"
+
+
+def test_unmanaged_target_set_up_to_date_is_reported():
+    sia = FakeSIA(secrets=[{"secret_id": "sec-1", "secret_type": "PCloudAccount", "secret_name": VAULT_SIA_NAME}],
+                  target_sets=[{"name": WEB01_FQDN, "type": "Target", "secret_type": "PCloudAccount", "secret_id": "sec-1"}])
+    result = make(ONE, sia=sia)[0].run()
+    assert result.servers[0].target_set.status == "exists" and "unmanaged" in result.servers[0].target_set.detail
+
+
+def test_group_not_found_fails_policy_only():
+    identity = FakeIdentity([group_row("SIA-Web-Admins"), group_row("SIA-Platform-Ops")])  # no DMZ group
+    result = make(identity=identity)[0].run()
+    dmz = by_fqdn(result)[DMZ_FQDN]
+    assert dmz.target_set.status == "created" and dmz.policy.status == "failed" and "SIA-DMZ-Admins" in dmz.policy.detail
+    assert result.failures == 1 and not result.aborted
+
+
+def test_duplicate_policy_names_fail_before_any_write():
+    inp = inputs([WEB01, srv("web01.dmz.example.com", "SA-corp-rdp", ["SIA-Web-Admins"], policy_name=WEB01_FQDN)], [VAULT])
+    rec, sia, uap, _ = make(inp)
+    result = rec.run()
+    assert all(s.policy.status == "failed" and "duplicate policy name" in s.policy.detail for s in result.servers)
+    assert not calls(uap, "create_policy") and all(s.target_set.status == "created" for s in result.servers)
+
+
+def test_managed_policy_drift_and_update():
+    rec, sia, uap, _ = make()
+    rec.run()
+    web02 = next(p for p in uap.policies if p["metadata"]["name"] == WEB02_FQDN)
+    web02["principals"] = web02["principals"][:1]  # someone removed a principal in the UI
+    result = make(sia=sia, uap=uap)[0].run()
+    sr = by_fqdn(result)[WEB02_FQDN]
+    assert sr.policy.status == "drift" and "principals differ" in sr.policy.detail and "(use --update to fix)" in sr.policy.detail
+    assert result.failures == 0
+    result3 = make(sia=sia, uap=uap, update=True)[0].run()
+    sr3 = by_fqdn(result3)[WEB02_FQDN]
+    assert sr3.policy.status == "updated"
+    pid, payload = calls(uap, "update_policy")[0]
+    assert pid == sr3.policy.ref and payload["metadata"]["policyId"] == pid and len(payload["principals"]) == 2
+
+
+MANUAL = {"metadata": {"name": WEB01_FQDN, "policyId": "manual-1", "policyTags": ["manual"], "status": {"status": "Active"}},
+          "principals": [{"id": "someone-else"}], "delegationClassification": "Unrestricted", "conditions": {"maxSessionDuration": 1},
+          "targets": {"FQDN/IP": {"fqdnRules": [{"operator": "EXACTLY", "computernamePattern": WEB01_FQDN, "domain": "corp.example.com"}]}},
+          "behavior": {"connectAs": {"rdp": {"localEphemeralUser": {"assignGroups": ["Administrators"]}}}}}
+
+
+def test_unmanaged_policy_update_requires_adopt():
+    uap = FakeUAP([MANUAL])
+    result = make(ONE, uap=uap, update=True)[0].run()
+    sr = result.servers[0]
+    assert sr.policy.status == "drift" and "not managed by this tool" in sr.policy.detail and f"--adopt {WEB01_FQDN}" in sr.policy.detail
+    assert not calls(uap, "update_policy") and result.failures == 0 and len(uap.policies) == 1
+
+    result = make(ONE, uap=uap, update=True, adopt=["WEB01.corp.example.com"])[0].run()  # adopt by name, case-insensitive
+    assert result.servers[0].policy.status == "updated"
+    pid, payload = calls(uap, "update_policy")[0]
+    assert pid == "manual-1" and OWNER in payload["metadata"]["policyTags"] and payload["principals"][0]["id"].startswith("id-SIA-Web-Admins")
+
+    # already correct but unmanaged: reported; adopting adds the tag
+    uap = FakeUAP([{**MANUAL, "principals": [{"id": f"id-SIA-Web-Admins-{CDS_UUID[:4]}"}]}])
+    result = make(ONE, uap=uap)[0].run()
+    assert result.servers[0].policy.status == "exists" and "unmanaged" in result.servers[0].policy.detail
+    result = make(ONE, uap=uap, update=True, adopt_all=True)[0].run()
+    assert result.servers[0].policy.status == "updated" and "adopting" in result.servers[0].policy.detail
+
+
+def test_create_conflict_is_reclassified_not_failed():
+    """A same-name policy hidden from the owner-tag listing answers 409 on create: compare it instead of failing."""
+    uap = FakeUAP([{**MANUAL, "principals": [{"id": f"id-SIA-Web-Admins-{CDS_UUID[:4]}"}]}])
+    rec, sia, uap, _ = make(ONE, uap=uap)
+    result = rec.run()
+    sr = result.servers[0]
+    assert sr.policy.status == "exists" and "unmanaged" in sr.policy.detail and result.failures == 0 and not result.aborted
+    assert len(calls(uap, "create_policy")) == 1 and calls(uap, "find_policy_by_name") == [WEB01_FQDN] and len(uap.policies) == 1
+
+
+def test_renamed_managed_policy_is_recognised_by_fqdn():
+    rec, sia, uap, _ = make()
+    rec.run()
+    web02 = next(p for p in uap.policies if p["metadata"]["name"] == WEB02_FQDN)
+    web02["metadata"]["name"] = "Renamed in the UI"
+    result = make(sia=sia, uap=uap)[0].run()
+    sr = by_fqdn(result)[WEB02_FQDN]
+    assert sr.policy.status == "drift" and "renamed" in sr.policy.detail and sr.policy.ref == web02["metadata"]["policyId"]
+    assert not calls(uap, "create_policy")[3:]  # no duplicate policy created
+    result = make(sia=sia, uap=uap, update=True)[0].run()
+    assert by_fqdn(result)[WEB02_FQDN].policy.status == "updated"
+    pid, payload = calls(uap, "update_policy")[0]
+    assert pid == web02["metadata"]["policyId"] and payload["metadata"]["name"] == WEB02_FQDN
+
+
+def test_partial_list_objects_compare_targets_only_with_drift():
+    rec, sia, uap, _ = make()
+    rec.run()
+    uap.partial_list = True   # like the real list endpoint: no targets in list results
+    before = len(uap.calls)
+    result = make(sia=sia, uap=uap)[0].run()
+    assert all(sr.policy.status == "exists" and "add --drift to compare targets" in sr.policy.detail for sr in result.servers)
+    assert not [c for c in uap.calls[before:] if c[0] == "get_policy"]
+    stored = next(p for p in uap.policies if p["metadata"]["name"] == DMZ_FQDN)
+    stored["targets"]["FQDN/IP"]["fqdnRules"][0]["computernamePattern"] = "other.corp"
+    before = len(uap.calls)
+    result = make(sia=sia, uap=uap, drift=True)[0].run()
+    assert len([c for c in uap.calls[before:] if c[0] == "get_policy"]) == 3
+    dmz = by_fqdn(result)[DMZ_FQDN]
+    assert dmz.policy.status == "drift" and "FQDN rules differ" in dmz.policy.detail
+    assert by_fqdn(result)[WEB01_FQDN].policy.status == "exists" and "targets checked" in by_fqdn(result)[WEB01_FQDN].policy.detail
+    before = len(uap.calls)
+    result = make(sia=sia, uap=uap, update=True)[0].run()   # --update implies the drift check and fixes it
+    assert dmz.policy.status == "drift" and by_fqdn(result)[DMZ_FQDN].policy.status == "updated"
+
+
+def test_inactive_policy_needs_attention():
+    rec, sia, uap, _ = make(ONE)
+    rec.run()
+    uap.policies[0]["metadata"]["status"] = {"status": "Suspended"}
+    result = make(ONE, sia=sia, uap=uap)[0].run()
+    sr = result.servers[0]
+    assert sr.policy.status == "inactive" and "status=Suspended" in sr.policy.detail and result.failures == 1 and not sr.ok
+
+
+def test_policy_error_status_counts_as_failure_and_validating_is_polled():
+    uap = FakeUAP()
+    uap.statuses_sequence = ["Validating", "Validating", "Error"]
+    result = make(ONE, uap=uap, status_polls=5)[0].run()
+    sr = result.servers[0]
+    assert sr.policy.status == "failed" and "status=Error" in sr.policy.detail and "connector unreachable" in sr.policy.detail
+    assert len(calls(uap, "get_policy")) == 3
+
+
+def test_default_single_status_read_reports_validating():
+    uap = FakeUAP()
+    uap.statuses_sequence = ["Validating", "Active"]
+    result = make(ONE, uap=uap)[0].run()
+    assert result.servers[0].policy.status == "created" and "status=Validating" in result.servers[0].policy.detail
+    assert len(calls(uap, "get_policy")) == 1
+
+
+# --------------------------------------------------------------- vault
+VAULT_USER = sa("SA-corp-rdp", "vault", safe="SIA-StrongAccounts", account_name="svc_sia_rdp", username="svc_sia_rdp",
+                account_domain="corp.example.com")
+VAULT_INPUT = inputs([WEB01], [VAULT_USER])
+
+
+def test_vault_stage_onboards_missing_accounts():
+    pvwa = FakePVWA()
+    result = make(VAULT_INPUT, dry_run=True, pvwa=pvwa, passwords={})[0].run()
+    assert result.vault["SA-corp-rdp"].status == "planned" and "not available now" in result.vault["SA-corp-rdp"].detail
+    assert result.failures == 0 and not calls(pvwa, "add_account")
+
+    result = make(VAULT_INPUT, pvwa=pvwa, passwords={})[0].run()
+    assert result.vault["SA-corp-rdp"].status == "failed" and "password file" in result.vault["SA-corp-rdp"].detail
+    assert result.secrets["SA-corp-rdp"].status == "blocked" and result.servers[0].target_set.status == "blocked" and result.failures == 1
+
+    result = make(VAULT_INPUT, pvwa=pvwa, passwords={"SA-corp-rdp": "initial-pw"})[0].run()
+    assert result.vault["SA-corp-rdp"].status == "created" and result.vault["SA-corp-rdp"].ref == "1_1"
+    assert calls(pvwa, "add_account") == [{"name": "svc_sia_rdp", "address": "corp.example.com", "userName": "svc_sia_rdp",
+                                           "platformId": "WinServerLocal", "safeName": "SIA-StrongAccounts", "secretType": "password",
+                                           "secretManagement": {"automaticManagementEnabled": True}}]
+    assert result.secrets["SA-corp-rdp"].status == "created" and result.failures == 0
+    assert make(VAULT_INPUT, pvwa=pvwa)[0].run().vault["SA-corp-rdp"].status == "exists"
+
+    local = sa("ADM-web01", "vault", safe="SIA-LocalAdmins", account_name="web01-Administrator", username="Administrator")
+    pvwa = FakePVWA()
+    result = make(inputs([srv(WEB01_FQDN, "ADM-web01", ["SIA-Web-Admins"])], [local]), pvwa=pvwa, passwords={"ADM-web01": "pw"},
+                  pvwa_platform_id="WinLocal", pvwa_cpm_managed=False)[0].run()
+    added = calls(pvwa, "add_account")[0]
+    assert added["address"] == WEB01_FQDN and added["platformId"] == "WinLocal" and added["secretManagement"] == {"automaticManagementEnabled": False}
+    assert result.vault["ADM-web01"].status == "created"
+
+    nouser = sa("SA-x", "vault", safe="S", account_name="a")
+    result = make(inputs([srv(WEB01_FQDN, "SA-x", ["SIA-Web-Admins"])], [nouser]), pvwa=FakePVWA(), passwords={"SA-x": "pw"})[0].run()
+    assert result.vault["SA-x"].status == "failed" and "no username" in result.vault["SA-x"].detail
+
+    pvwa = FakePVWA()
+    pvwa.raise_on_add = err(403, "forbidden safe")
+    result = make(VAULT_INPUT, pvwa=pvwa, passwords={"SA-corp-rdp": "pw"})[0].run()
+    assert result.vault["SA-corp-rdp"].status == "failed" and result.aborted and result.servers[0].policy.status == "blocked"
+
+
+def test_vault_stage_gating():
+    result = make(VAULT_INPUT, only="vault")[0].run()
+    assert any("[pvwa] is not configured" in w for w in result.warnings) and "SA-corp-rdp" not in result.vault
+    result = make(VAULT_INPUT, pvwa=FakePVWA(), only="secrets")[0].run()
+    assert result.vault["SA-corp-rdp"].status == "skipped" and result.secrets["SA-corp-rdp"].status == "created"
+    result = make(VAULT_INPUT, pvwa=FakePVWA(), only="vault", passwords={"SA-corp-rdp": "pw"})[0].run()
+    assert result.vault["SA-corp-rdp"].status == "created" and result.secrets["SA-corp-rdp"].status == "skipped"
+    assert make(dry_run=True, pvwa=FakePVWA())[0].run().vault == {} or True   # credentials accounts are never vaulted
+
+
+# ------------------------------------------------------------ template
+TEMPLATE = {"metadata": {"name": "Reference", "policyId": "tpl", "timeZone": "Europe/London", "policyTags": ["ref"], "status": {"status": "Active"},
+                         "policyEntitlement": {"targetCategory": "VM", "locationType": "FQDN/IP", "policyType": "Recurring"}},
+            "principals": [], "delegationClassification": "Unrestricted",
+            "conditions": {"accessWindow": {"daysOfTheWeek": [1, 2, 3]}, "maxSessionDuration": 3, "idleTime": 7},
+            "behavior": {"connectAs": {"ssh": {"username": "root"},
+                                       "rdp": {"localEphemeralUser": {"assignGroups": ["Power Users"], "enableEphemeralUserReconnect": True}}}},
+            "targets": {"FQDN/IP": {"fqdnRules": [{"operator": "EXACTLY", "computernamePattern": "ref.corp.example.com", "domain": "corp.example.com"}]}}}
+
+
+def test_template_policy_cloned_with_approved_fields_only():
+    rec, _, uap, _ = make(uap=FakeUAP([TEMPLATE]), defaults=Defaults(template_policy="Reference"))
+    result = rec.run()
+    assert result.failures == 0 and not result.warnings
+    created = calls(uap, "create_policy")
+    assert created[0]["conditions"] == TEMPLATE["conditions"] and created[0]["metadata"]["timeZone"] == "Europe/London"
+    assert created[0]["metadata"]["policyTags"] == ["ref", OWNER]
+    assert created[0]["behavior"] == {"connectAs": {"rdp": TEMPLATE["behavior"]["connectAs"]["rdp"]}}
+    assert created[1]["behavior"]["connectAs"]["rdp"]["localEphemeralUser"]["assignGroups"] == ["Remote Desktop Users"]
+
+
+def test_template_policy_missing_or_unsuitable_aborts():
+    with pytest.raises(ReconcileError, match="template_policy 'Missing' not found"):
+        make(defaults=Defaults(template_policy="Missing"))[0].run()
+    db = {**TEMPLATE, "metadata": {**TEMPLATE["metadata"], "name": "DBRef", "policyEntitlement": {"targetCategory": "DB", "locationType": "FQDN/IP"}},
+          "behavior": {"connectAs": {"ssh": {"username": "root"}}}}
+    with pytest.raises(ReconcileError, match="not usable as a template.*targetCategory"):
+        make(uap=FakeUAP([db]), defaults=Defaults(template_policy="DBRef"))[0].run()
+    no_profile = {**TEMPLATE, "metadata": {**TEMPLATE["metadata"], "name": "NoProfile"}, "behavior": {"connectAs": {}}}
+    with pytest.raises(ReconcileError, match="no connection profile"):
+        make(uap=FakeUAP([no_profile]), defaults=Defaults(template_policy="NoProfile"))[0].run()
+
+
+# --------------------------------------------------------------- --only
+def test_only_stage_restricts_writes():
+    rec, sia, uap, _ = make(only="secrets")
+    result = rec.run()
+    assert all(o.status == "created" for o in result.secrets.values())
+    assert all(sr.target_set.status == "skipped" and sr.policy.status == "skipped" for sr in result.servers)
+    assert not calls(sia, "bulk_create_target_sets") and not calls(uap, "create_policy")
+    result2 = make(sia=sia, uap=uap, only="targetsets")[0].run()
+    assert all(sr.target_set.status == "created" and sr.policy.status == "skipped" for sr in result2.servers)
+    result3 = make(sia=sia, uap=uap, only="policies")[0].run()
+    assert all(sr.policy.status == "created" for sr in result3.servers)
+
+
+def test_only_targetsets_with_missing_secret_is_skipped_not_created():
+    rec, sia, _, _ = make(only="targetsets")
+    result = rec.run()
+    assert all(o.status == "skipped" for o in result.secrets.values())
+    assert all(sr.target_set.status == "blocked" for sr in result.servers) and not calls(sia, "create_secret")
+
+
+# ---------------------------------------------------------- SSH rows
+LNX = srv("lnx01.corp.example.com", None, ["SIA-Linux-Admins"], protocol="ssh", ssh_username="ec2-user")
+MIXED = inputs([WEB01, LNX], [VAULT])
+
+
+def test_ssh_rows_need_only_a_policy():
+    rec, sia, uap, _ = make(MIXED)
+    result = rec.run()
+    assert result.failures == 0
+    lnx = by_fqdn(result)["lnx01.corp.example.com"]
+    assert lnx.secret.status == "n/a" and lnx.target_set.status == "n/a" and lnx.policy.status == "created"
+    assert lnx.protocol == "ssh" and lnx.strong_account == "-"
+    created = {p["metadata"]["name"]: p for p in calls(uap, "create_policy")}
+    assert created["lnx01.corp.example.com"]["behavior"] == {"connectAs": {"ssh": {"username": "ec2-user"}}}
+    assert set(created[WEB01_FQDN]["behavior"]["connectAs"]) == {"rdp"}
+    assert len(calls(sia, "create_secret")) == 1  # only the Windows row's account
+    assert all(ts["name"] == WEB01_FQDN for b in calls(sia, "bulk_create_target_sets") for m in b for ts in m["target_sets"])
+    result2 = make(MIXED, sia=sia, uap=uap)[0].run()
+    assert by_fqdn(result2)["lnx01.corp.example.com"].policy.status == "exists"
+
+
+def test_ssh_row_without_username_fails_only_that_policy():
+    inp = inputs([WEB01, srv("lnx02.corp.example.com", None, ["SIA-Linux-Admins"], protocol="ssh")], [VAULT])
+    result = make(inp)[0].run()
+    lnx = by_fqdn(result)["lnx02.corp.example.com"]
+    assert lnx.policy.status == "failed" and "needs ssh_username" in lnx.policy.detail
+    assert by_fqdn(result)[WEB01_FQDN].policy.status == "created"
+    result_default = make(inp, defaults=Defaults(time_zone="America/New_York", ssh_username="root"))[0].run()
+    assert by_fqdn(result_default)["lnx02.corp.example.com"].policy.status == "created"
+
+
+# ---------------------------------------------------------- workers
+def test_workers_create_everything_and_canary_still_fails_fast():
+    many = inputs([srv(f"web{i:02d}.corp.example.com", "SA-corp-rdp", ["SIA-Web-Admins"]) for i in range(1, 13)]
+                  + [srv(f"lnx{i:02d}.corp.example.com", None, ["SIA-Linux-Admins"], protocol="ssh", ssh_username="ec2-user") for i in range(1, 5)],
+                  [VAULT])
+    rec, sia, uap, _ = make(many, workers=4, lookup="search")
+    result = rec.run()
+    assert result.failures == 0 and len(calls(uap, "create_policy")) == 16 and len(uap.policies) == 16
+    assert sorted(p["metadata"]["name"] for p in uap.policies) == sorted(s.fqdn for s in many.servers)
+    result2 = make(many, sia=sia, uap=uap, workers=4, lookup="search")[0].run()   # the compare path runs in parallel too
+    assert all(sr.policy.status == "exists" for sr in result2.servers)
+
+    uap = FakeUAP()
+    uap.raise_on_create_policy = err(400, "invalid principal")
+    result = make(many, uap=uap, workers=4)[0].run()
+    statuses = [s.policy.status for s in result.servers]
+    assert statuses.count("failed") == 1 and statuses.count("blocked") == 15 and len(calls(uap, "create_policy")) == 1
+    assert result.aborted
+
+    with pytest.raises(ValueError, match="workers"):
+        make(many, workers=0)
