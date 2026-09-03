@@ -1,0 +1,14 @@
+.venv/
+__pycache__/
+*.pyc
+
+# secrets — never commit
+.env
+config.toml
+*password*.csv
+
+# run artifacts
+reports/
+out/
+.sia-checkpoint.jsonl
+input/.sia-checkpoint.jsonl

@@ -1,0 +1,939 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="Prerequisites to complete on the CyberArk side before SIA server onboarding: what to create, what values to return, and where each one lands.">
+<title>SIA Tenant Handoff</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap">
+<style>
+  :root {
+    --ground:      #F5F7F9;
+    --surface:     #FFFFFF;
+    --surface-sub: #EDF1F5;
+    --ink:         #15191F;
+    --ink-mid:     #47525F;
+    --ink-soft:    #6C7787;
+    --rule:        #DBE2EA;
+    --rule-strong: #C3CEDA;
+    --accent:      #1F5F8B;
+    --accent-soft: #E3EDF4;
+    --blocking:    #A8492213;
+    --blocking-ink:#9C4520;
+    --ok:          #2C6B50;
+    --open:        #7E6414;
+    --open-bg:     #F5EFD8;
+
+    --f-sans: "IBM Plex Sans", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+    --f-mono: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+
+    --measure: 68ch;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --ground:      #101418;
+      --surface:     #171C22;
+      --surface-sub: #1F252D;
+      --ink:         #E6EBF1;
+      --ink-mid:     #A8B4C2;
+      --ink-soft:    #7D8998;
+      --rule:        #29313A;
+      --rule-strong: #3A444F;
+      --accent:      #6BADD6;
+      --accent-soft: #1B2C39;
+      --blocking:    #D9743F1A;
+      --blocking-ink:#E0946B;
+      --ok:          #6FBF97;
+      --open:        #D8BC63;
+      --open-bg:     #2B2718;
+    }
+  }
+
+  :root[data-theme="dark"] {
+    --ground:      #101418;
+    --surface:     #171C22;
+    --surface-sub: #1F252D;
+    --ink:         #E6EBF1;
+    --ink-mid:     #A8B4C2;
+    --ink-soft:    #7D8998;
+    --rule:        #29313A;
+    --rule-strong: #3A444F;
+    --accent:      #6BADD6;
+    --accent-soft: #1B2C39;
+    --blocking:    #D9743F1A;
+    --blocking-ink:#E0946B;
+    --ok:          #6FBF97;
+    --open:        #D8BC63;
+    --open-bg:     #2B2718;
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    background: var(--ground);
+    color: var(--ink);
+    font-family: var(--f-sans);
+    font-size: 15px;
+    line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  .shell {
+    max-width: 1180px;
+    margin: 0 auto;
+    padding: 0 28px 96px;
+  }
+
+  /* ---------------------------------------------------------- masthead */
+  .masthead {
+    border-bottom: 2px solid var(--ink);
+    padding: 56px 0 26px;
+    margin-bottom: 40px;
+  }
+  .eyebrow {
+    font-family: var(--f-mono);
+    font-size: 11.5px;
+    font-weight: 500;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--accent);
+    margin: 0 0 18px;
+  }
+  h1 {
+    font-family: var(--f-mono);
+    font-size: clamp(28px, 4.4vw, 44px);
+    font-weight: 600;
+    letter-spacing: -0.02em;
+    line-height: 1.1;
+    margin: 0 0 16px;
+    text-wrap: balance;
+  }
+  .standfirst {
+    font-size: 17px;
+    line-height: 1.55;
+    color: var(--ink-mid);
+    max-width: var(--measure);
+    margin: 0;
+  }
+  .meta-strip {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px 28px;
+    margin-top: 26px;
+    font-family: var(--f-mono);
+    font-size: 12px;
+    color: var(--ink-soft);
+  }
+  .meta-strip b {
+    color: var(--ink-mid);
+    font-weight: 500;
+  }
+
+  /* ---------------------------------------------------------- layout */
+  .body-grid {
+    display: grid;
+    grid-template-columns: 196px minmax(0, 1fr);
+    gap: 56px;
+    align-items: start;
+  }
+  @media (max-width: 900px) {
+    .body-grid { grid-template-columns: minmax(0, 1fr); gap: 0; }
+    .rail { display: none; }
+  }
+
+  .rail {
+    position: sticky;
+    top: 28px;
+    font-family: var(--f-mono);
+    font-size: 12px;
+  }
+  .rail-title {
+    text-transform: uppercase;
+    letter-spacing: 0.12em;
+    color: var(--ink-soft);
+    font-size: 10.5px;
+    padding-bottom: 10px;
+    border-bottom: 1px solid var(--rule);
+    margin-bottom: 4px;
+  }
+  .rail a {
+    display: grid;
+    grid-template-columns: 20px 1fr;
+    gap: 8px;
+    padding: 7px 0;
+    color: var(--ink-mid);
+    text-decoration: none;
+    border-bottom: 1px solid var(--rule);
+    line-height: 1.35;
+  }
+  .rail a:hover { color: var(--accent); }
+  .rail a:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .rail a span:first-child { color: var(--ink-soft); }
+
+  /* ---------------------------------------------------------- returns */
+  .returns {
+    background: var(--surface);
+    border: 1px solid var(--rule-strong);
+    margin-bottom: 52px;
+  }
+  .returns-head {
+    padding: 18px 22px 16px;
+    border-bottom: 1px solid var(--rule);
+  }
+  .returns-head h2 {
+    font-family: var(--f-mono);
+    font-size: 13px;
+    font-weight: 600;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    margin: 0 0 6px;
+    color: var(--ink);
+  }
+  .returns-head p {
+    margin: 0;
+    font-size: 13.5px;
+    color: var(--ink-soft);
+    max-width: var(--measure);
+  }
+  .returns-scroll { overflow-x: auto; }
+  table.returns-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 13px;
+  }
+  table.returns-table th {
+    font-family: var(--f-mono);
+    font-size: 10.5px;
+    font-weight: 500;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    text-align: left;
+    color: var(--ink-soft);
+    padding: 11px 22px;
+    border-bottom: 1px solid var(--rule);
+    white-space: nowrap;
+  }
+  table.returns-table td {
+    padding: 11px 22px;
+    border-bottom: 1px solid var(--rule);
+    vertical-align: top;
+    color: var(--ink-mid);
+  }
+  table.returns-table tr:last-child td { border-bottom: 0; }
+  table.returns-table td:first-child { color: var(--ink); font-weight: 500; white-space: nowrap; }
+  table.returns-table code { white-space: nowrap; }
+
+  /* ---------------------------------------------------------- sections */
+  section { margin-bottom: 52px; scroll-margin-top: 24px; }
+
+  .sec-head {
+    display: grid;
+    grid-template-columns: 34px minmax(0, 1fr);
+    gap: 14px;
+    align-items: baseline;
+    padding-bottom: 12px;
+    border-bottom: 1px solid var(--ink);
+    margin-bottom: 4px;
+  }
+  .sec-num {
+    font-family: var(--f-mono);
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--accent);
+    letter-spacing: 0.04em;
+  }
+  .sec-head h2 {
+    font-family: var(--f-mono);
+    font-size: 19px;
+    font-weight: 600;
+    letter-spacing: -0.01em;
+    margin: 0;
+    color: var(--ink);
+  }
+  .sec-owner {
+    grid-column: 2;
+    font-family: var(--f-mono);
+    font-size: 11px;
+    color: var(--ink-soft);
+    letter-spacing: 0.03em;
+    margin-top: 5px;
+  }
+  .sec-intro {
+    grid-column: 2;
+    font-size: 14px;
+    color: var(--ink-mid);
+    max-width: var(--measure);
+    margin: 10px 0 0;
+  }
+
+  /* items: hairline rows, not cards */
+  .item {
+    display: grid;
+    grid-template-columns: 34px minmax(0, 1fr) auto;
+    gap: 14px;
+    padding: 16px 0;
+    border-bottom: 1px solid var(--rule);
+    align-items: start;
+  }
+  @media (max-width: 640px) {
+    .item { grid-template-columns: 26px minmax(0, 1fr); gap: 10px; }
+    .item .dest { grid-column: 2; justify-self: start; margin-top: 4px; }
+  }
+  .tick {
+    font-family: var(--f-mono);
+    font-size: 11px;
+    color: var(--ink-soft);
+    padding-top: 3px;
+    letter-spacing: 0.03em;
+  }
+  .item-body p { margin: 0; }
+  .item-body .lede {
+    font-weight: 600;
+    color: var(--ink);
+    font-size: 14.5px;
+    margin-bottom: 4px;
+  }
+  .item-body .note {
+    font-size: 13.5px;
+    color: var(--ink-mid);
+    max-width: var(--measure);
+  }
+  .item-body .note + .note { margin-top: 6px; }
+
+  .dest {
+    font-family: var(--f-mono);
+    font-size: 11px;
+    color: var(--accent);
+    background: var(--accent-soft);
+    border: 1px solid transparent;
+    padding: 3px 8px;
+    white-space: nowrap;
+    align-self: start;
+    margin-top: 2px;
+  }
+
+  code, .mono {
+    font-family: var(--f-mono);
+    font-size: 0.88em;
+    background: var(--surface-sub);
+    padding: 1.5px 5px;
+    color: var(--ink);
+    word-break: break-word;
+  }
+  .path { color: var(--accent); }
+
+  /* callouts */
+  .callout {
+    border-left: 3px solid var(--blocking-ink);
+    background: var(--blocking);
+    padding: 14px 18px;
+    margin: 0 0 34px;
+  }
+  .callout .label {
+    font-family: var(--f-mono);
+    font-size: 10.5px;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--blocking-ink);
+    font-weight: 600;
+    display: block;
+    margin-bottom: 5px;
+  }
+  .callout p {
+    margin: 0;
+    font-size: 13.5px;
+    color: var(--ink-mid);
+    max-width: var(--measure);
+  }
+
+  .aside {
+    border-left: 3px solid var(--rule-strong);
+    padding: 4px 0 4px 16px;
+    margin: 16px 0 0 48px;
+    font-size: 13px;
+    color: var(--ink-soft);
+    max-width: var(--measure);
+  }
+  @media (max-width: 640px) { .aside { margin-left: 36px; } }
+  .aside p { margin: 0; }
+
+  /* open questions */
+  .q {
+    display: grid;
+    grid-template-columns: 34px minmax(0, 1fr);
+    gap: 14px;
+    padding: 14px 0;
+    border-bottom: 1px solid var(--rule);
+  }
+  .q-mark {
+    font-family: var(--f-mono);
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--open);
+    background: var(--open-bg);
+    text-align: center;
+    padding: 2px 0;
+    height: fit-content;
+    letter-spacing: 0.03em;
+  }
+  .q p { margin: 0; font-size: 13.5px; color: var(--ink-mid); max-width: var(--measure); }
+  .q .lede { font-weight: 600; color: var(--ink); font-size: 14.5px; margin-bottom: 3px; }
+
+  footer {
+    margin-top: 64px;
+    padding-top: 20px;
+    border-top: 1px solid var(--rule);
+    font-family: var(--f-mono);
+    font-size: 11.5px;
+    color: var(--ink-soft);
+    line-height: 1.7;
+  }
+  footer b { color: var(--ink-mid); font-weight: 500; }
+
+  a { color: var(--accent); }
+  :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  @media (prefers-reduced-motion: reduce) {
+    * { animation: none !important; transition: none !important; }
+  }
+</style>
+
+  <style>
+    :root { color-scheme: light; }
+    @media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) { color-scheme: dark; } }
+    :root[data-theme="dark"] { color-scheme: dark; }
+    html { -webkit-text-size-adjust: 100%; }
+    body { margin: 0; }
+    img { max-width: 100%; }
+    [hidden] { display: none !important; }
+  </style>
+</head>
+<body>
+<div class="shell">
+
+  <header class="masthead">
+    <p class="eyebrow">Prerequisites handoff · Secure Infrastructure Access</p>
+    <h1>SIA Tenant Handoff</h1>
+    <p class="standfirst">Everything that must exist on the CyberArk side before the server-onboarding automation
+    can be pointed at the tenant. The tool creates strong accounts, target sets and access policies — it creates
+    none of the things on this page.</p>
+    <div class="meta-strip">
+      <span><b>For:</b> CyberArk engineer</span>
+      <span><b>Returns:</b> 10 values + 1 exported policy</span>
+      <span><b>Blocks:</b> <code>preflight</code> until §1 is done</span>
+    </div>
+  </header>
+
+  <div class="body-grid">
+
+    <nav class="rail" aria-label="Sections">
+      <div class="rail-title">Sections</div>
+      <a href="#s1"><span>01</span><span>Service user</span></a>
+      <a href="#s2"><span>02</span><span>Tenant URLs</span></a>
+      <a href="#s3"><span>03</span><span>Identity groups</span></a>
+      <a href="#s4"><span>04</span><span>Vault accounts</span></a>
+      <a href="#s5"><span>05</span><span>PAM integration</span></a>
+      <a href="#s6"><span>06</span><span>Reference policy</span></a>
+      <a href="#s7"><span>07</span><span>Server &amp; network</span></a>
+      <a href="#s8"><span>08</span><span>Optional: PVWA</span></a>
+      <a href="#s9"><span>??</span><span>Open questions</span></a>
+    </nav>
+
+    <main>
+
+      <div class="callout">
+        <span class="label">Critical path</span>
+        <p>Section 1 is the only hard blocker — nothing can be tested until the service user authenticates.
+        Sections 2–8 can be gathered in parallel. Please start with §1 and send those two values as soon as
+        they exist, rather than waiting to return the whole sheet at once.</p>
+      </div>
+
+      <div class="returns">
+        <div class="returns-head">
+          <h2>Values to send back</h2>
+          <p>The right-hand column is the literal setting each value lands in, so nothing is ambiguous on return.
+          Send the password over a separate channel from the rest.</p>
+        </div>
+        <div class="returns-scroll">
+          <table class="returns-table">
+            <thead>
+              <tr><th>Value</th><th>Where you find it</th><th>Lands in</th></tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>Tenant subdomain</td>
+                <td>The <code>acme</code> in <code>https://acme.cyberark.cloud</code></td>
+                <td><code>[tenant] subdomain</code></td>
+              </tr>
+              <tr>
+                <td>Identity tenant URL</td>
+                <td>Identity Administration › Settings › Customization › Tenant URLs</td>
+                <td><code>[tenant] identity_url</code></td>
+              </tr>
+              <tr>
+                <td>Service user login</td>
+                <td>Created in §1, e.g. <code>svc_sia_automation@acme.cyberark.cloud</code></td>
+                <td><code>SIA_CLIENT_ID</code></td>
+              </tr>
+              <tr>
+                <td>Service user password</td>
+                <td>Set at creation — <b>send separately</b></td>
+                <td><code>SIA_CLIENT_SECRET</code></td>
+              </tr>
+              <tr>
+                <td>Identity group names</td>
+                <td>Exact <code>SystemName</code> of each group that may connect</td>
+                <td><code>servers.csv</code> · <code>group</code></td>
+              </tr>
+              <tr>
+                <td>Directory per group</td>
+                <td>Only where one name exists in two directories</td>
+                <td><code>groups.csv</code> · <code>directory</code></td>
+              </tr>
+              <tr>
+                <td>Safe holding local admins</td>
+                <td>Vault, e.g. <code>SIA-LocalAdmins</code></td>
+                <td><code>strong_account_safe_template</code></td>
+              </tr>
+              <tr>
+                <td>Vault account naming rule</td>
+                <td>e.g. <code>&lt;hostname&gt;-Administrator</code></td>
+                <td><code>strong_account_account_name_template</code></td>
+              </tr>
+              <tr>
+                <td>Windows local admin user</td>
+                <td>e.g. <code>Administrator</code></td>
+                <td><code>strong_account_username_template</code></td>
+              </tr>
+              <tr>
+                <td>Access window + time zone</td>
+                <td>Organizational decision — days, hours, zone</td>
+                <td><code>days_of_week</code>, <code>from_hour</code>, <code>to_hour</code>, <code>time_zone</code></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- 1 -->
+      <section id="s1">
+        <div class="sec-head">
+          <span class="sec-num">01</span>
+          <h2>Service user</h2>
+          <p class="sec-owner">Owner: Identity administrator</p>
+          <p class="sec-intro">One non-interactive Identity user. The automation authenticates as this user for
+          every call it makes — to SIA, to the policy service, and to Identity itself.</p>
+        </div>
+
+        <div class="item">
+          <span class="tick">1.1</span>
+          <div class="item-body">
+            <p class="lede">Create the Identity user</p>
+            <p class="note">A service account, not a person. Password should not expire and the user must be
+            exempt from MFA — the tool runs unattended and cannot answer a challenge.</p>
+          </div>
+          <span class="dest">SIA_CLIENT_ID</span>
+        </div>
+
+        <div class="item">
+          <span class="tick">1.2</span>
+          <div class="item-body">
+            <p class="lede">Tick <span class="mono">Is OAuth confidential client</span></p>
+            <p class="note">This flag is what enables <code class="path">POST /oauth2/platformtoken</code> with a
+            client-credentials grant. Without it, authentication fails at the first call with HTTP 400/401 and
+            nothing else can be tested.</p>
+          </div>
+        </div>
+
+        <div class="item">
+          <span class="tick">1.3</span>
+          <div class="item-body">
+            <p class="lede">Add to the Secure Infrastructure Access administrator role</p>
+            <p class="note">Internally named <code>DpaAdmin</code>. Grants the strong-account, target-set and
+            policy permissions below. Without it, authentication succeeds but every read returns HTTP 403.</p>
+          </div>
+        </div>
+
+        <div class="item">
+          <span class="tick">1.4</span>
+          <div class="item-body">
+            <p class="lede">Confirm the user can query directories</p>
+            <p class="note">Group-to-principal resolution calls
+            <code class="path">GET Core/GetDirectoryServices</code> and
+            <code class="path">POST UserMgmt/DirectoryServiceQuery</code> on the Identity tenant. This is a
+            separate permission from the SIA role and is the most common 403 in practice.</p>
+            <p class="note">If Identity rejects the platform token, there is a documented fallback — the tool can
+            switch to the service-user OIDC flow instead. Just tell us which one works; no extra setup either way.</p>
+          </div>
+        </div>
+
+        <div class="aside">
+          <p><b>Permissions the user actually exercises:</b>
+          read/create strong accounts (<code class="path">/api/secrets</code>),
+          read/create/update target sets (<code class="path">/api/targetsets</code>),
+          read/create/update access policies (<code class="path">/api/policies</code>),
+          read tenant settings (<code class="path">/api/settings</code>, optional — the tool degrades gracefully
+          on 403), and the two Identity directory calls above. It never deletes anything.</p>
+        </div>
+      </section>
+
+      <!-- 2 -->
+      <section id="s2">
+        <div class="sec-head">
+          <span class="sec-num">02</span>
+          <h2>Tenant URLs</h2>
+          <p class="sec-owner">Owner: CyberArk engineer · 2 values</p>
+          <p class="sec-intro">Two strings. Everything else is derived from them.</p>
+        </div>
+
+        <div class="item">
+          <span class="tick">2.1</span>
+          <div class="item-body">
+            <p class="lede">Tenant subdomain</p>
+            <p class="note">Lowercase, the bare subdomain only — <code>acme</code>, not the full URL. The tool
+            derives <code>acme.dpa.cyberark.cloud</code> (SIA), <code>acme.uap.cyberark.cloud</code> (policies)
+            and <code>acme.rdp.cyberark.cloud</code> (the RDP gateway) from it.</p>
+          </div>
+          <span class="dest">subdomain</span>
+        </div>
+
+        <div class="item">
+          <span class="tick">2.2</span>
+          <div class="item-body">
+            <p class="lede">Identity tenant URL</p>
+            <p class="note">From Identity Administration › Settings › Customization › Tenant URLs — the
+            <code>https://abc1234.id.cyberark.cloud</code> form. No trailing slash. The tenant alias
+            <code>https://acme.cyberark.cloud</code> also works if the ID form is awkward to obtain.</p>
+          </div>
+          <span class="dest">identity_url</span>
+        </div>
+      </section>
+
+      <!-- 3 -->
+      <section id="s3">
+        <div class="sec-head">
+          <span class="sec-num">03</span>
+          <h2>Identity groups</h2>
+          <p class="sec-owner">Owner: Identity administrator</p>
+          <p class="sec-intro">Each generated policy grants access to one Identity group. The groups must exist
+          first — the tool looks them up by name and fails the row if the name does not resolve to exactly one group.</p>
+        </div>
+
+        <div class="item">
+          <span class="tick">3.1</span>
+          <div class="item-body">
+            <p class="lede">Create or confirm each group, and send the exact names</p>
+            <p class="note">Matching is on <code>SystemName</code> or <code>DisplayName</code>, so a near-miss
+            like <code>SIA_Web_Admins</code> versus <code>SIA-Web-Admins</code> fails. Exact spelling matters more
+            than anything else on this page.</p>
+          </div>
+          <span class="dest">group</span>
+        </div>
+
+        <div class="item">
+          <span class="tick">3.2</span>
+          <div class="item-body">
+            <p class="lede">Flag any name that exists in more than one directory</p>
+            <p class="note">If the same group name lives in both Cloud Directory and AD, the lookup is ambiguous
+            and the row fails. Tell us the directory to pin for those names — everything else is found by name alone.</p>
+          </div>
+          <span class="dest">groups.csv</span>
+        </div>
+
+        <div class="aside">
+          <p>Each group must resolve to a row carrying <code>InternalName</code>,
+          <code>DirectoryServiceUuid</code> and <code>ServiceInstanceLocalized</code> — these become the policy's
+          principal. A group that exists but returns an incomplete row cannot be used.</p>
+        </div>
+      </section>
+
+      <!-- 4 -->
+      <section id="s4">
+        <div class="sec-head">
+          <span class="sec-num">04</span>
+          <h2>Vault accounts and the naming convention</h2>
+          <p class="sec-owner">Owner: Vault administrator</p>
+          <p class="sec-intro">The design is one strong account per server — each server's own local administrator,
+          referenced from the Vault. This is usually the longest-lead item, because it is per-server rather than
+          per-tenant.</p>
+        </div>
+
+        <div class="item">
+          <span class="tick">4.1</span>
+          <div class="item-body">
+            <p class="lede">Name the Safe holding the local administrator accounts</p>
+            <p class="note">One Safe for all of them, e.g. <code>SIA-LocalAdmins</code>. The service user needs
+            no direct Vault access — SIA holds only a reference and the CPM rotates the password.</p>
+          </div>
+          <span class="dest">safe_template</span>
+        </div>
+
+        <div class="item">
+          <span class="tick">4.2</span>
+          <div class="item-body">
+            <p class="lede">Confirm the account naming rule inside that Safe</p>
+            <p class="note">The tool derives each account name from the hostname, e.g.
+            <code>&lt;hostname&gt;-Administrator</code>. Tell us the real convention — if accounts are named
+            differently, the template changes rather than the accounts.</p>
+          </div>
+          <span class="dest">account_name_template</span>
+        </div>
+
+        <div class="item">
+          <span class="tick">4.3</span>
+          <div class="item-body">
+            <p class="lede">Confirm the Windows user name on those accounts</p>
+            <p class="note">Typically <code>Administrator</code>. This is the local Windows account SIA logs on
+            with, distinct from its name in the Vault.</p>
+          </div>
+          <span class="dest">username_template</span>
+        </div>
+
+        <div class="item">
+          <span class="tick">4.4</span>
+          <div class="item-body">
+            <p class="lede">Tell us how many servers already have their account in the Vault</p>
+            <p class="note">A server whose account is missing fails that row. Two ways forward: onboard them in
+            the Vault first, or let the tool onboard the missing ones through the PVWA REST API (§8), which needs
+            each account's current password supplied to it.</p>
+          </div>
+        </div>
+
+        <div class="aside">
+          <p><b>Naming note:</b> SIA generates the reference name as
+          <code>&lt;account_name&gt;_&lt;safe&gt;</code> — e.g. <code>web01-Administrator_SIA-LocalAdmins</code> —
+          and rejects custom names. The tool matches that format deliberately, so it always finds the right
+          reference on re-runs.</p>
+        </div>
+      </section>
+
+      <!-- 5 -->
+      <section id="s5">
+        <div class="sec-head">
+          <span class="sec-num">05</span>
+          <h2>PAM integration and connectors</h2>
+          <p class="sec-owner">Owner: CyberArk engineer · PAM Self-Hosted 14.4+</p>
+          <p class="sec-intro">SIA has to know which Vault to read strong-account passwords from, and needs
+          connectors that can reach the servers. Neither is created by the tool; both are read back by
+          <code>preflight</code>.</p>
+        </div>
+
+        <div class="item">
+          <span class="tick">5.1</span>
+          <div class="item-body">
+            <p class="lede">Complete the PAM Self-Hosted integration in SIA settings</p>
+            <p class="note">The tool reads <code class="path">GET /api/settings</code> and checks four fields on
+            <code>self_hosted_pam</code>: <code>tenant_type</code> (must be <code>SELF_HOSTED</code>, not
+            <code>PCLOUD</code>), <code>pvwa_base_url</code>, <code>connector_pool_id</code> and
+            <code>service_user_secret_id</code>. Any missing field is reported as
+            <span class="mono">incomplete</span>.</p>
+          </div>
+        </div>
+
+        <div class="item">
+          <span class="tick">5.2</span>
+          <div class="item-body">
+            <p class="lede">Confirm connectors are deployed and reach the target servers</p>
+            <p class="note">The connector opens WinRM to each Windows server to create and remove the temporary
+            user. This is a connection-time dependency, not an onboarding one — policies will be created
+            successfully and then fail to connect if it is missing.</p>
+          </div>
+        </div>
+      </section>
+
+      <!-- 6 -->
+      <section id="s6">
+        <div class="sec-head">
+          <span class="sec-num">06</span>
+          <h2>One reference policy, built by hand</h2>
+          <p class="sec-owner">Owner: CyberArk engineer · returns a JSON export</p>
+          <p class="sec-intro">The single most valuable thing on this page. Tenants encode a few policy details
+          differently, and this is how we confirm the generated policies will match yours before creating
+          thousands of them.</p>
+        </div>
+
+        <div class="item">
+          <span class="tick">6.1</span>
+          <div class="item-body">
+            <p class="lede">Create one zero-standing-privilege VM policy in the portal, by hand</p>
+            <p class="note">For one server, looking exactly the way you want every generated policy to look:
+            the right access window, session limits, and RDP connection profile. Then send us its name.</p>
+          </div>
+        </div>
+
+        <div class="item">
+          <span class="tick">6.2</span>
+          <div class="item-body">
+            <p class="lede">We export and compare it</p>
+            <p class="note">We run <code>show-policy</code> against it and check three things: how
+            <code>targets.fqdnRules</code> encodes the server (we expect operator <code>EXACTLY</code>, the full
+            FQDN in <code>computernamePattern</code>, the DNS domain in <code>domain</code>), what
+            <code>sourceDirectoryId</code> and <code>sourceDirectoryName</code> your principals carry, and which
+            fields the list endpoint returns.</p>
+          </div>
+        </div>
+
+        <div class="aside">
+          <p>This policy can also be reused as a live template — every generated policy then clones its access
+          window, session settings and connection profile, so those stay maintained in one place in the portal
+          rather than in our config file.</p>
+        </div>
+      </section>
+
+      <!-- 7 -->
+      <section id="s7">
+        <div class="sec-head">
+          <span class="sec-num">07</span>
+          <h2>Server and network prerequisites</h2>
+          <p class="sec-owner">Owner: Windows / GPO and network teams</p>
+          <p class="sec-intro">Not the CyberArk engineer's work, but worth forwarding in the same thread — these
+          block connections, not onboarding, so they surface late and painfully if missed.</p>
+        </div>
+
+        <div class="item">
+          <span class="tick">7.1</span>
+          <div class="item-body">
+            <p class="lede">WinRM reachable from the connectors</p>
+            <p class="note">TCP 5985 (HTTP) or 5986 (HTTPS). If certificates are valid on the targets, say so —
+            we can turn on certificate validation for the target sets rather than leaving it off.</p>
+          </div>
+        </div>
+
+        <div class="item">
+          <span class="tick">7.2</span>
+          <div class="item-body">
+            <p class="lede"><span class="mono">LocalAccountTokenFilterPolicy = 1</span> via GPO</p>
+            <p class="note">Local accounts cannot be used remotely without it. Push it before the first
+            connection test, not after.</p>
+          </div>
+        </div>
+
+        <div class="item">
+          <span class="tick">7.3</span>
+          <div class="item-body">
+            <p class="lede">Local admin account state on each server</p>
+            <p class="note">In the local <span class="mono">Administrators</span> group, marked
+            <span class="mono">Account is sensitive and cannot be delegated</span>, and <em>not</em> a member of
+            <span class="mono">Protected Users</span>.</p>
+          </div>
+        </div>
+
+        <div class="item">
+          <span class="tick">7.4</span>
+          <div class="item-body">
+            <p class="lede">Exclude domain controllers from the server list</p>
+            <p class="note">SIA does not support RDP to domain controllers. If any are in scope, they need a
+            different access path and should be filtered out of the inventory before we build the CSV.</p>
+          </div>
+        </div>
+      </section>
+
+      <!-- 8 -->
+      <section id="s8">
+        <div class="sec-head">
+          <span class="sec-num">08</span>
+          <h2>Optional — PVWA onboarding stage</h2>
+          <p class="sec-owner">Owner: Vault administrator · only if 4.4 found gaps</p>
+          <p class="sec-intro">Skip this entirely if every local admin account is already in the Vault. It exists
+          so the tool can onboard the missing ones itself instead of blocking the rollout.</p>
+        </div>
+
+        <div class="item">
+          <span class="tick">8.1</span>
+          <div class="item-body">
+            <p class="lede">PVWA base URL and authentication method</p>
+            <p class="note">The <code>https://</code> URL of the PAM Self-Hosted PVWA, and whether logon is
+            <code>CyberArk</code> or <code>LDAP</code>.</p>
+          </div>
+          <span class="dest">[pvwa]</span>
+        </div>
+
+        <div class="item">
+          <span class="tick">8.2</span>
+          <div class="item-body">
+            <p class="lede">A PVWA user permitted to add accounts to the Safe</p>
+            <p class="note">Separate from the SIA service user. Add-account permission on the target Safe only —
+            nothing broader is used.</p>
+          </div>
+          <span class="dest">PVWA_USER</span>
+        </div>
+
+        <div class="item">
+          <span class="tick">8.3</span>
+          <div class="item-body">
+            <p class="lede">Confirm the platform ID for onboarded accounts</p>
+            <p class="note">The tool defaults to <code>WinServerLocal</code>. If your platform differs, or
+            mandates extra required properties on new accounts, we need to know before the first onboarding run.</p>
+          </div>
+          <span class="dest">platform_id</span>
+        </div>
+
+        <div class="aside">
+          <p>This stage also needs each account's <em>current</em> password supplied to the tool so it can hand it
+          to the Vault. With every account already vaulted, no password ever passes through the tooling at all —
+          which is the strong reason to prefer pre-onboarding where it is feasible.</p>
+        </div>
+      </section>
+
+      <!-- 9 -->
+      <section id="s9">
+        <div class="sec-head">
+          <span class="sec-num">??</span>
+          <h2>Open questions for CyberArk</h2>
+          <p class="sec-owner">Answers wanted before the large waves, not before the first server</p>
+          <p class="sec-intro">These do not block a pilot. They do determine how fast we can go afterwards, and
+          no published answer was found in the documentation.</p>
+        </div>
+
+        <div class="q">
+          <span class="q-mark">Q1</span>
+          <div>
+            <p class="lede">Are there limits on object counts per tenant?</p>
+            <p>Specifically the number of access policies, target sets and strong accounts. The programme is
+            sized at 70,000–140,000 policies, which is well beyond anything documented.</p>
+          </div>
+        </div>
+
+        <div class="q">
+          <span class="q-mark">Q2</span>
+          <div>
+            <p class="lede">What are the API rate limits?</p>
+            <p>The tool has a shared rate limiter and parallel workers, both configurable. We would rather set
+            them from a published number than discover the limit by tripping it.</p>
+          </div>
+        </div>
+
+        <div class="q">
+          <span class="q-mark">Q3</span>
+          <div>
+            <p class="lede">What does a user see when two policies match the same user and server?</p>
+            <p>Servers with a second group get a second policy. We want to confirm the portal behaviour before
+            that pattern is used at scale.</p>
+          </div>
+        </div>
+
+        <div class="q">
+          <span class="q-mark">Q4</span>
+          <div>
+            <p class="lede">Does the policy list endpoint return principals?</p>
+            <p>Answered by the export in §6. If it does, re-runs over finished servers cost a fraction of the
+            requests — this is the difference between a cheap weekly reconcile and an expensive one.</p>
+          </div>
+        </div>
+      </section>
+
+      <footer>
+        <p><b>What happens once §1 and §2 come back:</b> we run <code>preflight</code>, which authenticates,
+        detects which API variants this tenant serves, and prints the tenant's current strong-account, target-set
+        and policy counts. It is entirely read-only. Every line should say OK — anything that does not comes
+        straight back to you with the exact error.</p>
+        <p>The first real run is one server, verified end to end with a live RDP login, before any list is loaded.</p>
+      </footer>
+
+    </main>
+  </div>
+</div>
+</body>
+</html>
