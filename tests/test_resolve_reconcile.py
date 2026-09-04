@@ -7,6 +7,7 @@ from sia.config import Defaults
 from sia.http import SIAApiError
 from sia.inputs import Inputs, ServerRow, StrongAccountRow
 from sia.reconcile import ReconcileError, Reconciler
+from sia.report import result_dict
 from sia.resolve import PrincipalResolver, ResolveError, SecretIndex
 from tests.fakes import AD_UUID, CDS_UUID, FakeIdentity, FakePVWA, FakeSIA, FakeUAP, group_row
 
@@ -676,3 +677,115 @@ def test_workers_create_everything_and_canary_still_fails_fast():
 
     with pytest.raises(ValueError, match="workers"):
         make(many, workers=0)
+
+
+# ------------------------------------------------- domain-scoped target sets
+
+DOM = "corp.example.com"
+CORP_SA = sa("SA-CORP-SIA", "existing", account_domain=DOM)
+DOM_SRV = [srv(f, "SA-CORP-SIA", ["SIA-Web-Admins"], target_set_name=DOM, target_set_type="Domain")
+           for f in (WEB01_FQDN, WEB02_FQDN)]
+DOMAIN_INPUTS = inputs(DOM_SRV, [CORP_SA])
+CORP_SECRET = {"secret_id": "sec-corp", "secret_name": "SA-CORP-SIA", "secret_type": "PCloudAccount"}
+
+
+def test_domain_target_set_is_created_once_for_the_whole_domain():
+    rec, sia, uap, _ = make(DOMAIN_INPUTS, sia=FakeSIA([CORP_SECRET]))
+    result = rec.run()
+    created = calls(sia, "bulk_create_target_sets")
+    assert len(created) == 1
+    sets = created[0][0]["target_sets"]
+    assert len(sets) == 1 and sets[0]["name"] == DOM and sets[0]["type"] == "Domain"
+    assert sets[0]["secret_id"] == "sec-corp" and MARK in sets[0]["description"]
+    assert DOM in sets[0]["description"] and WEB01_FQDN not in sets[0]["description"]
+    # ...and its outcome reaches both servers, which still get a policy each
+    rows = by_fqdn(result)
+    assert [rows[f].target_set.status for f in (WEB01_FQDN, WEB02_FQDN)] == ["created", "created"]
+    assert [rows[f].target_set.ref for f in (WEB01_FQDN, WEB02_FQDN)] == [DOM, DOM]
+    assert [rows[f].policy.status for f in (WEB01_FQDN, WEB02_FQDN)] == ["created", "created"]
+    assert len(calls(uap, "create_policy")) == 2
+    # the summary counts one target set, not one per server
+    assert result_dict(result)["counts"]["created"] == 3          # 1 target set + 2 policies
+
+
+def test_domain_target_set_found_by_a_later_wave():
+    """A wave holding only some servers of a domain finds the set the first wave created."""
+    existing = {"id": DOM, "name": DOM, "type": "Domain", "secret_id": "sec-corp", "secret_type": "PCloudAccount",
+                "description": f"RDP ZSP domain {DOM} via SA-CORP-SIA {MARK}"}
+    wave = inputs([DOM_SRV[1]], [CORP_SA])
+    rec, sia, _, _ = make(wave, sia=FakeSIA([CORP_SECRET], [existing]))
+    result = rec.run()
+    assert calls(sia, "bulk_create_target_sets") == []
+    assert result.servers[0].target_set.status == "exists"
+    assert "Domain -> SA-CORP-SIA" in result.servers[0].target_set.detail
+
+
+def test_domain_target_set_is_looked_up_by_domain_name():
+    rec, sia, _, _ = make(DOMAIN_INPUTS, sia=FakeSIA([CORP_SECRET]), lookup="search")
+    rec.run()
+    assert [name for _, name in calls(sia, "list_target_sets")] == [DOM]     # once, not once per server
+
+
+def test_domain_target_set_drift_warns_that_it_moves_every_server():
+    other = {"id": DOM, "name": DOM, "type": "Domain", "secret_id": "sec-other", "description": "hand made"}
+    rec, sia, _, _ = make(DOMAIN_INPUTS, sia=FakeSIA([CORP_SECRET], [other]))
+    result = rec.run()
+    row = by_fqdn(result)[WEB01_FQDN]
+    assert row.target_set.status == "drift"
+    assert f"re-pointing it moves every server in {DOM}" in row.target_set.detail
+    assert "use --update to re-point" in row.target_set.detail
+    assert row.policy.status == "created"          # drift is not a failure; the policy is still reconciled
+    # with --update but no ownership, the hint names the target set (not one of its servers)
+    rec2, _, _, _ = make(DOMAIN_INPUTS, sia=FakeSIA([CORP_SECRET], [other]), update=True)
+    assert f"--adopt {DOM}" in by_fqdn(rec2.run())[WEB01_FQDN].target_set.detail
+
+
+def test_domain_target_set_adopted_by_its_name():
+    other = {"id": DOM, "name": DOM, "type": "Domain", "secret_id": "sec-other", "description": "hand made"}
+    rec, sia, _, _ = make(DOMAIN_INPUTS, sia=FakeSIA([CORP_SECRET], [other]), update=True, adopt=[DOM])
+    result = rec.run()
+    name, payload = calls(sia, "update_target_set")[0]
+    assert name == DOM and payload["type"] == "Domain" and payload["secret_id"] == "sec-corp" and MARK in payload["description"]
+    assert all(r.target_set.status == "updated" for r in result.servers)
+
+
+def test_domain_and_workgroup_servers_in_one_run():
+    """Domain-joined servers share their domain's set; a workgroup server keeps its own Target set."""
+    local = sa("ADM-dmz01", "existing")
+    mixed = inputs(DOM_SRV + [srv(DMZ_FQDN, "ADM-dmz01", ["SIA-DMZ-Admins"], domain_joined=False)], [CORP_SA, local])
+    sia_fake = FakeSIA([CORP_SECRET, {"secret_id": "sec-dmz", "secret_name": "ADM-dmz01", "secret_type": "PCloudAccount"}])
+    rec, sia_fake, _, _ = make(mixed, sia=sia_fake)
+    result = rec.run()
+    made = {ts["name"]: ts["type"] for item in calls(sia_fake, "bulk_create_target_sets") for ts in item[0]["target_sets"]}
+    assert made == {DOM: "Domain", DMZ_FQDN: "Target"}
+    assert all(r.target_set.status == "created" for r in result.servers)
+
+
+def test_domain_target_set_blocked_when_its_strong_account_is_missing():
+    rec, sia, _, _ = make(DOMAIN_INPUTS, sia=FakeSIA([]))       # SA-CORP-SIA is type=existing and not in SIA
+    result = rec.run()
+    assert result.secrets["SA-CORP-SIA"].status == "failed"
+    for row in result.servers:
+        assert row.target_set.status == "blocked" and row.policy.status == "blocked"
+    assert calls(sia, "bulk_create_target_sets") == []
+
+
+def test_created_detail_names_the_target_set_type():
+    rec, _, _, _ = make(DOMAIN_INPUTS, sia=FakeSIA([CORP_SECRET]))
+    assert rec.run().servers[0].target_set.detail == f"Domain set {DOM} -> SA-CORP-SIA"
+    rec2, _, _, _ = make(ONE, sia=FakeSIA([{"secret_id": "s1", "secret_name": VAULT_SIA_NAME, "secret_type": "PCloudAccount"}]))
+    assert rec2.run().servers[0].target_set.detail == f"Target set {WEB01_FQDN} -> SA-corp-rdp"
+
+
+def test_adopting_a_domain_target_set_does_not_adopt_its_policies():
+    """--adopt <domain> names the shared target set only; the per-server policies stay unmanaged."""
+    other = {"id": DOM, "name": DOM, "type": "Domain", "secret_id": "sec-other", "description": "hand made"}
+    uap = FakeUAP([{"metadata": {"policyId": "p-old", "name": WEB01_FQDN, "policyTags": []},
+                    "principals": [{"id": "someone-else"}],
+                    "targets": {"FQDN/IP": {"fqdnRules": [{"operator": "EXACTLY", "computernamePattern": WEB01_FQDN}]}}}])
+    rec, sia, _, _ = make(DOMAIN_INPUTS, sia=FakeSIA([CORP_SECRET], [other]), uap=uap, update=True, adopt=[DOM])
+    result = rec.run()
+    rows = by_fqdn(result)
+    assert rows[WEB01_FQDN].target_set.status == "updated"          # the set was adopted
+    assert rows[WEB01_FQDN].policy.status == "drift"                # the policy was not
+    assert "not managed by this tool" in rows[WEB01_FQDN].policy.detail

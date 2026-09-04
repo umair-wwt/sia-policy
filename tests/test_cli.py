@@ -9,7 +9,7 @@ from sia.config import load_config
 from sia.http import SIAApiError
 from sia.inputs import StrongAccountRow
 from sia.redact import register_secret
-from tests.fakes import FakeIdentity, FakePVWA, FakeSIA, FakeUAP
+from tests.fakes import FakeIdentity, FakePVWA, FakeSIA, FakeUAP, group_row
 
 ROOT = Path(__file__).resolve().parents[1]
 POLICY_NAMES = ["web01.corp.example.com", "web01.corp.example.com-ops", "web02.corp.example.com", "SIA-RDP-dmz-app01-custom",
@@ -359,3 +359,83 @@ def test_password_file_flag_feeds_credentials_accounts(workspace, capsys, monkey
     assert created["secret"]["secret_data"]["password"] == "file-pw-123"
     out = capsys.readouterr().out
     assert "file-pw-123" not in out
+
+
+# ---------------------------------------------------------------- scripted callers (Ansible)
+
+def _domain_workspace(workspace):
+    """A tenant + input directory shaped like the client's: group and strong account derived per domain."""
+    cfg = workspace / "config.toml"
+    cfg.write_text(cfg.read_text()
+                   .replace('group_template = ""', 'group_template = "SIA-{hostname_upper}-RDP"')
+                   .replace('target_set_scope = "server"', 'target_set_scope = "auto"'), encoding="utf-8")
+    inp = workspace / "input"
+    inp.mkdir()
+    (inp / "servers.csv").write_text("fqdn\n", encoding="utf-8")
+    (inp / "domains.csv").write_text("domain,strong_account,target_set,target_set_type,group_template\n"
+                                     "corp.example.com,SA-CORP-SIA,,Domain,\n", encoding="utf-8")
+    return inp
+
+
+def test_apply_single_server_json(workspace, monkeypatch, capsys):
+    """The Ansible path: one server, no servers.csv row, machine-readable result on stdout."""
+    inp = _domain_workspace(workspace)
+    sia = FakeSIA([{"secret_id": "sec-corp", "secret_name": "SA-CORP-SIA", "secret_type": "PCloudAccount"}])
+    shared_context(monkeypatch, sia=sia, identity=FakeIdentity([group_row("SIA-WEB09-RDP")]))
+    code = run(workspace, "apply", "--input", str(inp), "--server", "web09.corp.example.com", "--yes", "--json",
+               "--no-report", "--checkpoint", str(workspace / "ckpt.jsonl"))
+    out = capsys.readouterr()
+    assert code == 0
+    data = json.loads(out.out)                       # stdout is JSON only; the table went to stderr
+    assert "Servers:" in out.err
+    row = data["servers"][0]
+    assert row["fqdn"] == "web09.corp.example.com" and row["target_set_name"] == "corp.example.com"
+    assert row["strong_account"] == "SA-CORP-SIA" and row["policy"]["status"] == "created"
+    assert data["failures"] == 0
+    created = [ts for c in sia.calls if c[0] == "bulk_create_target_sets" for i in c[1] for ts in i["target_sets"]]
+    assert [(ts["name"], ts["type"]) for ts in created] == [("corp.example.com", "Domain")]
+    assert not (workspace / "reports").exists()      # --no-report
+
+
+def test_single_server_group_override_and_bad_fqdn(workspace, monkeypatch, capsys):
+    inp = _domain_workspace(workspace)
+    sia = FakeSIA([{"secret_id": "sec-corp", "secret_name": "SA-CORP-SIA", "secret_type": "PCloudAccount"}])
+    shared_context(monkeypatch, sia=sia, identity=FakeIdentity([group_row("Typed-In")]))
+    assert run(workspace, "plan", "--input", str(inp), "--server", "web09.corp.example.com", "--group", "Typed-In") == 0
+    out = capsys.readouterr().out
+    assert "Typed-In" in out and "shared by every server in corp.example.com" in out
+    assert run(workspace, "plan", "--input", str(inp), "--server", "not-an-fqdn") == 2
+    assert "--server not-an-fqdn" in capsys.readouterr().err
+
+
+def test_ca_bundle_flag_reaches_the_context(workspace, monkeypatch, capsys):
+    bundle = workspace / "corp-ca.pem"
+    bundle.write_text("-----BEGIN CERTIFICATE-----\n", encoding="utf-8")
+    shared_context(monkeypatch)
+    assert run(workspace, "--ca-bundle", str(bundle), "preflight") == 0
+    assert FakeContext.instances[-1].cfg.http.tls_verify == str(bundle)
+    assert f"CA bundle {bundle}" in capsys.readouterr().out
+    assert run(workspace, "--ca-bundle", str(workspace / "missing.pem"), "preflight") == 2
+    assert "does not exist" in capsys.readouterr().err
+
+
+def test_apply_json_stdout_stays_parseable_without_yes(workspace, monkeypatch, capsys):
+    """The confirmation prompt must not land on stdout: --json promises a parseable document there."""
+    inp = _domain_workspace(workspace)
+    sia = FakeSIA([{"secret_id": "sec-corp", "secret_name": "SA-CORP-SIA", "secret_type": "PCloudAccount"}])
+    shared_context(monkeypatch, sia=sia, identity=FakeIdentity([group_row("SIA-WEB09-RDP")]))
+    monkeypatch.setattr("builtins.input", lambda prompt="": "no")
+    code = run(workspace, "apply", "--input", str(inp), "--server", "web09.corp.example.com", "--json", "--no-report")
+    out = capsys.readouterr()
+    assert code == 2 and out.out == ""                       # aborted before applying; nothing printed to stdout
+    assert "Type 'yes' to apply these changes:" in out.err and "Aborted; nothing changed." in out.err
+    assert [c[0] for c in sia.calls if c[0] == "bulk_create_target_sets"] == []
+
+
+def test_server_only_flags_without_server_are_rejected(workspace, monkeypatch, capsys):
+    """--group without --server used to be a silent no-op on a command that writes."""
+    inp = _domain_workspace(workspace)
+    (inp / "servers.csv").write_text("fqdn\nweb01.corp.example.com\n", encoding="utf-8")
+    shared_context(monkeypatch)
+    assert run(workspace, "apply", "--input", str(inp), "--group", "SIA-Emergency-Access", "--yes") == 2
+    assert "--group only apply together with --server" in capsys.readouterr().err

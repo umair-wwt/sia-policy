@@ -21,7 +21,8 @@ STRONG_ACCOUNT_TYPES = ("existing", "vault", "credentials")
 SECRETS_API_FAMILIES = ("auto", "public", "legacy")
 TARGETSETS_API_FAMILIES = ("auto", "legacy", "discovery")
 PVWA_AUTH_TYPES = ("cyberark", "ldap")
-TEMPLATE_PLACEHOLDERS = ("hostname", "fqdn", "domain")
+TEMPLATE_PLACEHOLDERS = ("hostname", "fqdn", "domain", "hostname_upper", "hostname_lower", "domain_upper")
+TARGET_SET_SCOPES = ("server", "auto", "domain")
 # [defaults] keys that must be written explicitly in config.toml (no silent organizational defaults)
 REQUIRED_DEFAULT_KEYS = ("days_of_week", "from_hour", "to_hour", "target_set_cert_validation")
 
@@ -83,6 +84,13 @@ class Defaults:
     template_policy: str = ""
     owner_tag: str = "sia-policy-automation"   # policy tag / description marker identifying objects this tool manages
     ssh_username: str = ""                     # default certificate username for protocol=ssh rows
+    # Identity group derived from the server name (servers.csv leaves group blank), e.g. "SIA-{hostname_upper}-RDP".
+    # domains.csv may override it per domain. Several groups: separate them with ';'.
+    group_template: str = ""
+    # How wide a target set is: server = one "Target" set per FQDN (every server has its own strong account);
+    # auto = servers whose strong account comes from domains.csv share that domain's set, the rest fall back to
+    # per-server; domain = as auto, but a domain-joined server missing from domains.csv is an error.
+    target_set_scope: str = "server"
     # Per-server strong accounts derived from a naming convention (servers.csv leaves strong_account blank):
     strong_account_template: str = ""          # e.g. "ADM-{hostname}": the strong account's name
     strong_account_type: str = "existing"      # existing (look up only) | vault (create a Vault reference) | credentials
@@ -117,6 +125,15 @@ class HttpConfig:
     lookup_search_max_rows: int = 2000         # --lookup auto: search per server up to this many servers, else list
     secrets_api: str = "auto"                  # auto | public (/api/secrets/public/v1+v2) | legacy (/api/secrets)
     targetsets_api: str = "auto"               # auto | legacy (/api/targetsets) | discovery (/api/discovery/targetsets)
+    ca_bundle: str = ""                        # PEM file/dir of trusted CAs (TLS-inspecting proxies); "" = certifi
+    verify: bool = True                        # never set false outside a lab: it disables TLS verification entirely
+
+    @property
+    def tls_verify(self) -> str | bool:
+        """What to pass to requests as `verify`: a CA bundle path, or True/False."""
+        if not self.verify:
+            return False
+        return self.ca_bundle or True
 
 
 @dataclass(frozen=True)
@@ -171,7 +188,9 @@ def _build(cls, section: dict[str, Any], name: str):
 
 
 def _check_template(label: str, template: str, placeholders: tuple[str, ...] = TEMPLATE_PLACEHOLDERS) -> None:
-    if re.sub(r"\{(" + "|".join(placeholders) + r")\}", "", template).count("{"):
+    # longest first: {hostname_upper} must not be read as {hostname} followed by stray text
+    alternatives = "|".join(sorted(placeholders, key=len, reverse=True))
+    if re.sub(r"\{(" + alternatives + r")\}", "", template).count("{"):
         allowed = ", ".join("{" + p + "}" for p in placeholders)
         raise ConfigError(f"[defaults] {label} may only use {allowed}")
 
@@ -200,10 +219,13 @@ def validate(cfg: Config) -> None:
     if not d.assign_local_groups:
         raise ConfigError("[defaults] assign_local_groups must list at least one local group")
     for label in ("policy_name_template", "strong_account_template", "strong_account_safe_template",
-                  "strong_account_account_name_template", "strong_account_username_template"):
+                  "strong_account_account_name_template", "strong_account_username_template",
+                  "strong_account_domain", "group_template"):
         _check_template(label, getattr(d, label))
     if not d.policy_name_template.strip():
         raise ConfigError("[defaults] policy_name_template must not be empty")
+    if d.target_set_scope not in TARGET_SET_SCOPES:
+        raise ConfigError(f"[defaults] target_set_scope must be one of {', '.join(TARGET_SET_SCOPES)}")
     _check_template("description_template", d.description_template, TEMPLATE_PLACEHOLDERS + ("protocol",))
     if d.strong_account_type not in STRONG_ACCOUNT_TYPES:
         raise ConfigError(f"[defaults] strong_account_type must be one of {', '.join(STRONG_ACCOUNT_TYPES)}")
@@ -237,6 +259,10 @@ def validate(cfg: Config) -> None:
         raise ConfigError(f"[http] secrets_api must be one of {', '.join(SECRETS_API_FAMILIES)}")
     if h.targetsets_api not in TARGETSETS_API_FAMILIES:
         raise ConfigError(f"[http] targetsets_api must be one of {', '.join(TARGETSETS_API_FAMILIES)}")
+    if h.ca_bundle and not Path(h.ca_bundle).exists():
+        raise ConfigError(f"[http] ca_bundle {h.ca_bundle!r} does not exist (expected a PEM file or a directory of them)")
+    if h.ca_bundle and not h.verify:
+        raise ConfigError("[http] ca_bundle is set but verify = false; pick one")
     p = cfg.pvwa
     if p.base_url and (not p.base_url.startswith("https://") or p.base_url.endswith("/")):
         raise ConfigError("[pvwa] base_url must start with https:// and have no trailing slash")

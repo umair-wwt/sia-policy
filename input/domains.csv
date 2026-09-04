@@ -1,0 +1,2 @@
+domain,strong_account,target_set,target_set_type,group_template,description
+ad1.example.com,SA-AD1-DOMAIN,,Domain,SIA-{hostname_upper}-RDP,"One shared domain account for every server in ad1.example.com. No server in this example uses it; add a row to servers.csv with an fqdn ending in .ad1.example.com and leave strong_account and group blank."

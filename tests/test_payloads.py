@@ -120,9 +120,15 @@ def test_target_set_payloads_carry_owner_marker():
     assert ts2["description"] == f"DMZ app {MARK}"
     bulk = build_bulk_target_sets({"sec-123": [ts], "sec-9": [ts2], "sec-empty": []})
     assert bulk == [{"strong_account_id": "sec-123", "target_sets": [ts]}, {"strong_account_id": "sec-9", "target_sets": [ts2]}]
+    # a PUT replaces the object, so the update body re-sends cert validation / provision format rather than
+    # letting them fall back to the platform default
     update = build_target_set_update(server(), "sec-1", "PCloudAccount", DEFAULTS)
     assert update == {"type": "Target", "secret_type": "PCloudAccount", "secret_id": "sec-1",
-                      "description": f"RDP ZSP target web01.corp.example.com via SA-corp-rdp {MARK}"}
+                      "description": f"RDP ZSP target web01.corp.example.com via SA-corp-rdp {MARK}",
+                      "enable_certificate_validation": False}
+    update2 = build_target_set_update(server(), "sec-1", "PCloudAccount",
+                                      Defaults(provision_format="<user>_<session-guid>", target_set_cert_validation=True))
+    assert update2["provision_format"] == "<user>_<session-guid>" and update2["enable_certificate_validation"] is True
     assert ownership_marker("x") == "managed-by:x"
 
 
@@ -275,3 +281,31 @@ def test_template_profile_chosen_by_protocol():
     ssh_only = {**TEMPLATE, "behavior": {"connectAs": {"ssh": {"username": "root"}}}}
     with pytest.raises(ValueError, match="no RDP profile"):
         build_policy(server(), [build_principal(GROUP_ROW)], DEFAULTS, template=ssh_only)
+
+
+def test_domain_scoped_target_set_payload():
+    """A Domain set is named after the AD domain and describes its scope, never one server."""
+    web01 = server(description="per-server note", target_set_name="corp.example.com", target_set_type="Domain")
+    ts = build_target_set(web01, "sec-corp", "PCloudAccount", DEFAULTS)
+    assert ts == {"name": "corp.example.com", "type": "Domain", "secret_type": "PCloudAccount", "secret_id": "sec-corp",
+                  "description": f"RDP ZSP domain corp.example.com via SA-corp-rdp {MARK}",
+                  "enable_certificate_validation": False}
+    assert is_owned_target_set(ts, OWNER)
+    assert build_target_set_update(web01, "sec-corp", "PCloudAccount", DEFAULTS)["type"] == "Domain"
+    # a set named after the server itself is not shared, so the per-server description still wins
+    own = server(description="per-server note", target_set_name="web01.corp.example.com")
+    assert build_target_set(own, "s", "PCloudAccount", DEFAULTS)["description"] == f"per-server note {MARK}"
+
+
+def test_render_supports_case_variants():
+    assert render("{hostname_upper}-{hostname_lower}-{domain_upper}", server()) == "WEB01-web01-CORP.EXAMPLE.COM"
+
+
+def test_target_set_update_preserves_a_provision_format_it_does_not_manage():
+    """[defaults] provision_format = "" means "SIA default naming", not "wipe what the target set already has"."""
+    existing = {"name": NAME, "provision_format": "<user>_<session-guid>"}
+    assert build_target_set_update(server(), "s", "PCloudAccount", DEFAULTS, existing)["provision_format"] == "<user>_<session-guid>"
+    # a configured format still wins over the existing one
+    configured = Defaults(provision_format="<user>-svc")
+    assert build_target_set_update(server(), "s", "PCloudAccount", configured, existing)["provision_format"] == "<user>-svc"
+    assert "provision_format" not in build_target_set_update(server(), "s", "PCloudAccount", DEFAULTS, {"name": NAME})

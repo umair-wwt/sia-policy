@@ -25,9 +25,11 @@ def split_fqdn(fqdn: str) -> tuple[str, str]:
 
 
 def render(template: str, server: ServerRow) -> str:
+    """Keep the placeholder set in step with config.TEMPLATE_PLACEHOLDERS and inputs._render_name."""
     try:
         return template.format(hostname=server.hostname, fqdn=server.fqdn, domain=server.dns_domain,
-                               protocol=server.protocol.upper())
+                               hostname_upper=server.hostname.upper(), hostname_lower=server.hostname.lower(),
+                               domain_upper=server.dns_domain.upper(), protocol=server.protocol.upper())
     except (KeyError, IndexError, ValueError) as exc:
         raise ValueError(f"template {template!r} is invalid: {exc}; use {{hostname}}, {{fqdn}}, {{domain}}, {{protocol}}") from exc
 
@@ -109,16 +111,25 @@ def build_vault_account(account: StrongAccountRow, password: str, *, platform_id
 
 # --- target sets --------------------------------------------------------------------------------
 
+def target_set_name_for(server: ServerRow) -> str:
+    """The target set a server needs: its own FQDN, or a wider set (a Domain) shared with its whole domain."""
+    return server.target_set_name or server.fqdn
+
+
 def target_set_description(server: ServerRow, owner_tag: str) -> str:
-    base = server.description or f"RDP ZSP target {server.fqdn} via {server.strong_account}"
+    """A shared target set describes its scope, never one server -- `description` is a per-server column."""
+    if server.shares_target_set:
+        base = f"RDP ZSP {server.target_set_type.lower()} {target_set_name_for(server)} via {server.strong_account}"
+    else:
+        base = server.description or f"RDP ZSP target {server.fqdn} via {server.strong_account}"
     marker = ownership_marker(owner_tag)
     return base if marker in base else f"{base} [{marker}]"
 
 
 def build_target_set(server: ServerRow, secret_id: str, secret_type: str, defaults: Defaults) -> dict[str, Any]:
     payload: dict[str, Any] = {
-        "name": server.fqdn,
-        "type": TARGET_SET_TYPE_TARGET,
+        "name": target_set_name_for(server),
+        "type": server.target_set_type or TARGET_SET_TYPE_TARGET,
         "secret_type": secret_type,
         "secret_id": secret_id,
         "description": target_set_description(server, defaults.owner_tag),
@@ -134,10 +145,26 @@ def build_bulk_target_sets(items: dict[str, list[dict[str, Any]]]) -> list[dict[
     return [{"strong_account_id": secret_id, "target_sets": sets} for secret_id, sets in items.items() if sets]
 
 
-def build_target_set_update(server: ServerRow, secret_id: str, secret_type: str, defaults: Defaults) -> dict[str, Any]:
-    """PUT .../targetsets/{name} body to re-point a target set at another strong account (and mark it managed)."""
-    return {"type": TARGET_SET_TYPE_TARGET, "secret_type": secret_type, "secret_id": secret_id,
-            "description": target_set_description(server, defaults.owner_tag)}
+def build_target_set_update(server: ServerRow, secret_id: str, secret_type: str, defaults: Defaults,
+                            current: dict[str, Any] | None = None) -> dict[str, Any]:
+    """PUT .../targetsets/{name} body to re-point a target set at another strong account (and mark it managed).
+
+    A PUT replaces the object, so every field the tool has an opinion on is re-sent rather than left to fall back
+    to the platform default. `provision_format` is the exception: an empty [defaults] provision_format means "SIA
+    default naming", not "reset it", so a value already on the target set (`current`) is carried over.
+    """
+    payload: dict[str, Any] = {
+        "type": server.target_set_type or TARGET_SET_TYPE_TARGET,
+        "secret_type": secret_type,
+        "secret_id": secret_id,
+        "description": target_set_description(server, defaults.owner_tag),
+        "enable_certificate_validation": bool(defaults.target_set_cert_validation),
+    }
+    existing = current or {}
+    fmt = defaults.provision_format or existing.get("provision_format") or existing.get("provisionFormat") or ""
+    if fmt:
+        payload["provision_format"] = fmt
+    return payload
 
 
 # --- policies (UAP) -----------------------------------------------------------------------------

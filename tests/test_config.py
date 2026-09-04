@@ -226,3 +226,32 @@ def test_password_file(tmp_path, caplog):
         with caplog.at_level("WARNING", logger="sia.config"):
             load_password_file(pw)
         assert "readable by other users" in caplog.text
+
+
+def test_group_template_and_target_set_scope(tmp_path):
+    cfg = load_config(make(tmp_path, 'group_template = "SIA-{hostname_upper}-RDP"\ntarget_set_scope = "auto"\n'))
+    assert cfg.defaults.group_template == "SIA-{hostname_upper}-RDP" and cfg.defaults.target_set_scope == "auto"
+    assert load_config(make(tmp_path)).defaults.target_set_scope == "server"      # unchanged default
+    assert load_config(make(tmp_path)).defaults.group_template == ""
+
+
+@pytest.mark.parametrize("defaults_extra, fragment", [
+    ('target_set_scope = "everything"\n', "target_set_scope must be one of"),
+    ('group_template = "SIA-{server}"\n', "group_template may only use"),
+    ('strong_account_domain = "{nope}"\n', "strong_account_domain may only use"),
+])
+def test_new_defaults_validation(tmp_path, defaults_extra, fragment):
+    with pytest.raises(ConfigError, match=fragment):
+        load_config(make(tmp_path, defaults_extra))
+
+
+def test_ca_bundle_and_verify(tmp_path):
+    bundle = tmp_path / "corp-ca.pem"
+    bundle.write_text("-----BEGIN CERTIFICATE-----\n", encoding="utf-8")
+    assert load_config(make(tmp_path)).http.tls_verify is True                    # default: certifi
+    assert load_config(make(tmp_path, other_sections=f'[http]\nca_bundle = "{bundle}"\n')).http.tls_verify == str(bundle)
+    assert load_config(make(tmp_path, other_sections="[http]\nverify = false\n")).http.tls_verify is False
+    with pytest.raises(ConfigError, match="does not exist"):
+        load_config(make(tmp_path, other_sections='[http]\nca_bundle = "/no/such/bundle.pem"\n'))
+    with pytest.raises(ConfigError, match="verify = false; pick one"):
+        load_config(make(tmp_path, other_sections=f'[http]\nca_bundle = "{bundle}"\nverify = false\n'))

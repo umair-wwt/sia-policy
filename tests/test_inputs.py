@@ -3,7 +3,7 @@ from pathlib import Path
 import pytest
 
 from sia.config import StrongAccountTemplate
-from sia.inputs import InputError, effective_policy_name, load_inputs
+from sia.inputs import InputError, effective_policy_name, inline_inputs, load_inputs
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -13,11 +13,17 @@ VAULT_SPEC = StrongAccountTemplate(name="ADM-{hostname}", type="vault", safe="SI
                                    account_name="{hostname}-Administrator", username="Administrator")
 
 
-def make_inputs(tmp_path: Path, servers: str, accounts: str, groups: str | None = None, servers_hdr: str = SERVERS_HDR) -> Path:
+DOMAINS_HDR = "domain,strong_account,target_set,target_set_type,group_template\n"
+
+
+def make_inputs(tmp_path: Path, servers: str, accounts: str, groups: str | None = None, servers_hdr: str = SERVERS_HDR,
+                domains: str | None = None) -> Path:
     (tmp_path / "servers.csv").write_text(servers_hdr + servers, encoding="utf-8")
     (tmp_path / "strong_accounts.csv").write_text(ACCOUNTS_HDR + accounts, encoding="utf-8")
     if groups is not None:
         (tmp_path / "groups.csv").write_text("name,directory\n" + groups, encoding="utf-8")
+    if domains is not None:
+        (tmp_path / "domains.csv").write_text(DOMAINS_HDR + domains, encoding="utf-8")
     return tmp_path
 
 
@@ -111,13 +117,20 @@ def test_all_problems_reported_together(tmp_path):
     assert "SA2" in text and "group is required" in text
 
 
-def test_missing_and_unknown_columns(tmp_path):
+def test_unknown_column(tmp_path):
+    """`group` is optional now (group_template can derive it), so a typo is caught as an unknown column."""
     (tmp_path / "servers.csv").write_text("fqdn,strong_account,groups\n", encoding="utf-8")
     (tmp_path / "strong_accounts.csv").write_text("name,type\n", encoding="utf-8")
     with pytest.raises(InputError) as exc:
         load_inputs(tmp_path)
-    assert "missing required column(s): group" in str(exc.value)
     assert "unknown column(s): groups" in str(exc.value)
+
+
+def test_missing_required_column(tmp_path):
+    (tmp_path / "servers.csv").write_text("strong_account,group\n", encoding="utf-8")
+    (tmp_path / "strong_accounts.csv").write_text("name,type\n", encoding="utf-8")
+    with pytest.raises(InputError, match=r"missing required column\(s\): fqdn"):
+        load_inputs(tmp_path)
 
 
 def test_missing_files(tmp_path):
@@ -244,3 +257,205 @@ def test_domain_joined_and_address_columns(tmp_path):
     (tmp_path / "strong_accounts.csv").write_text("name,type,address\nSA1,existing,corp.local\n", encoding="utf-8")
     with pytest.raises(InputError, match="must not set"):
         load_inputs(tmp_path)
+
+
+# --------------------------------------------------------------------------- domains.csv, group and target-set scope
+
+SERVERS_MIN = "fqdn,strong_account,group,domain_joined\n"
+
+
+def test_domains_csv_supplies_group_strong_account_and_target_set(tmp_path):
+    """The client's model: one row per server, everything else derived from its AD domain."""
+    path = make_inputs(
+        tmp_path,
+        "web01.corp.example.com,,,\nweb02.corp.example.com,,,\napp01.lab.example.com,,,\n", "",
+        servers_hdr=SERVERS_MIN,
+        domains="corp.example.com,SA-CORP-SIA,,Domain,\nlab.example.com,SA-LAB-SIA,,Domain,SIA-{hostname_upper}-LAB\n")
+    inputs = load_inputs(path, group_template="SIA-{hostname_upper}-RDP", target_set_scope="auto")
+    web01, web02, app01 = inputs.servers
+    assert web01.groups == ("SIA-WEB01-RDP",) and web02.groups == ("SIA-WEB02-RDP",)
+    assert app01.groups == ("SIA-APP01-LAB",)                        # the domain's template wins over [defaults]
+    assert web01.strong_account == web02.strong_account == "SA-CORP-SIA"
+    assert app01.strong_account == "SA-LAB-SIA"
+    # both corp servers share one Domain target set; the lab server has its own
+    assert web01.target_set_key == web02.target_set_key == "corp.example.com"
+    assert web01.target_set_type == "Domain" and web01.shares_target_set
+    assert app01.target_set_key == "lab.example.com"
+    # the domain accounts are declared implicitly, as pre-existing accounts scoped to their domain
+    corp = inputs.strong_accounts["SA-CORP-SIA"]
+    assert corp.type == "existing" and corp.account_domain == "corp.example.com" and not corp.is_local
+
+
+def test_strong_accounts_csv_is_optional(tmp_path):
+    """Minimum viable input: an fqdn column plus domains.csv."""
+    (tmp_path / "servers.csv").write_text("fqdn\nweb01.corp.example.com\n", encoding="utf-8")
+    (tmp_path / "domains.csv").write_text(DOMAINS_HDR + "corp.example.com,SA-CORP-SIA,,Domain,\n", encoding="utf-8")
+    inputs = load_inputs(tmp_path, group_template="SIA-{hostname_upper}-RDP", target_set_scope="auto")
+    assert inputs.servers[0].strong_account == "SA-CORP-SIA" and inputs.servers[0].groups == ("SIA-WEB01-RDP",)
+
+
+def test_strong_account_precedence(tmp_path):
+    """Explicit cell beats domains.csv beats the per-host template."""
+    path = make_inputs(
+        tmp_path,
+        "web01.corp.example.com,SA-explicit,G,\nweb02.corp.example.com,,G,\nlone01.other.example.com,,G,\n",
+        "SA-explicit,existing,,,,,\n", servers_hdr=SERVERS_MIN,
+        domains="corp.example.com,SA-CORP-SIA,,Domain,\n")
+    inputs = load_inputs(path, strong_account_template="ADM-{hostname}", target_set_scope="auto")
+    explicit, from_domain, templated = inputs.servers
+    assert explicit.strong_account == "SA-explicit"
+    assert from_domain.strong_account == "SA-CORP-SIA"
+    assert templated.strong_account == "ADM-lone01"
+    # only the row that took its account from domains.csv shares that domain's target set
+    assert not explicit.shares_target_set and explicit.target_set_key == "web01.corp.example.com"
+    assert from_domain.shares_target_set
+    assert not templated.shares_target_set
+
+
+def test_workgroup_rows_keep_their_own_local_account_and_target_set(tmp_path):
+    """Domain-joined and workgroup servers coexist in one file."""
+    path = make_inputs(
+        tmp_path, "web01.corp.example.com,,G,yes\ndmz01.corp.example.com,,G,no\n", "",
+        servers_hdr=SERVERS_MIN, domains="corp.example.com,SA-CORP-SIA,,Domain,\n")
+    inputs = load_inputs(path, strong_account_template="ADM-{hostname}", target_set_scope="auto")
+    joined, workgroup = inputs.servers
+    assert joined.strong_account == "SA-CORP-SIA" and joined.target_set_key == "corp.example.com"
+    assert workgroup.strong_account == "ADM-dmz01" and workgroup.target_set_key == "dmz01.corp.example.com"
+    assert workgroup.target_set_type == "Target" and not workgroup.shares_target_set
+    assert inputs.strong_accounts["ADM-dmz01"].is_local
+
+
+def test_target_set_scope_server_keeps_one_set_per_server(tmp_path):
+    """The default: domains.csv still supplies the account, but every server gets its own Target set."""
+    path = make_inputs(tmp_path, "web01.corp.example.com,,G,\nweb02.corp.example.com,,G,\n", "",
+                       servers_hdr=SERVERS_MIN, domains="corp.example.com,SA-CORP-SIA,,Domain,\n")
+    inputs = load_inputs(path)          # target_set_scope defaults to "server"
+    assert [s.target_set_key for s in inputs.servers] == ["web01.corp.example.com", "web02.corp.example.com"]
+    assert all(s.target_set_type == "Target" and not s.shares_target_set for s in inputs.servers)
+    assert all(s.strong_account == "SA-CORP-SIA" for s in inputs.servers)
+
+
+def test_target_set_scope_domain_requires_a_domains_row(tmp_path):
+    path = make_inputs(tmp_path, "web01.nowhere.example.com,,G,\n", "", servers_hdr=SERVERS_MIN,
+                       domains="corp.example.com,SA-CORP-SIA,,Domain,\n")
+    with pytest.raises(InputError) as exc:
+        load_inputs(path, strong_account_template="ADM-{hostname}", target_set_scope="domain")
+    assert "'nowhere.example.com' has no row in domains.csv" in str(exc.value)
+    # "auto" falls back to the per-host template instead of failing
+    inputs = load_inputs(path, strong_account_template="ADM-{hostname}", target_set_scope="auto")
+    assert inputs.servers[0].strong_account == "ADM-web01"
+
+
+def test_custom_target_set_name_and_type(tmp_path):
+    path = make_inputs(tmp_path, "web01.corp.example.com,,G,\n", "", servers_hdr=SERVERS_MIN,
+                       domains="corp.example.com,SA-CORP-SIA,example.com,Suffix,\n")
+    inputs = load_inputs(path, target_set_scope="auto")
+    assert inputs.servers[0].target_set_name == "example.com" and inputs.servers[0].target_set_type == "Suffix"
+
+
+def test_group_is_required_without_a_template(tmp_path):
+    path = make_inputs(tmp_path, "web01.corp.example.com,SA1,,\n", "SA1,existing,,,,,\n", servers_hdr=SERVERS_MIN)
+    with pytest.raises(InputError) as exc:
+        load_inputs(path)
+    assert "group is required" in str(exc.value) and "group_template" in str(exc.value)
+
+
+def test_group_template_may_produce_several_groups(tmp_path):
+    path = make_inputs(tmp_path, "web01.corp.example.com,SA1,,\n", "SA1,existing,,,,,\n", servers_hdr=SERVERS_MIN)
+    inputs = load_inputs(path, group_template="SIA-{hostname}-RDP;SIA-{domain}-ALL")
+    assert inputs.servers[0].groups == ("SIA-web01-RDP", "SIA-corp.example.com-ALL")
+
+
+def test_explicit_group_cell_beats_the_template(tmp_path):
+    path = make_inputs(tmp_path, "web01.corp.example.com,SA1,Typed-In,\n", "SA1,existing,,,,,\n", servers_hdr=SERVERS_MIN)
+    assert load_inputs(path, group_template="SIA-{hostname}").servers[0].groups == ("Typed-In",)
+
+
+def test_strong_account_domain_may_be_templated(tmp_path):
+    """strong_account_domain = "{domain}" turns the per-host template into a per-domain one."""
+    path = make_inputs(tmp_path, "web01.corp.example.com,,G,\n", "", servers_hdr=SERVERS_MIN)
+    spec = StrongAccountTemplate(name="SA-{domain}", type="existing", account_domain="{domain}")
+    account = load_inputs(path, strong_account_template=spec).strong_accounts["SA-corp.example.com"]
+    assert account.account_domain == "corp.example.com" and not account.is_local
+
+
+def test_domains_csv_validation(tmp_path):
+    path = make_inputs(
+        tmp_path, "web01.corp.example.com,SA1,G,\n", "SA1,existing,,,,,\n", servers_hdr=SERVERS_MIN,
+        domains=("not a domain,SA-X,,Domain,\n"
+                 "corp.example.com,SA-CORP,,Nonsense,\n"
+                 "corp.example.com,SA-OTHER,,Domain,\n"
+                 "lab.example.com,SA-LAB,shared.example.com,Domain,\n"
+                 "qa.example.com,SA-QA,shared.example.com,Domain,\n"))
+    with pytest.raises(InputError) as exc:
+        load_inputs(path)
+    text = str(exc.value)
+    assert "'not a domain' is not a valid DNS name" in text
+    assert "target_set_type must be one of" in text
+    assert "duplicate domain 'corp.example.com'" in text
+    assert "shares target set 'shared.example.com'" in text and "only hold one strong account" in text
+
+
+def test_unknown_strong_account_names_domains_csv_in_the_hint(tmp_path):
+    path = make_inputs(tmp_path, "web01.corp.example.com,SA-typo,G,\n", "SA1,existing,,,,,\n", servers_hdr=SERVERS_MIN)
+    with pytest.raises(InputError, match="not defined in strong_accounts.csv or domains.csv"):
+        load_inputs(path)
+
+
+def test_rows_of_one_server_must_agree_on_their_target_set(tmp_path):
+    """A second policy for the same server may not quietly land in a different target set."""
+    path = make_inputs(
+        tmp_path, "web01.corp.example.com,,G1,\nweb01.corp.example.com,SA-explicit,G2,\n",
+        "SA-explicit,existing,,,,,\n", servers_hdr=SERVERS_MIN, domains="corp.example.com,SA-CORP-SIA,,Domain,\n")
+    with pytest.raises(InputError) as exc:
+        load_inputs(path, target_set_scope="auto", policy_name_template="{fqdn}-{hostname}")
+    assert "strong_account" in str(exc.value) and "target set" in str(exc.value)
+
+
+def test_inline_inputs_match_the_csv_path(tmp_path):
+    """--server rows resolve their group, account and target set exactly as servers.csv rows would."""
+    (tmp_path / "domains.csv").write_text(DOMAINS_HDR + "corp.example.com,SA-CORP-SIA,,Domain,\n", encoding="utf-8")
+    inputs = inline_inputs(tmp_path, [{"fqdn": "WEB01.corp.example.com"}],
+                           group_template="SIA-{hostname_upper}-RDP", target_set_scope="auto")
+    row = inputs.servers[0]
+    assert row.fqdn == "web01.corp.example.com" and row.groups == ("SIA-WEB01-RDP",)
+    assert row.strong_account == "SA-CORP-SIA" and row.target_set_key == "corp.example.com"
+
+
+def test_inline_inputs_report_problems_with_the_server_name(tmp_path):
+    (tmp_path / "domains.csv").write_text(DOMAINS_HDR, encoding="utf-8")
+    with pytest.raises(InputError) as exc:
+        inline_inputs(tmp_path, [{"fqdn": "not-an-fqdn", "group": "G", "strong_account": "SA1"}])
+    assert "--server not-an-fqdn" in str(exc.value)
+
+
+def test_missing_strong_account_hint_fits_the_row(tmp_path):
+    """A workgroup server can never use its domain's account, so its error must not point at domains.csv."""
+    path = make_inputs(tmp_path, "web01.corp.example.com,,G,yes\ndmz01.corp.example.com,,G,no\n", "",
+                       servers_hdr=SERVERS_MIN)
+    with pytest.raises(InputError) as exc:
+        load_inputs(path)
+    joined, workgroup = str(exc.value).splitlines()
+    assert "add 'corp.example.com' to domains.csv" in joined
+    assert "domains.csv" not in workgroup and "strong_account_template" in workgroup
+
+
+def test_a_domain_target_set_may_not_collide_with_a_server_of_its_own(tmp_path):
+    """domains.csv pointing a whole domain at one host's target set must not silently retarget that host."""
+    path = make_inputs(
+        tmp_path, "web01.lab.example.com,,G,\njump01.lab.example.com,SA-JUMP,G,\n", "SA-JUMP,existing,,,,,\n",
+        servers_hdr=SERVERS_MIN, domains="lab.example.com,SA-LAB,jump01.lab.example.com,Target,\n")
+    with pytest.raises(InputError) as exc:
+        load_inputs(path, target_set_scope="auto")
+    text = str(exc.value)
+    assert "shares target set 'jump01.lab.example.com'" in text
+    assert "'SA-JUMP'" in text and "'SA-LAB'" in text and "holds exactly one strong account" in text
+
+
+def test_domain_wide_target_set_may_not_be_typed_target(tmp_path):
+    """A Target set scopes to one machine, so naming it after a domain would match nothing at connect time."""
+    path = make_inputs(tmp_path, "web01.corp.example.com,,G,\n", "", servers_hdr=SERVERS_MIN,
+                       domains="corp.example.com,SA-CORP-SIA,,Target,\n")
+    with pytest.raises(InputError) as exc:
+        load_inputs(path, target_set_scope="auto")
+    assert "target_set_type = Target names a single machine" in str(exc.value)

@@ -38,7 +38,24 @@ provision_format = ""                  # e.g. "<user>_<session-guid>"; "" = SIA 
 # Linux rows (protocol=ssh): username on the SSH certificate when servers.csv leaves ssh_username blank, e.g. "ec2-user"
 ssh_username = ""
 
+# --- The Identity group that may connect, derived from the server name ---
+# Used when servers.csv leaves `group` blank. A group_template in domains.csv overrides this per domain.
+# Templates may use {hostname}, {fqdn}, {domain} and the {hostname_upper} / {hostname_lower} / {domain_upper}
+# variants (FQDNs are lower-cased on the way in; AD group names are usually upper-case).
+# Several groups on one server: separate them with ';'.
+group_template = ""                    # e.g. "SIA-{hostname_upper}-RDP" for server ABC123 -> group SIA-ABC123-RDP
+
+# --- How wide a target set is ---
+#   server  every Windows server gets its own "Target" set (the default; right when each server has its own
+#           local administrator account)
+#   auto    a server whose strong account comes from domains.csv shares that domain's target set (one "Domain"
+#           set per AD domain instead of one per server); every other server falls back to its own "Target" set
+#   domain  as auto, but a domain-joined server whose domain is missing from domains.csv is an error
+target_set_scope = "server"
+
 # --- Per-server strong accounts (every Windows server has its own local administrator account) ---
+# Only used for servers that do NOT get their account from domains.csv -- i.e. workgroup servers, and any
+# domain whose row you have not added yet. strong_account_domain may itself be templated ("{domain}").
 # When servers.csv leaves strong_account blank, the account is derived from these templates:
 #   strong_account_template   its name in the tool and in SIA (for type=vault SIA shows <account_name>_<safe>)
 #   strong_account_type       existing    = only look it up in SIA (it was onboarded there already)
@@ -78,6 +95,10 @@ lookup_search_max_rows = 2000  # --lookup auto: read per server (search) up to t
 # SIA path families. "auto" = detect with read-only calls at every run; pin them once `preflight` has printed them.
 secrets_api = "auto"           # auto | public (/api/secrets/public/v1 + v2) | legacy (/api/secrets)
 targetsets_api = "auto"        # auto | legacy (/api/targetsets) | discovery (/api/discovery/targetsets)
+# TLS. Behind a proxy that re-signs certificates, export its root CA and point ca_bundle at the PEM file
+# (--ca-bundle FILE does the same for one run; the REQUESTS_CA_BUNDLE environment variable also works).
+ca_bundle = ""                 # "" = the built-in trust store (certifi)
+verify = true                  # false disables certificate verification entirely -- lab use only
 
 [connect]
 # Values used by `connect-info` (what end users type into an RDP client). Nothing here is secret.

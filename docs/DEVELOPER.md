@@ -20,14 +20,16 @@ This document is for people who maintain or extend the tool. Operators should re
 
 Plain Python 3.11+, one third-party dependency (`requests`). The tenant is the source of truth and the CSVs are
 the desired state; the only local state is an optional checkpoint file (finished rows, no secrets). Units of
-work: one strong account per referenced account, one target set per Windows server (FQDN), one access policy per
-`servers.csv` row (a server may have several rows). Linux rows (`protocol=ssh`) reconcile only the policy,
-because SIA's Linux ZSP uses a short-lived SSH certificate.
+work: one strong account per referenced account, one target set per distinct *target-set name*, one access policy
+per `servers.csv` row (a server may have several rows). The target-set name is normally the server's FQDN, but
+with `target_set_scope = "auto"/"domain"` a server that takes its strong account from `domains.csv` uses a single
+`Domain` set covering its whole AD domain, so one set can serve thousands of servers. Linux rows
+(`protocol=ssh`) reconcile only the policy, because SIA's Linux ZSP uses a short-lived SSH certificate.
 
 ```mermaid
 flowchart TB
     subgraph inputs["Inputs"]
-        CSV["input/servers.csv<br/>input/strong_accounts.csv<br/>input/groups.csv"]
+        CSV["input/servers.csv<br/>input/domains.csv<br/>input/strong_accounts.csv<br/>input/groups.csv"]
         CFG["config.toml"]
         ENV[".env, password file or no-echo prompts"]
     end
@@ -81,7 +83,7 @@ flowchart TB
 |---|---|
 | `sia_onboard.py` | CLI (`argparse`): wires config, auth adapters, clients, the rate limiter, the optional PVWA client and the reconciler; the six commands; prompts; exit codes; last-resort redacted error handler. |
 | `sia/config.py` | Loads `config.toml` (stdlib `tomllib`) and `.env`; validates every key; enforces the four required `[defaults]` keys; `StrongAccountTemplate` + `Defaults.strong_account_spec` (per-server accounts by convention); `[connect]`, `[pvwa]` and the `[http]` scale keys. `load_password_file()` reads the optional `name,password` CSV (permission warning, values registered with the redactor). |
-| `sia/inputs.py` | Reads the CSVs into frozen dataclasses (`ServerRow`, `StrongAccountRow`, `GroupRow`); reports every problem with `file:line`; allows several rows per FQDN (they must agree on strong account, domain, protocol) and rejects duplicate effective policy names before any tenant contact (`effective_policy_name`); renders templated accounts of type `existing`/`vault`/`credentials`; `Inputs.unique_fqdns`, `rows_for`, `target_rows`, `window()` (waves). |
+| `sia/inputs.py` | Reads the CSVs into frozen dataclasses (`ServerRow`, `StrongAccountRow`, `GroupRow`, `DomainRow`); reports every problem with `file:line`; allows several rows per FQDN (they must agree on strong account, domain, protocol, target set) and rejects duplicate effective policy names before any tenant contact (`effective_policy_name`); resolves each row's group (`_resolve_groups`), strong account (`_resolve_strong_account`) and target set (`_resolve_target_set`); renders templated accounts of type `existing`/`vault`/`credentials`; `Inputs.unique_fqdns`, `rows_for`, `target_rows`, `window()` (waves). `_build_server_row` is shared by `load_inputs` (servers.csv) and `inline_inputs` (`--server`), so the two paths cannot validate differently. |
 | `sia/auth.py` | `PlatformTokenProvider` (documented client-credentials flow) and `ServiceUserOIDCTokenProvider` (the SDKs' `Oauth2/Token` + `OAuth2/Authorize` flow). Both cache until a minute before expiry, refresh on demand, and register every secret with the redactor. |
 | `sia/http.py` | One `requests.Session`; bearer header; the retry policy in [§5](#5-safety-mechanisms); `RateLimiter` (token bucket + shared 429 penalty); `SIAApiError` with redacted body, `status` (0 for network errors), `client_error`, `not_found`, `uncertain`. |
 | `sia/clients.py` | 1:1 endpoint wrappers. `SIAClient.probe()` detects the strong-account and target-set path families (`SIACapabilities`), listings paginate and accept name / strong-account filters, `find_secret()`; `UAPClient` lists (`filter`, `q`, `nextToken`), `owned_vm_filter()`, `find_policies_for_fqdn()`; `IdentityClient`. No business logic. |
@@ -105,7 +107,7 @@ flowchart TD
     C -->|apply, after 'yes'| D["4 - reconcile(dry_run=False), same snapshot"]
     D --> E["5a - Vault accounts (PVWA POST Accounts), optional<br/>canary, then --workers threads"]
     E --> F["5b - Strong accounts (POST secrets)<br/>canary, then --workers threads"]
-    F --> G["5c - Target sets (POST targetsets/bulk, chunks of 50)<br/>one per Windows server"]
+    F --> G["5c - Target sets (POST targetsets/bulk, chunks of 50)<br/>one per target-set name"]
     G --> H["5d - Policies: compare existing in parallel,<br/>create missing (canary, then --workers), read status back;<br/>checkpoint every finished row"]
     H --> R2["print table, write report, exit 0/1"]
 ```
@@ -127,8 +129,10 @@ Details worth knowing:
 
 `_plan_rows()` builds one `ServerResult` per `servers.csv` row, keyed `(fqdn, policy_name)`; rows whose checkpoint
 record matches their fingerprint and is complete are set aside as *resumed* (their outcomes come from the record
-and no lookup is issued for them). `_rows_by_fqdn()` groups the active rows per server: the first rdp row of a
-server drives its strong account and target set, and the outcome is copied to every row of that server.
+and no lookup is issued for them). `_ensure_target_sets()` then runs two passes: the strong-account outcome is set
+per row, and `_rows_by_target_set()` groups the active Windows rows by `ServerRow.target_set_key` so each target
+set is reconciled once and its outcome copied to every row that uses it — which for a `Domain` set spans several
+FQDNs. `report._counts()` de-duplicates on the same key, so a shared set counts as one object, not one per server.
 
 ### Linux rows
 
@@ -152,6 +156,22 @@ Runs only when a `PVWAClient` is given (`[pvwa] base_url` set) and only for refe
 The address is the account's `address` column, else the AD domain for domain accounts, else the FQDN of the
 first server using the account.
 
+### Group, strong account and target set of a row (`inputs.py`)
+
+Resolved at parse time, before any tenant contact:
+
+| | Order |
+|---|---|
+| group | the `group` cell → the domain's `group_template` (domains.csv) → `[defaults] group_template` → error |
+| strong account | the `strong_account` cell → the domain's `strong_account` (domain-joined rows only) → `[defaults] strong_account_template` → error |
+| target set | `scope = server`: the FQDN, type `Target`. `scope = auto`/`domain`: the domain's `target_set` (default: the domain name) and `target_set_type`, but only for a row that took its account from domains.csv; otherwise the FQDN. `scope = domain` additionally rejects a domain-joined row whose domain has no domains.csv entry. |
+
+A strong account named only in domains.csv is materialised as a `type=existing` `StrongAccountRow` with
+`account_domain` set to the domain — the tool looks it up and never creates it, which is what "onboarded by hand"
+means operationally. An explicit `strong_accounts.csv` row of the same name wins.
+`_check_shared_target_sets()` rejects two domains that point at one target set with different strong accounts,
+which is what lets the reconciler assume every row in a target-set group shares an account.
+
 ### Strong account (`_ensure_secrets`)
 
 | Situation | Status |
@@ -165,7 +185,9 @@ first server using the account.
 
 ### Target set (`_ensure_target_sets` / `_reconcile_existing_target_set`)
 
-One per server; the outcome is copied to every row of the server.
+One per target-set name; the outcome is copied to every row that uses it. For a `Domain` set that means every
+server in the AD domain, so `--update` on one re-points all of them — the drift/planned detail says so, and
+`--adopt` accepts the target-set name as well as an FQDN or policy name.
 
 | Situation | Status |
 |---|---|
@@ -289,8 +311,10 @@ checkpoint, reports, connection CSV and `.rdp` files never contain secrets.
   `days_of_week`, `from_hour`, `to_hour`, `target_set_cert_validation` to be present in the file (the dataclass
   keeps programmatic defaults for tests).
 - `validate()` checks hour format, session/idle ranges, day values, `provision_format` containing `<user>`,
-  the `owner_tag` charset, `identity_auth`, `status_polls` 1–10, that every name template uses only
-  `{hostname}`, `{fqdn}`, `{domain}` (`description_template` may also use `{protocol}`), the
+  the `owner_tag` charset, `identity_auth`, `status_polls` 1–10, `target_set_scope`, that `[http] ca_bundle`
+  exists on disk and is not combined with `verify = false`, that every name template (now including
+  `group_template` and `strong_account_domain`) uses only `{hostname}`, `{fqdn}`, `{domain}` and their
+  `_upper`/`_lower` variants (`description_template` may also use `{protocol}`), the
   `strong_account_type` matrix (vault needs safe + account-name templates, credentials needs a username template,
   both need `strong_account_template`), the `[http]` scale keys (`max_requests_per_second >= 0`,
   `lookup_search_max_rows >= 0`, the two path-family pins), `[pvwa]` (https URL, auth type, platform) and
@@ -346,7 +370,8 @@ Headers on every call: `Authorization: Bearer <token>` (PVWA: the raw token), `A
  "secretManagement": {"automaticManagementEnabled": true}}
 ```
 
-**Target sets** — `POST …/targetsets/bulk`:
+**Target sets** — `POST …/targetsets/bulk`. `type` is `Target` (one machine), `Domain` (every machine in an AD
+domain) or `Suffix` (every machine under a DNS suffix); `ArkSIATargetSetType` in `ark-sdk-python` is the reference.
 
 ```json
 {"target_sets_mapping": [{"strong_account_id": "<secret_id>", "target_sets": [
@@ -355,6 +380,20 @@ Headers on every call: `Authorization: Bearer <token>` (PVWA: the raw token), `A
    "enable_certificate_validation": false}
 ]}]}
 ```
+
+One `Domain` set for a whole AD domain, sharing that domain's strong account. Note the description names the
+scope, not a server: `server.description` is a per-server column and would be wrong on a shared object.
+
+```json
+{"target_sets_mapping": [{"strong_account_id": "<corp secret_id>", "target_sets": [
+  {"name": "corp.example.com", "type": "Domain", "secret_type": "PCloudAccount", "secret_id": "<corp secret_id>",
+   "description": "RDP ZSP domain corp.example.com via SA-CORP-SIA [managed-by:sia-policy-automation]",
+   "enable_certificate_validation": false}
+]}]}
+```
+
+`PUT …/targetsets/{name}` re-sends `enable_certificate_validation` and `provision_format` as well: the PUT
+replaces the object, so omitting them would reset them to the platform default.
 
 **Policy** — `POST https://<sub>.uap.cyberark.cloud/api/policies`:
 
@@ -438,6 +477,9 @@ Code must stay Python 3.11-compatible (no 3.12-only f-string nesting, no PEP 695
 | Change | Where |
 |---|---|
 | New policy field or behaviour (e.g. domain ephemeral user) | `payloads.build_policy` (+ golden test), possibly a new `servers.csv` column in `inputs.py` |
+| Another way to derive a row's group / account / target set | `inputs._resolve_groups` / `_resolve_strong_account` / `_resolve_target_set` — one function each, called from `_build_server_row` |
+| A new name-template placeholder | three places in step: `config.TEMPLATE_PLACEHOLDERS`, `inputs._render_name`, `payloads.render` |
+| Credentials from a secret store instead of `.env` | a `sia/ccp.py` sibling of `sia/pvwa.py`, called from `sia_onboard.resolve_client_secret` |
 | New strong-account option (e.g. ephemeral domain user settings) | `payloads.build_secret_payload` `secret_details`, `inputs.StrongAccountRow`, `config.StrongAccountTemplate` |
 | Another Vault (Privilege Cloud accounts API) for the vault stage | a sibling of `pvwa.PVWAClient` with the same three methods; `reconcile._ensure_vault` is client-agnostic |
 | New API call or path family | `clients.py` (thin wrapper, `SIACapabilities`) + a fake method in `tests/fakes.py` |

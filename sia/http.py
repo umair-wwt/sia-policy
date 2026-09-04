@@ -97,11 +97,14 @@ class HttpClient:
         logger: logging.Logger | None = None,
         sleep: Callable[[float], None] = time.sleep,
         limiter: RateLimiter | None = None,
+        verify: str | bool = True,
     ):
         self._token_provider = token_provider
         self._timeout = timeout
         self._max_retries = max_retries
         self._session = session or requests.Session()
+        if verify is not True:      # a corporate CA bundle, or (lab only) verification turned off
+            self._session.verify = verify
         self._log = logger or logging.getLogger("sia.http")
         self._sleep = sleep
         self._limiter = limiter

@@ -22,7 +22,7 @@ AUTH_PATHS = {"cyberark": "CyberArk", "ldap": "LDAP"}
 
 class PVWAClient:
     def __init__(self, base_url: str, *, auth_type: str = "cyberark", timeout: int = 60, max_retries: int = 2,
-                 session: requests.Session | None = None, logger: logging.Logger | None = None,
+                 session: requests.Session | None = None, logger: logging.Logger | None = None, verify: str | bool = True,
                  sleep: Callable[[float], None] = time.sleep):
         if auth_type not in AUTH_PATHS:
             raise ValueError(f"auth_type must be one of {', '.join(AUTH_PATHS)}")
@@ -31,7 +31,7 @@ class PVWAClient:
         self._token: str | None = None
         self._log = logger or logging.getLogger("sia.pvwa")
         self._http = HttpClient(lambda force=False: self._token or "-", timeout=timeout, max_retries=max_retries,
-                                session=session, logger=self._log, sleep=sleep)
+                                session=session, logger=self._log, sleep=sleep, verify=verify)
 
     @property
     def base_url(self) -> str:

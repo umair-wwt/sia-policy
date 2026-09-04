@@ -37,9 +37,11 @@ flowchart TB
 
 For each Windows server in your list the tool:
 
-1. makes sure SIA has a **strong account** for it: a reference to the server's own local admin account in the
+1. makes sure SIA has a **strong account** for it — either the shared account for the server's AD domain
+   (listed once per domain in `domains.csv`), or a reference to the server's own local admin account in the
    Vault, found by a naming convention you set once (safe `SIA-LocalAdmins`, account `<hostname>-Administrator`);
-2. creates a **target set** named after the server, pointing at that account;
+2. creates a **target set** pointing at that account: one per server, or one per AD domain when the account is
+   shared;
 3. creates the **access policy**: which Identity group may connect, by RDP with a temporary local user, for how long.
 
 Linux servers get only a policy (SIA uses an SSH certificate there). A second group on the same server is just a
@@ -120,17 +122,68 @@ app-lnx01.corp.example.com,,SIA-Linux-Admins,,,,,,ssh,ec2-user,
 
 | Column | Fill in |
 |---|---|
-| `fqdn` | The server name exactly as users will connect to it. |
-| `group` | The Identity group that may connect (several: `SIA-Web-Admins;SIA-Platform-Ops`). |
+| `fqdn` | The server name exactly as users will connect to it. **The only required column.** |
+| `group` | The Identity group that may connect (several: `SIA-Web-Admins;SIA-Platform-Ops`). Leave empty to derive it from the server name — see below. |
 | `policy_suffix` | Only for a second policy on the same server, e.g. `-ops`. |
 | `assign_groups` | Local groups the temporary user joins; empty = `Administrators`. |
 | `protocol`, `ssh_username` | `ssh` and the certificate user name for Linux servers; empty = Windows/RDP. |
-| `strong_account` | Leave empty. Only for the few servers that use a shared domain account declared in `strong_accounts.csv`. |
-| `policy_name`, `domain`, `description`, `domain_joined` | Optional overrides; the example file shows them. |
+| `strong_account` | Leave empty. Only for the few servers that need a specific account declared in `strong_accounts.csv`. |
+| `domain_joined` | `no` for a workgroup server, so it gets its own local account instead of its domain's. |
+| `policy_name`, `domain`, `description` | Optional overrides; the example file shows them. |
 
-The example folder also has `strong_accounts.csv` (shared or special accounts) and `groups.csv` (only needed
-when a group name exists in two directories). Column names must match exactly; every problem is reported with
-its line number and nothing is touched until the files are clean.
+Column names must match exactly; every problem is reported with its line number and nothing is touched until
+the files are clean.
+
+## Deriving the group and the strong account
+
+Filling in a group and a strong account per server does not scale past a few hundred rows. Two conventions
+remove both columns.
+
+**The group comes from the server name.** Set it once in `config.toml`:
+
+```toml
+[defaults]
+group_template = "SIA-{hostname_upper}-RDP"     # server ABC123 -> group SIA-ABC123-RDP
+```
+
+Templates may use `{hostname}`, `{fqdn}`, `{domain}` and the `{hostname_upper}` / `{hostname_lower}` /
+`{domain_upper}` variants. A `group` typed into a row always wins.
+
+**The strong account comes from the server's AD domain.** List your domains once in `input/domains.csv`:
+
+```csv
+domain,strong_account,target_set,target_set_type,group_template,description
+corp.example.com,SA-CORP-SIA,,Domain,,
+dmz.example.com,SA-DMZ-SIA,,Domain,SIA-{hostname_upper}-DMZ,
+```
+
+| Column | Fill in |
+|---|---|
+| `domain` | The AD domain, exactly as it appears at the end of the servers' FQDNs. |
+| `strong_account` | The domain account already onboarded into SIA. The tool only looks it up — it never creates it. |
+| `target_set` | The target set holding that account; empty = the domain name. |
+| `target_set_type` | `Domain` (every machine in the domain, the default) or `Suffix` (every machine under a DNS suffix). `Target` scopes a set to one machine, so it is only valid together with an explicit `target_set`. |
+| `group_template` | Overrides `[defaults] group_template` for this domain only. |
+
+Then `servers.csv` is just a list of names, and `strong_accounts.csv` is only needed for the exceptions:
+
+```csv
+fqdn
+web01.corp.example.com
+web02.corp.example.com
+```
+
+**How a server picks its strong account**, in order: the `strong_account` cell → its domain's row in
+`domains.csv` (domain-joined servers only) → `[defaults] strong_account_template`, the per-host local
+administrator. So a workgroup server (`domain_joined = no`) always falls through to its own local account,
+and both kinds can sit in the same file.
+
+**One target set per domain instead of one per server.** A domain account works on every machine in its
+domain, so it does not need a target set per server. Set `target_set_scope = "auto"` in `config.toml` and
+each domain gets a single `Domain` target set — 24 objects instead of 24,000. Workgroup servers keep their
+own `Target` set. The default, `server`, keeps one target set per server for everyone.
+
+`groups.csv` is only needed when a group name exists in two directories.
 
 ## Run it
 
@@ -164,6 +217,31 @@ Start with one server, test the login as a member of the group, then load the re
 - Interrupted? Run the same `apply` again with `--resume`; finished rows are skipped.
 
 More in [Large rollouts](docs/OPERATIONS.md#6-large-rollouts).
+
+## One server at a time (from a build job)
+
+`--server` replaces `servers.csv` for a single run, so a newly built server can be onboarded from the same
+job that builds it. `domains.csv`, `strong_accounts.csv` and `groups.csv` are still read, so the group and
+strong account resolve exactly as they would in a bulk run:
+
+```bash
+python sia_onboard.py apply --server web09.corp.example.com --yes --json --no-report
+```
+
+`--json` puts the result on stdout (the table goes to stderr) and the exit code is `0` success, `1` something
+needs attention, `2` bad input or configuration. Add `--group NAME` to name the group explicitly,
+`--workgroup` for a server that is not domain-joined.
+
+## Behind a TLS-inspecting proxy
+
+Export the proxy's root CA and point the tool at it, rather than turning verification off:
+
+```bash
+python sia_onboard.py --ca-bundle /path/to/corp-root-ca.pem preflight
+```
+
+Or set `ca_bundle` under `[http]` in `config.toml` to make it permanent. `preflight` prints which bundle is
+in use.
 
 ## Safety
 

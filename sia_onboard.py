@@ -19,6 +19,7 @@ import os
 import sys
 import traceback
 from collections import Counter
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -26,15 +27,15 @@ from sia.auth import AuthError, PlatformTokenProvider, make_identity_token_provi
 from sia.checkpoint import DEFAULT_NAME as CHECKPOINT_NAME
 from sia.checkpoint import Checkpoint
 from sia.clients import IdentityClient, SIAClient, UAPClient
-from sia.config import Config, ConfigError, load_config, load_dotenv, load_password_file
+from sia.config import Config, ConfigError, load_config, load_dotenv, load_password_file, validate
 from sia.connect import build_rows, login_suffix, write_connect_csv, write_rdp_files
 from sia.http import HttpClient, RateLimiter, SIAApiError
-from sia.inputs import InputError, Inputs, StrongAccountRow, load_inputs
+from sia.inputs import LIST_SEPARATOR, InputError, Inputs, StrongAccountRow, inline_inputs, load_inputs
 from sia.payloads import policy_name_for
 from sia.pvwa import PVWAClient
 from sia.reconcile import LOOKUP_MODES, MAX_WORKERS, STAGES, ReconcileError, Reconciler
 from sia.redact import RedactingFilter, redact, register_secret
-from sia.report import exit_code, print_summary, print_verify, write_reports, write_verify_csv
+from sia.report import exit_code, print_summary, print_verify, result_dict, write_reports, write_verify_csv
 from sia.resolve import PrincipalResolver, pick
 
 EXIT_OK, EXIT_FAILURES, EXIT_USAGE = 0, 1, 2
@@ -68,14 +69,18 @@ class Context:
         self.client_id = client_id
         secret = resolve_client_secret()
         timeout = cfg.http.timeout_seconds
+        verify = cfg.http.tls_verify
+        if verify is False:
+            log.warning("TLS verification is OFF ([http] verify = false): traffic to the tenant is not authenticated")
         self.limiter = RateLimiter(cfg.http.max_requests_per_second) if cfg.http.max_requests_per_second > 0 else None
-        self.token = PlatformTokenProvider(cfg.tenant.identity_url, client_id, secret, timeout=timeout)
+        self.token = PlatformTokenProvider(cfg.tenant.identity_url, client_id, secret, timeout=timeout, verify=verify)
         self.identity_token = make_identity_token_provider(
             cfg.auth.identity_auth, self.token, identity_url=cfg.tenant.identity_url, client_id=client_id,
-            client_secret=secret, application=cfg.auth.oidc_application, timeout=timeout)
-        self.http = HttpClient(self.token, timeout=timeout, max_retries=cfg.http.max_retries, limiter=self.limiter)
+            client_secret=secret, application=cfg.auth.oidc_application, timeout=timeout, verify=verify)
+        self.http = HttpClient(self.token, timeout=timeout, max_retries=cfg.http.max_retries, limiter=self.limiter,
+                               verify=verify)
         identity_http = self.http if self.identity_token is self.token else HttpClient(
-            self.identity_token, timeout=timeout, max_retries=cfg.http.max_retries, limiter=self.limiter)
+            self.identity_token, timeout=timeout, max_retries=cfg.http.max_retries, limiter=self.limiter, verify=verify)
         self.sia = SIAClient(self.http, cfg.tenant.dpa_url, secrets_api=cfg.http.secrets_api, targetsets_api=cfg.http.targetsets_api)
         self.uap = UAPClient(self.http, cfg.tenant.uap_url)
         self.identity = IdentityClient(identity_http, cfg.tenant.identity_url)
@@ -92,7 +97,8 @@ class Context:
                 password = getpass.getpass(f"PVWA_PASSWORD for {user or 'PVWA user'} (not echoed): ")
             if not user or not password:
                 raise ConfigError("[pvwa] is configured but PVWA_USER / PVWA_PASSWORD are not set (put them in .env)")
-            client = PVWAClient(self.cfg.pvwa.base_url, auth_type=self.cfg.pvwa.auth_type, timeout=self.cfg.http.timeout_seconds)
+            client = PVWAClient(self.cfg.pvwa.base_url, auth_type=self.cfg.pvwa.auth_type,
+                                timeout=self.cfg.http.timeout_seconds, verify=self.cfg.http.tls_verify)
             client.logon(user, password)
             self._pvwa = client
         return self._pvwa
@@ -110,8 +116,19 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("name")
     sp.add_argument("--from-list", action="store_true", help="print the (partial) object the list endpoint returns instead of the full policy")
 
+    parser.add_argument("--ca-bundle", metavar="FILE", help="PEM file (or directory) of trusted CAs; overrides [http] ca_bundle")
+
     def add_input_flags(p: argparse.ArgumentParser) -> None:
-        p.add_argument("--input", default="input", help="directory with servers.csv, strong_accounts.csv[, groups.csv]")
+        p.add_argument("--input", default="input", help="directory with servers.csv[, domains.csv, strong_accounts.csv, groups.csv]")
+        p.add_argument("--server", action="append", default=[], metavar="FQDN",
+                       help="onboard this server instead of reading servers.csv (repeatable); the other CSVs are still read")
+        p.add_argument("--group", action="append", default=[], metavar="NAME",
+                       help="--server only: Identity group that may connect (repeatable); omit to use group_template")
+        p.add_argument("--strong-account", metavar="NAME", help="--server only: override the strong account")
+        p.add_argument("--server-domain", metavar="DNS", help="--server only: AD domain, when it differs from the FQDN's")
+        p.add_argument("--workgroup", action="store_true", help="--server only: the target is not domain-joined")
+        p.add_argument("--protocol", choices=("rdp", "ssh"), help="--server only: rdp (default) or ssh")
+        p.add_argument("--ssh-username", metavar="USER", help="--server only: certificate user name for --protocol ssh")
         p.add_argument("--offset", type=int, default=0, metavar="N", help="skip the first N servers of the input (waves)")
         p.add_argument("--limit", type=int, default=0, metavar="N", help="process at most N servers (0 = all)")
         p.add_argument("--lookup", choices=LOOKUP_MODES, default="auto",
@@ -137,6 +154,9 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--resume", action="store_true", help="skip rows the checkpoint file records as complete")
         p.add_argument("--checkpoint", metavar="FILE", help=f"checkpoint file (default: <input>/{CHECKPOINT_NAME})")
         p.add_argument("--progress-every", type=int, default=100, metavar="N", help="log progress every N objects (0 = off)")
+        p.add_argument("--json", action="store_true",
+                       help="print the run as JSON on stdout (the table goes to stderr); for scripted callers")
+        p.add_argument("--no-report", action="store_true", help="do not write the JSON/CSV report files")
         if name == "apply":
             p.add_argument("--yes", "-y", action="store_true", help="do not ask for confirmation")
     vp = sub.add_parser("verify", help="check that every row's objects exist and its policy is Active (read-only)")
@@ -157,6 +177,14 @@ def cmd_preflight(ctx: Context) -> int:
     ok = True
     t = ctx.cfg.tenant
     print(f"Tenant:   {t.subdomain}  SIA={t.dpa_url}  UAP={t.uap_url}  Identity={t.identity_url}")
+    tls = ctx.cfg.http.tls_verify
+    if tls is True:
+        trust = "certifi (default trust store)"
+    elif tls is False:
+        trust = "VERIFICATION OFF -- traffic to the tenant is not authenticated"
+    else:
+        trust = f"CA bundle {tls}"
+    print(f"TLS:      {trust}")
     try:
         token = ctx.token()
         claims = ctx.token.claims
@@ -302,10 +330,43 @@ def make_password_source(allow_prompt: bool, file_passwords: dict[str, str] | No
     return get_password
 
 
+SERVER_ONLY_FLAGS = (("group", "--group"), ("strong_account", "--strong-account"), ("server_domain", "--server-domain"),
+                     ("workgroup", "--workgroup"), ("protocol", "--protocol"), ("ssh_username", "--ssh-username"))
+
+
+def check_server_flags(args: argparse.Namespace) -> None:
+    """These flags describe the row --server builds. Without --server they would silently do nothing."""
+    if args.server:
+        return
+    used = [flag for attr, flag in SERVER_ONLY_FLAGS if getattr(args, attr, None)]
+    if used:
+        raise ConfigError(f"{', '.join(used)} only apply together with --server; without it the servers and their "
+                          "groups come from servers.csv")
+
+
+def inline_rows(args: argparse.Namespace) -> list[dict[str, str]]:
+    """--server FQDN [...] as servers.csv rows, so both paths run through the same validation."""
+    shared = {
+        "group": LIST_SEPARATOR.join(args.group),
+        "strong_account": args.strong_account or "",
+        "domain": args.server_domain or "",
+        "protocol": args.protocol or "",
+        "ssh_username": args.ssh_username or "",
+        "domain_joined": "no" if args.workgroup else "",
+    }
+    return [{"fqdn": fqdn, **shared} for fqdn in args.server]
+
+
 def load_wave(ctx: Context, args: argparse.Namespace) -> Inputs:
     d = ctx.cfg.defaults
-    inputs = load_inputs(args.input, strong_account_template=d.strong_account_spec or "", ssh_username_default=d.ssh_username,
-                         policy_name_template=d.policy_name_template)
+    check_server_flags(args)
+    common = dict(strong_account_template=d.strong_account_spec or "", ssh_username_default=d.ssh_username,
+                  policy_name_template=d.policy_name_template, group_template=d.group_template,
+                  target_set_scope=d.target_set_scope)
+    if args.server:
+        inputs = inline_inputs(args.input, inline_rows(args), **common)
+    else:
+        inputs = load_inputs(args.input, **common)
     total = len(inputs.unique_fqdns)
     if args.offset or args.limit:
         if args.offset < 0 or args.limit < 0:
@@ -324,6 +385,8 @@ def load_wave(ctx: Context, args: argparse.Namespace) -> Inputs:
 def cmd_plan_apply(ctx: Context, args: argparse.Namespace, dry_run: bool) -> int:
     global _active_checkpoint
     d = ctx.cfg.defaults
+    # With --json, stdout carries only the JSON document so a caller can parse it; everything human goes to stderr.
+    human = sys.stderr if args.json else sys.stdout
     inputs = load_wave(ctx, args)
     file_passwords: dict[str, str] = {}
     password_file = args.passwords or ctx.cfg.auth.password_file
@@ -357,26 +420,33 @@ def cmd_plan_apply(ctx: Context, args: argparse.Namespace, dry_run: bool) -> int
         rec.snapshot()
         if not dry_run and not args.yes:
             preview = rec.reconcile(dry_run=True)
-            print_summary(preview)
+            print_summary(preview, human)
             if preview.failures:
-                print("\nResolve the items above (or re-run with --yes to proceed with the rest).")
+                print("\nResolve the items above (or re-run with --yes to proceed with the rest).", file=human)
             try:
-                answer = input("\nType 'yes' to apply these changes: ").strip().lower()
+                # the prompt goes to `human` too: with --json, stdout must stay parseable
+                print("\nType 'yes' to apply these changes: ", end="", file=human, flush=True)
+                answer = input().strip().lower()
             except EOFError:
                 answer = ""
-                print("\nNo interactive terminal; use --yes to apply without confirmation.")
+                print("\nNo interactive terminal; use --yes to apply without confirmation.", file=human)
             if answer != "yes":
-                print("Aborted; nothing changed.")
+                print("Aborted; nothing changed.", file=human)
                 return EXIT_USAGE
         result = rec.reconcile(dry_run=dry_run)
     finally:
         if pvwa is not None:
             pvwa.logoff()
-    print_summary(result)
-    json_path, csv_path = write_reports(result, args.report_dir)
-    print(f"\nReport: {json_path}\n        {csv_path}")
+    print_summary(result, human)
+    if not args.no_report:
+        json_path, csv_path = write_reports(result, args.report_dir)
+        print(f"\nReport: {json_path}\n        {csv_path}", file=human)
     if not dry_run and checkpoint_path.is_file():
-        print(f"Checkpoint: {checkpoint_path} ({checkpoint.done_count()} row(s) complete; re-run with --resume to skip them)")
+        print(f"Checkpoint: {checkpoint_path} ({checkpoint.done_count()} row(s) complete; re-run with --resume to skip them)",
+              file=human)
+    if args.json:
+        json.dump(result_dict(result), sys.stdout, indent=2)
+        print()
     return exit_code(result)
 
 
@@ -441,7 +511,11 @@ def main(argv: list[str] | None = None) -> int:
     configure_logging(args.verbose)
     try:
         load_dotenv(args.env)
-        ctx = Context(load_config(args.config))
+        cfg = load_config(args.config)
+        if args.ca_bundle:
+            cfg = replace(cfg, http=replace(cfg.http, ca_bundle=args.ca_bundle, verify=True))
+            validate(cfg)
+        ctx = Context(cfg)
         if args.command == "preflight":
             return cmd_preflight(ctx)
         if args.command == "show-policy":

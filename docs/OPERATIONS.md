@@ -111,12 +111,39 @@ window, session settings and connection profile, so you maintain those in one pl
 
 ## 4. Strong accounts in detail
 
-**Per-server local admins (the default).** With the `strong_account_*` settings in `config.toml`, a row that leaves
-`strong_account` empty gets the account `ADM-<hostname>`: a reference to the Vault account
-`<hostname>-Administrator` in Safe `SIA-LocalAdmins`, Windows user `Administrator`, shown in SIA as
-`<hostname>-Administrator_SIA-LocalAdmins`. `{hostname}`, `{fqdn}` and `{domain}` work in every template.
-`strong_account_type` can also be `existing` (references already created in the SIA portal, only looked up) or
-`credentials` (user name + password stored in SIA instead of the Vault; passwords from the password file).
+A row that leaves `strong_account` empty gets one of two kinds of account, and that choice also decides how wide
+its target set is:
+
+| | Domain-joined server with its domain in `domains.csv` | Everything else (workgroup servers, domains you have not listed) |
+|---|---|---|
+| Strong account | the domain's shared account, named once in `domains.csv` | `ADM-<hostname>`, the server's own local administrator |
+| Onboarded by | you, by hand, before the run (`type=existing`: the tool looks it up and never creates it) | the tool, from `strong_account_type` (`vault`/`credentials`), or by hand |
+| Target set (`target_set_scope = "auto"`) | one `Domain` set per AD domain, shared | one `Target` set per server |
+| Accounts to manage for 10,000 servers | one per domain | one per server |
+
+Both kinds can sit in the same `servers.csv`; `domain_joined = no` sends a row down the second column.
+
+**Per-domain accounts** — `domains.csv`, one row per AD domain:
+
+```csv
+domain,strong_account,target_set,target_set_type,group_template,description
+corp.example.com,SA-CORP-SIA,,Domain,,
+dmz.example.com,SA-DMZ-SIA,,Domain,SIA-{hostname_upper}-DMZ,
+```
+
+The account must already exist in SIA under exactly that name, and be a local administrator on every server in
+the domain. If it does not, every server in that domain reports
+`no strong account named 'SA-CORP-SIA' in SIA (type=existing)` and nothing is created — which is the intended
+behaviour while accounts are onboarded manually. Two domains may share one `target_set`, but only if they name
+the same `strong_account`: a target set holds exactly one account.
+
+**Per-server local admins.** With the `strong_account_*` settings in `config.toml`, a row that falls through to
+them gets the account `ADM-<hostname>`: a reference to the Vault account `<hostname>-Administrator` in Safe
+`SIA-LocalAdmins`, Windows user `Administrator`, shown in SIA as `<hostname>-Administrator_SIA-LocalAdmins`.
+`{hostname}`, `{fqdn}`, `{domain}` and their `_upper`/`_lower` variants work in every template, including
+`strong_account_domain` (set it to `"{domain}"` for one account per domain by naming convention rather than by
+list). `strong_account_type` can also be `existing` (references already created in the SIA portal, only looked
+up) or `credentials` (user name + password stored in SIA instead of the Vault; passwords from the password file).
 
 **Accounts you name explicitly** go in `strong_accounts.csv` and are referenced from the `strong_account` column:
 
@@ -157,7 +184,12 @@ sensitive and cannot be delegated*, not in *Protected Users*; local accounts nee
 
 ## 5. Day-to-day changes
 
-- **Adding servers.** Add rows, `plan`, `apply`. Existing servers show `exists`, new ones `created`.
+- **Adding servers.** Add rows, `plan`, `apply`. Existing servers show `exists`, new ones `created`. A server in a
+  domain that already has its `Domain` target set only needs its policy — the set is reported `exists`.
+- **A shared target set is shared.** `--update` on a `Domain` target set re-points every server in that domain at
+  once; `plan` says so in the detail line. To take over a hand-built one, `--adopt` accepts the target-set name
+  (`--adopt corp.example.com`) — that adopts the set only, never the policies of the servers in it, which are
+  still adopted by FQDN or policy name.
 - **A second group on a server.** Add a row with the same `fqdn`, the other `group` and a `policy_suffix`
   (or a `policy_name`). The strong account and target set are shared; only a policy is added.
 - **Changing a server's strong account.** Edit the row (or the template), `plan` shows `drift` on the target set,
@@ -231,10 +263,13 @@ hour, depending on tenant rate limits. Confirm the tenant-side limits in [Open i
 | `PVWA: FAILED` / `PVWA_USER / PVWA_PASSWORD are not set` | The `vault` stage cannot log on. | Put the PVWA user's credentials in `.env`, or empty `[pvwa] base_url`. |
 | `servers.csv:7: fqdn 'web01' is not a valid FQDN` | Input problem at line 7. | Fix the file; all problems are listed at once. |
 | `policy name '…' collides with line N` | Two rows would create the same policy. | Same server: add `policy_suffix`. Same host name in two domains: use `{fqdn}` in `policy_name_template`. |
-| `strong_account 'X' conflicts with line N for the same fqdn` | Two rows of one server disagree. | Rows of one server must share strong account, domain and protocol. |
-| `strong_account is required (or set defaults.strong_account_template …)` | No strong account and no naming template. | Fill the column or set the `strong_account_*` settings. |
+| `strong_account 'X' conflicts with line N for the same fqdn` | Two rows of one server disagree. | Rows of one server must share strong account, domain, protocol and target set. |
+| `strong_account is required — name it in the row, add '…' to domains.csv …` | No strong account, no domain row, no naming template. | Fill the column, add the domain to `domains.csv`, or set the `strong_account_*` settings. |
+| `group is required …, or set [defaults] group_template …` | No group, and nothing to derive one from. | Fill the column, or set `group_template` (in `config.toml` or per domain in `domains.csv`). |
+| `target_set_scope = "domain" but domain '…' has no row in domains.csv` | A domain-joined server whose domain you have not listed. | Add the domain, name a `strong_account` on the row, or use `target_set_scope = "auto"`. |
+| `domain '…' shares target set '…' with '…' but names strong account …` | Two domains point one target set at two accounts. | A target set holds one account: give them separate `target_set` names, or the same `strong_account`. |
 | `protocol=ssh needs ssh_username …` | A Linux row has no certificate user name. | Fill `ssh_username` on the row or in `config.toml`. |
-| `strong_account 'SA-x' is not defined in strong_accounts.csv` | The row refers to an unknown account. | Add the row (`type=existing` if it already exists in SIA). |
+| `strong_account 'SA-x' is not defined in strong_accounts.csv or domains.csv` | The row refers to an unknown account. | Add the row (`type=existing` if it already exists in SIA), or name it on the domain's row in `domains.csv`. |
 | `no strong account named '…' in SIA (type=existing)` | Nothing in SIA has that exact name. | Check the *Strong accounts* page, or set `strong_account_type = "vault"` so the reference is created. |
 | `Vault account '…' is missing and its current password is not available` | Nothing to onboard it with. | Add the account's name and password to the password file, or onboard it in PVWA. |
 | `group 'X' not found in Identity` / `is ambiguous` | Name mismatch / same name in several directories. | Check the exact name (similar names are listed) / add it to `groups.csv` with its directory. |
@@ -243,7 +278,8 @@ hour, depending on tenant rate limits. Confirm the tenant-side limits in [Open i
 | policy `status=Error` | SIA created the policy but flagged it. | Read the detail; compare with a hand-built policy (`show-policy`). |
 | policy `inactive … status=Suspended` | Someone suspended the policy. | Activate it in the portal, or accept `verify` reporting `FAIL`. |
 | `Run aborted (fail-fast): …` | The first create was rejected. | Fix the cause, `plan`, `apply` again. |
-| `drift: … not managed by this tool` | `--update` on a hand-built object. | Add `--adopt <fqdn>`. |
+| `drift: … not managed by this tool` | `--update` on a hand-built object. | Add `--adopt <fqdn>` (for a shared target set, `--adopt <target set name>`). |
+| `SSLError` / `CERTIFICATE_VERIFY_FAILED` | A proxy is re-signing TLS with a certificate the tool does not trust. | Export the proxy's root CA and pass `--ca-bundle FILE` (or set `[http] ca_bundle`). Do **not** disable verification to get past this on a real tenant. |
 | `… may or may not have been applied` | A request failed on the network mid-way. | Run `plan`; if the object exists it shows `exists`. |
 | `interrupted … re-run apply with --resume` | You stopped the run. | Run the same command with `--resume`. |
 | `… is readable by other users` | File permissions are too open. | `chmod 600 <file>` (macOS/Linux). |
@@ -290,7 +326,12 @@ account or target set.
 `drift`. `verify` is the read-only variant for sign-off.
 
 **Does it create domain (AD) ephemeral users?** No; Windows policies use local ephemeral users, which is what this
-programme wants.
+programme wants. That is independent of whether the *strong account* is a domain account: a domain account can
+create local ephemeral users on every server it administers, which is exactly what `domains.csv` sets up.
+
+**Can it be called from a build job?** Yes — `apply --server <fqdn> --yes --json --no-report` onboards one server
+without a `servers.csv`, reading `domains.csv` for its group and strong account. Exit code `0` success, `1`
+something needs attention, `2` bad input or configuration; the JSON result is on stdout, the table on stderr.
 
 **Can I undo a run?** No automatic undo, but every report lists exactly what was created (policy, then target
 set, then strong account if unused).
@@ -302,12 +343,12 @@ own `config.toml`, `.env` and password file.
 
 | In the SIA portal | In this tool | Notes |
 |---|---|---|
-| Strong account | derived per server from `strong_account_*` templates, or a `strong_accounts.csv` row (a *VM secret* in the API) | `vault` (Vault reference), `credentials` (stored in SIA), `existing` (already in SIA) |
-| Target set (type *Target*) | one per Windows server, named the FQDN | Links the server to its strong account |
+| Strong account | the server's domain account (a `domains.csv` row), a `strong_accounts.csv` row, or derived per server from `strong_account_*` templates (a *VM secret* in the API) | `vault` (Vault reference), `credentials` (stored in SIA), `existing` (already in SIA) |
+| Target set | type *Target*: one per Windows server, named the FQDN. Type *Domain*: one per AD domain, shared (`target_set_scope`) | Links servers to a strong account |
 | Access policy (Access control policies) | one per `servers.csv` row, named after the server, plus `policy_suffix` for a second one | Who / where / how / when |
 | Ephemeral (temporary) local user | `assign_local_groups` / `assign_groups`; `max_session_hours`, `idle_minutes`, `enable_reconnect` | Created and removed by SIA at connection time |
 | SSH certificate access (Linux ZSP) | `protocol = ssh`, `ssh_username` | Policy only |
-| Principal | the `group` column | Resolved to the Identity group automatically |
+| Principal | the `group` column, or `group_template` applied to the server name | Always a group, never a user; resolved to the Identity group automatically |
 | Directory | `groups.csv` `directory` | Only for ambiguous group names |
 | Connector | – | Must reach Windows servers over WinRM |
 | RD Gateway `<subdomain>.rdp.cyberark.cloud` | `connect-info` output | What RDP clients connect through |

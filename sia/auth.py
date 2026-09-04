@@ -57,7 +57,8 @@ class _CachingTokenProvider:
     name = "base"
 
     def __init__(self, identity_url: str, client_id: str, client_secret: str, *, timeout: int = 60,
-                 session: requests.Session | None = None, logger: logging.Logger | None = None, clock=time.time):
+                 session: requests.Session | None = None, logger: logging.Logger | None = None, clock=time.time,
+                 verify: str | bool = True):
         if not client_id or not client_secret:
             raise AuthError("SIA_CLIENT_ID and SIA_CLIENT_SECRET must be set")
         register_secret(client_secret)
@@ -66,6 +67,8 @@ class _CachingTokenProvider:
         self._client_secret = client_secret
         self._timeout = timeout
         self._session = session or requests.Session()
+        if verify is not True:      # a corporate CA bundle, or (lab only) verification turned off
+            self._session.verify = verify
         self._log = logger or logging.getLogger("sia.auth")
         self._clock = clock
         self._token: str | None = None
@@ -179,11 +182,12 @@ class ServiceUserOIDCTokenProvider(_CachingTokenProvider):
 
 def make_identity_token_provider(method: str, platform_provider: PlatformTokenProvider, *, identity_url: str,
                                  client_id: str, client_secret: str, application: str = DEFAULT_OIDC_APPLICATION,
-                                 timeout: int = 60, session: requests.Session | None = None):
+                                 timeout: int = 60, session: requests.Session | None = None,
+                                 verify: str | bool = True):
     """Select the adapter used for Identity directory calls ([auth] identity_auth)."""
     if method == "platform_token":
         return platform_provider
     if method == "service_user_oidc":
         return ServiceUserOIDCTokenProvider(identity_url, client_id, client_secret, application=application,
-                                            timeout=timeout, session=session)
+                                            timeout=timeout, session=session, verify=verify)
     raise AuthError(f"unknown identity_auth method {method!r}")

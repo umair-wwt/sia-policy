@@ -2,7 +2,8 @@
 
 Units of work
   * one strong account per referenced account row (shared by every server that names it);
-  * one target set per Windows server (FQDN);
+  * one target set per distinct target-set name: normally that is one per Windows server (FQDN), but a "Domain" set
+    covers every server in one AD domain, so its outcome is copied to all of them;
   * one access policy per servers.csv row (a server may have several, e.g. one per Identity group).
 
 Safety rules
@@ -45,7 +46,7 @@ from .inputs import Inputs, ServerRow, StrongAccountRow
 from .payloads import (
     build_bulk_target_sets, build_policy, build_policy_update, build_secret_payload, build_target_set,
     build_target_set_update, build_vault_account, exact_fqdns, is_owned_policy, is_owned_target_set, policy_name_for,
-    policy_signature, policy_status, sanitize_template, validate_template,
+    policy_signature, policy_status, sanitize_template, target_set_name_for, validate_template,
 )
 from .redact import register_secret
 from .resolve import PrincipalResolver, ResolveError, SecretIndex, pick, secret_id_of, secret_type_of
@@ -87,6 +88,7 @@ class ServerResult:
     policy_name: str
     protocol: str = "rdp"
     line: int = 0
+    target_set_name: str = ""     # the set this row needs; several rows may name the same one (a Domain set)
     secret: Outcome = field(default_factory=Outcome)
     target_set: Outcome = field(default_factory=Outcome)
     policy: Outcome = field(default_factory=Outcome)
@@ -98,6 +100,11 @@ class ServerResult:
     @property
     def key(self) -> tuple[str, str]:
         return (self.fqdn, self.policy_name)
+
+    @property
+    def target_set_key(self) -> str:
+        """Identity of this row's target set, for counting objects rather than rows."""
+        return (self.target_set_name or self.fqdn).lower()
 
 
 @dataclass
@@ -176,11 +183,13 @@ class Reconciler:
         self._template = self._load_template()
         self._plan_rows()
         fqdns = list(dict.fromkeys(s.fqdn for s, _ in self._rows))
-        rdp_fqdns = list(dict.fromkeys(s.fqdn for s, _ in self._rows if not s.is_ssh))
+        # Windows servers may share one target set (a Domain set covers a whole AD domain), so look them up by
+        # target-set name rather than by FQDN.
+        target_set_names = list(dict.fromkeys(s.target_set_key for s, _ in self._rows if not s.is_ssh))
         accounts = self._active_accounts()
         self._lookup_mode = self._choose_lookup(len(fqdns))
         self._snapshot_secrets(accounts)
-        self._snapshot_target_sets(rdp_fqdns, accounts)
+        self._snapshot_target_sets(target_set_names, accounts)
         self._snapshot_policies(fqdns)
         self._log.info("Tenant snapshot (%s lookup): %d strong accounts, %d target sets, %d policies read for %d rows (%d resumed)",
                        self._lookup_mode, len(self._secrets), len(self._target_sets), len(self._policies), len(self._rows),
@@ -204,12 +213,13 @@ class Reconciler:
         fresh: list[tuple[ServerRow, ServerResult]] = []
         for server, old in self._rows:
             fresh.append((server, ServerResult(fqdn=old.fqdn, strong_account=old.strong_account, policy_name=old.policy_name,
-                                               protocol=old.protocol, line=old.line)))
+                                               protocol=old.protocol, line=old.line,
+                                               target_set_name=old.target_set_name)))
         self._rows = fresh
         ordered: dict[tuple[str, str], ServerResult] = {}
         for key, (server, old, record) in self._resumed.items():
             sr = ServerResult(fqdn=old.fqdn, strong_account=old.strong_account, policy_name=old.policy_name,
-                              protocol=old.protocol, line=old.line)
+                              protocol=old.protocol, line=old.line, target_set_name=old.target_set_name)
             statuses, refs, at = record.get("statuses") or {}, record.get("refs") or {}, record.get("at", "")
             for label in ("secret", "target_set", "policy"):
                 status = statuses.get(label, "exists")
@@ -234,7 +244,8 @@ class Reconciler:
         for server in self.inputs.servers:
             name = policy_name_for(server, self.defaults)
             sr = ServerResult(fqdn=server.fqdn, strong_account=server.strong_account or "-", policy_name=name,
-                              protocol=server.protocol, line=server.line)
+                              protocol=server.protocol, line=server.line,
+                              target_set_name=("" if server.is_ssh else target_set_name_for(server)))
             if self.resume and self.checkpoint is not None:
                 account = self.inputs.strong_accounts.get(server.strong_account or "")
                 record = self.checkpoint.get(row_key(server.fqdn, name), fingerprint(server, account, name))
@@ -272,15 +283,15 @@ class Reconciler:
         else:
             self._secrets = SecretIndex(self.sia.list_secrets())
 
-    def _snapshot_target_sets(self, fqdns: list[str], accounts: list[StrongAccountRow]) -> None:
+    def _snapshot_target_sets(self, names: list[str], accounts: list[StrongAccountRow]) -> None:
         self._target_sets = {}
-        if not fqdns:
+        if not names:
             return
         caps = getattr(self.sia, "capabilities", None)
         unfiltered = True if caps is None else bool(caps.targetsets_list_unfiltered)
         items: list[dict[str, Any]] = []
         if self._lookup_mode == "search" and unfiltered:
-            for chunk in self._parallel(fqdns, lambda f: self.sia.list_target_sets(name=f)):
+            for chunk in self._parallel(names, lambda n: self.sia.list_target_sets(name=n)):
                 items.extend(chunk)
         elif unfiltered:
             items = self.sia.list_target_sets()
@@ -319,6 +330,11 @@ class Reconciler:
 
     def _adopted(self, server: ServerRow, sr: ServerResult) -> bool:
         return self.adopt_all or server.fqdn.lower() in self.adopt or sr.policy_name.lower() in self.adopt
+
+    def _adopted_target_set(self, server: ServerRow, sr: ServerResult) -> bool:
+        """A shared set has no FQDN of its own, so --adopt also accepts its name. Deliberately not folded into
+        _adopted(): naming a domain must not silently adopt every policy in it as well."""
+        return self._adopted(server, sr) or server.target_set_key in self.adopt
 
     def _abort(self, reason: str) -> None:
         with self._lock:
@@ -599,29 +615,37 @@ class Reconciler:
         self._result.secrets[account.name] = Outcome("created", f"created {what} -> {sid}", sid)
 
     # -------------------------------------------------------- target sets
-    def _rows_by_fqdn(self) -> dict[str, list[tuple[ServerRow, ServerResult]]]:
+    def _rows_by_target_set(self) -> dict[str, list[tuple[ServerRow, ServerResult]]]:
+        """Windows rows grouped by the target set they need. One Domain set can cover a whole AD domain, so a group
+        may span several FQDNs; every row in a group shares one strong account (the inputs guarantee it)."""
         out: dict[str, list[tuple[ServerRow, ServerResult]]] = {}
         for server, sr in self._rows:
-            out.setdefault(server.fqdn, []).append((server, sr))
+            if not server.is_ssh:
+                out.setdefault(server.target_set_key, []).append((server, sr))
         return out
 
     def _ensure_target_sets(self, result: RunResult) -> None:
+        # Pass 1: the strong account is per row.
+        for server, sr in self._rows:
+            if server.is_ssh:
+                sr.secret = Outcome(NOT_APPLICABLE, "SSH: Linux ZSP uses an SSH certificate; no strong account")
+                sr.target_set = Outcome(NOT_APPLICABLE, "SSH: no target set needed")
+                continue
+            found = result.secrets.get(server.strong_account or "", Outcome("failed", "strong account missing"))
+            sr.secret = Outcome(found.status, found.detail, found.ref)
+        # Pass 2: the target set is per target-set name, and its outcome is copied to every server that uses it.
         queue: dict[str, list[dict[str, Any]]] = {}
         queued: dict[str, list[ServerResult]] = {}
-        for fqdn, rows in self._rows_by_fqdn().items():
+        for rows in self._rows_by_target_set().values():
             server = rows[0][0]
             results = [sr for _, sr in rows]
-            if server.is_ssh:
-                self._set_all(results, secret=Outcome(NOT_APPLICABLE, "SSH: Linux ZSP uses an SSH certificate; no strong account"),
-                              target_set=Outcome(NOT_APPLICABLE, "SSH: no target set needed"))
-                continue
-            secret = result.secrets.get(server.strong_account or "", Outcome("failed", "strong account missing"))
-            self._set_all(results, secret=secret)
-            if secret.bad or secret.status == "skipped":
+            name = target_set_name_for(server)
+            shared = f" (shared by every server in {name})" if server.shares_target_set else ""
+            if results[0].secret.bad or results[0].secret.status == "skipped":
                 self._set_all(results, target_set=Outcome("blocked", f"strong account {server.strong_account!r} unavailable"))
                 continue
             secret_id, secret_type = self._refs[server.strong_account or ""]
-            current = self._target_sets.get(fqdn)
+            current = self._target_sets.get(server.target_set_key)
             if current:
                 outcome = self._reconcile_existing_target_set(server, results[0], current, secret_id, secret_type, result)
                 self._set_all(results, target_set=outcome)
@@ -633,10 +657,11 @@ class Reconciler:
                 self._set_all(results, target_set=self._blocked_by_abort())
                 continue
             if self.dry_run or secret_id is None:
-                self._set_all(results, target_set=Outcome("planned", f"would create Target set -> {server.strong_account}", fqdn))
+                self._set_all(results, target_set=Outcome(
+                    "planned", f"would create {server.target_set_type} set {name} -> {server.strong_account}{shared}", name))
                 continue
             queue.setdefault(secret_id, []).append(build_target_set(server, secret_id, secret_type, self.defaults))
-            queued[fqdn] = results
+            queued[name] = results
         if queue:
             self._bulk_create(queue, queued)
 
@@ -650,30 +675,34 @@ class Reconciler:
 
     def _reconcile_existing_target_set(self, server: ServerRow, sr: ServerResult, current: dict[str, Any],
                                        secret_id: str | None, secret_type: str, result: RunResult) -> Outcome:
+        name = target_set_name_for(server)
+        expected_type = server.target_set_type or "Target"
         current_secret = pick(current, "secret_id", "secretId")
-        ts_type = pick(current, "type", default="Target")
+        ts_type = pick(current, "type", default=expected_type)
         owned = is_owned_target_set(current, self.defaults.owner_tag)
-        if str(ts_type) != "Target":
-            result.warnings.append(f"target set {server.fqdn!r} exists with type={ts_type} (expected Target)")
+        if str(ts_type) != expected_type:
+            result.warnings.append(f"target set {name!r} exists with type={ts_type} (expected {expected_type})")
         if not secret_id or current_secret == secret_id:
             note = "" if owned else " (unmanaged: no owner marker)"
-            return Outcome("exists", f"{ts_type} -> {server.strong_account}{note}", server.fqdn)
+            return Outcome("exists", f"{ts_type} -> {server.strong_account}{note}", name)
         summary = f"points to secret {current_secret}, expected {secret_id} ({server.strong_account})"
+        if server.shares_target_set:
+            summary += f"; re-pointing it moves every server in {name}"
         if not (self.update and self._writes("targetsets")):
-            return Outcome("drift", f"{summary} (use --update to re-point)", server.fqdn)
-        if not (owned or self._adopted(server, sr)):
-            return Outcome("drift", f"{summary}; not managed by this tool -- pass --adopt {server.fqdn} to take ownership", server.fqdn)
+            return Outcome("drift", f"{summary} (use --update to re-point)", name)
+        if not (owned or self._adopted_target_set(server, sr)):
+            return Outcome("drift", f"{summary}; not managed by this tool -- pass --adopt {name} to take ownership", name)
         if self._abort_reason:
             return self._blocked_by_abort()
         if self.dry_run:
-            return Outcome("planned", f"would re-point target set to {server.strong_account} ({secret_id})", server.fqdn)
+            return Outcome("planned", f"would re-point target set {name} to {server.strong_account} ({secret_id})", name)
         try:
-            self.sia.update_target_set(server.fqdn, build_target_set_update(server, secret_id, secret_type, self.defaults))
-            return Outcome("updated", f"re-pointed to {server.strong_account} ({secret_id})", server.fqdn)
+            self.sia.update_target_set(name, build_target_set_update(server, secret_id, secret_type, self.defaults, current))
+            return Outcome("updated", f"re-pointed to {server.strong_account} ({secret_id})", name)
         except SIAApiError as exc:
             if self._systematic(exc):
-                self._abort(f"updating target set {server.fqdn}: {exc}")
-            return Outcome("failed", f"update failed: {exc}", server.fqdn)
+                self._abort(f"updating target set {name}: {exc}")
+            return Outcome("failed", f"update failed: {exc}", name)
 
     def _bulk_create(self, queue: dict[str, list[dict[str, Any]]], queued: dict[str, list[ServerResult]]) -> None:
         total = sum(len(sets) for sets in queue.values())
@@ -694,13 +723,14 @@ class Reconciler:
                         self._abort(f"bulk-creating target sets for strong account {secret_id}: {exc}")
                     continue
                 by_name = {str(pick(o, "target_set_name", "targetSetName", default="")).lower(): o for o in outcomes}
+                kinds = {ts["name"]: ts["type"] for ts in chunk}
                 for name in names:
                     item = by_name.get(name.lower())
                     account = queued[name][0].strong_account
                     if item is None:
                         outcome = Outcome("failed", "bulk create returned no result for this target set", name)
                     elif pick(item, "success", default=False) is True:
-                        outcome = Outcome("created", f"Target set -> {account}", name)
+                        outcome = Outcome("created", f"{kinds[name]} set {name} -> {account}", name)
                     else:
                         reason = pick(item, "error", "message", "reason", default="rejected by SIA (check the strong account and FQDN)")
                         outcome = Outcome("failed", f"bulk create: {reason}", name)

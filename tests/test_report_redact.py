@@ -80,7 +80,7 @@ def test_write_reports_thresholds(tmp_path):
     assert data["servers"] == "2 rows: see the CSV report" and [s["fqdn"] for s in data["servers_needing_attention"]] == ["s1.corp"]
     assert data["vault_accounts"]["SA"]["status"] == "created"
     lines = csv_path.read_text().splitlines()
-    assert lines[0].startswith("fqdn,strong_account,policy_name,secret_status") and len(lines) == 3 and "pol-1" in lines[2]
+    assert lines[0].startswith("fqdn,strong_account,target_set_name,policy_name,secret_status") and len(lines) == 3 and "pol-1" in lines[2]
     json_path, _ = write_reports(result, tmp_path / "reports2")
     assert len(json.loads(json_path.read_text())["servers"]) == 2
     assert exit_code(result) == 1 and exit_code(result_with([("exists", "exists")])) == 0

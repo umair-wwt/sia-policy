@@ -16,8 +16,8 @@ from .reconcile import Outcome, RunResult, ServerResult
 
 _DETAIL_STATUSES = {"failed", "blocked", "drift", "planned", "updated", "created", "skipped", "inactive"}
 _QUIET_STATUSES = {"exists", "n/a"}
-CSV_COLUMNS = ("fqdn", "strong_account", "policy_name", "secret_status", "secret_detail", "target_set_status",
-               "target_set_detail", "policy_status", "policy_detail", "policy_id")
+CSV_COLUMNS = ("fqdn", "strong_account", "target_set_name", "policy_name", "secret_status", "secret_detail",
+               "target_set_status", "target_set_detail", "policy_status", "policy_detail", "policy_id")
 VERIFY_COLUMNS = ("fqdn", "policy_name", "strong_account", "secret", "target_set", "policy", "verdict", "policy_id", "detail")
 VERDICT_BY_STATUS = {"exists": "PASS", "created": "PASS", "updated": "PASS", "n/a": "PASS", "planned": "MISSING",
                      "drift": "FAIL", "failed": "FAIL", "blocked": "FAIL", "inactive": "FAIL", "skipped": "SKIP"}
@@ -77,8 +77,8 @@ def print_summary(result: RunResult, out: TextIO | None = None, *, max_rows: int
         seen_target_sets: set[str] = set()
         for sr in servers:
             items = [("policy", sr.policy)]
-            if sr.fqdn not in seen_target_sets:      # one target set per server, however many policies it has
-                seen_target_sets.add(sr.fqdn)
+            if sr.target_set_key not in seen_target_sets:   # one target set, however many rows and servers use it
+                seen_target_sets.add(sr.target_set_key)
                 items.insert(0, ("target set", sr.target_set))
             for label, outcome in items:
                 noteworthy = outcome.status in _DETAIL_STATUSES or "unmanaged" in outcome.detail
@@ -106,13 +106,14 @@ def print_summary(result: RunResult, out: TextIO | None = None, *, max_rows: int
 
 
 def _counts(result: RunResult) -> dict[str, int]:
-    """Objects by status: strong accounts and Vault accounts once each, target sets once per server, policies per row."""
+    """Objects by status: strong accounts and Vault accounts once each, target sets once per *set* (a Domain set
+    shared by a whole AD domain counts once, not once per server), policies per row."""
     counts: dict[str, int] = {}
     seen_target_sets: set[str] = set()
     for sr in result.servers:
         outcomes = [sr.policy]
-        if sr.fqdn not in seen_target_sets:
-            seen_target_sets.add(sr.fqdn)
+        if sr.target_set_key not in seen_target_sets:
+            seen_target_sets.add(sr.target_set_key)
             outcomes.append(sr.target_set)
         for outcome in outcomes:
             counts[outcome.status] = counts.get(outcome.status, 0) + 1
@@ -127,14 +128,12 @@ def _totals(result: RunResult) -> str:
 
 def _server_dict(sr: ServerResult) -> dict:
     return {"fqdn": sr.fqdn, "strong_account": sr.strong_account, "policy_name": sr.policy_name, "protocol": sr.protocol,
+            "target_set_name": sr.target_set_name or sr.fqdn,
             "secret": vars(sr.secret), "target_set": vars(sr.target_set), "policy": vars(sr.policy)}
 
 
-def write_reports(result: RunResult, report_dir: str | Path, *, json_max_rows: int = 10_000) -> tuple[Path, Path]:
-    report_dir = Path(report_dir)
-    report_dir.mkdir(parents=True, exist_ok=True)
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    base = report_dir / f"{result.mode}-{stamp}"
+def result_dict(result: RunResult, *, json_max_rows: int = 10_000) -> dict:
+    """The whole run as plain data: written to reports/<mode>-<stamp>.json, and printed by --json."""
     data: dict = {
         "mode": result.mode,
         "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -153,6 +152,15 @@ def write_reports(result: RunResult, report_dir: str | Path, *, json_max_rows: i
     else:
         data["servers"] = f"{len(result.servers)} rows: see the CSV report"
         data["servers_needing_attention"] = [_server_dict(sr) for sr in result.servers if not sr.ok][:json_max_rows]
+    return data
+
+
+def write_reports(result: RunResult, report_dir: str | Path, *, json_max_rows: int = 10_000) -> tuple[Path, Path]:
+    report_dir = Path(report_dir)
+    report_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    base = report_dir / f"{result.mode}-{stamp}"
+    data = result_dict(result, json_max_rows=json_max_rows)
     json_path = base.with_suffix(".json")
     with json_path.open("w", encoding="utf-8") as fh:
         json.dump(data, fh, indent=2)
@@ -161,9 +169,9 @@ def write_reports(result: RunResult, report_dir: str | Path, *, json_max_rows: i
         writer = csv.writer(fh)
         writer.writerow(CSV_COLUMNS)
         for sr in result.servers:
-            writer.writerow([sr.fqdn, sr.strong_account, sr.policy_name, sr.secret.status, sr.secret.detail,
-                             sr.target_set.status, sr.target_set.detail, sr.policy.status, sr.policy.detail,
-                             sr.policy.ref or ""])
+            writer.writerow([sr.fqdn, sr.strong_account, sr.target_set_name or sr.fqdn, sr.policy_name,
+                             sr.secret.status, sr.secret.detail, sr.target_set.status, sr.target_set.detail,
+                             sr.policy.status, sr.policy.detail, sr.policy.ref or ""])
     return json_path, csv_path
 
 
