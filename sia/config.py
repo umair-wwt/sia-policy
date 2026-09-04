@@ -23,6 +23,7 @@ TARGETSETS_API_FAMILIES = ("auto", "legacy", "discovery")
 PVWA_AUTH_TYPES = ("cyberark", "ldap")
 TEMPLATE_PLACEHOLDERS = ("hostname", "fqdn", "domain", "hostname_upper", "hostname_lower", "domain_upper")
 TARGET_SET_SCOPES = ("server", "auto", "domain")
+POLICY_STATUSES = ("Active", "Suspended")
 # [defaults] keys that must be written explicitly in config.toml (no silent organizational defaults)
 REQUIRED_DEFAULT_KEYS = ("days_of_week", "from_hour", "to_hour", "target_set_cert_validation")
 
@@ -71,6 +72,7 @@ class Defaults:
     policy_name_template: str = "{fqdn}"
     description_template: str = "Automated: {protocol} ZSP access to {fqdn}"
     policy_tags: tuple[str, ...] = ("automated",)
+    policy_status: str = "Active"              # metadata.status on create: Active, or Suspended to stage a rollout
     time_zone: str = "GMT"
     days_of_week: tuple[int, ...] = (0, 1, 2, 3, 4, 5, 6)
     from_hour: str = ""
@@ -226,6 +228,9 @@ def validate(cfg: Config) -> None:
         raise ConfigError("[defaults] policy_name_template must not be empty")
     if d.target_set_scope not in TARGET_SET_SCOPES:
         raise ConfigError(f"[defaults] target_set_scope must be one of {', '.join(TARGET_SET_SCOPES)}")
+    if d.policy_status not in POLICY_STATUSES:
+        raise ConfigError(f"[defaults] policy_status must be one of {', '.join(POLICY_STATUSES)} "
+                          "(Validating/Error/Warning are set by the platform, not requested)")
     _check_template("description_template", d.description_template, TEMPLATE_PLACEHOLDERS + ("protocol",))
     if d.strong_account_type not in STRONG_ACCOUNT_TYPES:
         raise ConfigError(f"[defaults] strong_account_type must be one of {', '.join(STRONG_ACCOUNT_TYPES)}")

@@ -15,6 +15,9 @@ from .inputs import ServerRow, StrongAccountRow, effective_policy_name
 TARGET_SET_TYPE_TARGET = "Target"
 MAX_POLICY_TAGS = 20
 APPROVED_CONDITION_KEYS = ("accessWindow", "maxSessionDuration", "idleTime", "accessApproval")
+# metadata.status is REQUIRED on create (ArkUAPMetadata.status has no default); the platform then owns the value,
+# reporting Validating/Error/Warning back. Only these two are meaningful to ask for.
+POLICY_STATUSES = ("Active", "Suspended")
 APPROVED_RDP_KEYS = ("localEphemeralUser", "domainEphemeralUser")
 
 
@@ -258,7 +261,10 @@ def build_policy(server: ServerRow, principals: list[dict[str, Any]], defaults: 
     With `template` (an existing policy as returned by GET), its approved fields are cloned (see sanitize_template)
     and the profile matching the row's protocol is used: rdp rows take the RDP ephemeral-user profile (a per-row
     assign_groups still overrides its local groups), ssh rows take the SSH profile (a per-row ssh_username still
-    overrides the username). The owner tag is always added. metadata.status is read-only in the API and never sent.
+    overrides the username). The owner tag is always added.
+
+    metadata.status is required by the API (CyberArk's own SDK sends it on every create); the platform validates the
+    policy and then reports Validating/Active/Error back on read.
     """
     if not principals:
         raise ValueError(f"policy for {server.fqdn} has no principals")
@@ -295,6 +301,7 @@ def build_policy(server: ServerRow, principals: list[dict[str, Any]], defaults: 
             "policyEntitlement": {"targetCategory": "VM", "locationType": "FQDN/IP", "policyType": "Recurring"},
             "policyTags": tags,
             "timeZone": tmeta.get("timeZone") or defaults.time_zone,
+            "status": {"status": defaults.policy_status},
         },
         "principals": principals,
         "delegationClassification": (template or {}).get("delegationClassification") or "Unrestricted",
@@ -305,8 +312,16 @@ def build_policy(server: ServerRow, principals: list[dict[str, Any]], defaults: 
 
 
 def build_policy_update(existing: dict[str, Any], desired: dict[str, Any]) -> dict[str, Any]:
-    """PUT /api/policies/{id} body: desired policy carrying the existing policyId."""
-    return {**desired, "metadata": {**desired["metadata"], "policyId": existing["metadata"]["policyId"]}}
+    """PUT /api/policies/{id} body: desired policy carrying the existing policyId.
+
+    The existing status is carried over rather than reset to defaults.policy_status: an operator who suspended a
+    policy in the portal should not have it silently re-activated by an unrelated principal or target fix.
+    """
+    meta = {**desired["metadata"], "policyId": existing["metadata"]["policyId"]}
+    current = (existing.get("metadata") or {}).get("status")
+    if current:
+        meta["status"] = {"status": current} if isinstance(current, str) else current
+    return {**desired, "metadata": meta}
 
 
 def policy_status(policy: dict[str, Any]) -> str:

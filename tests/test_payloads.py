@@ -148,6 +148,7 @@ def test_policy_payload_golden():
             "policyEntitlement": {"targetCategory": "VM", "locationType": "FQDN/IP", "policyType": "Recurring"},
             "policyTags": ["automated", OWNER],
             "timeZone": "America/New_York",
+            "status": {"status": "Active"},
         },
         "principals": [build_principal(GROUP_ROW)],
         "delegationClassification": "Unrestricted",
@@ -158,7 +159,9 @@ def test_policy_payload_golden():
                                                                    "enableEphemeralUserReconnect": False}}}},
     }
     assert policy == expected
-    assert "status" not in policy["metadata"]   # read-only in the API
+    # metadata.status is required by the API (ArkUAPMetadata.status has no default); tenants reject a create without it
+    assert build_policy(server(), [build_principal(GROUP_ROW)],
+                        Defaults(policy_status="Suspended"))["metadata"]["status"] == {"status": "Suspended"}
     assert is_owned_policy(policy, OWNER) and not is_owned_policy({"metadata": {"policyTags": ["automated"]}}, OWNER)
     json.dumps(policy)  # serializable
 
@@ -212,7 +215,8 @@ def test_policy_from_template_clones_approved_fields_only():
     assert policy["behavior"] == {"connectAs": {"rdp": TEMPLATE["behavior"]["connectAs"]["rdp"]}}  # SSH profile dropped
     assert policy["metadata"]["timeZone"] == "Europe/London" and policy["metadata"]["policyTags"] == ["ref", OWNER]
     assert policy["delegationClassification"] == "Restricted"
-    assert policy["metadata"]["name"] == NAME and "policyId" not in policy["metadata"] and "status" not in policy["metadata"]
+    assert policy["metadata"]["name"] == NAME and "policyId" not in policy["metadata"]
+    assert policy["metadata"]["status"] == {"status": "Active"}      # the template's status never carries over
     assert policy["principals"] == [build_principal(GROUP_ROW)]
     assert policy["targets"]["FQDN/IP"]["fqdnRules"][0]["computernamePattern"] == "web01.corp.example.com"
     policy2 = build_policy(server(assign_groups=("Users",)), [build_principal(GROUP_ROW)], DEFAULTS, template=TEMPLATE)
@@ -239,6 +243,12 @@ def test_policy_update_signature_status_and_fqdns():
     existing = {**desired, "metadata": {**desired["metadata"], "policyId": "pol-42", "status": {"status": "ACTIVE"}}}
     update = build_policy_update(existing, desired)
     assert update["metadata"]["policyId"] == "pol-42" and update["metadata"]["name"] == NAME
+    # an update carries the live status over: fixing principals must not silently un-suspend a policy
+    assert update["metadata"]["status"] == {"status": "ACTIVE"}
+    suspended = {**desired, "metadata": {**desired["metadata"], "policyId": "p", "status": "Suspended"}}
+    assert build_policy_update(suspended, desired)["metadata"]["status"] == {"status": "Suspended"}
+    fresh = {"metadata": {"policyId": "p"}}
+    assert build_policy_update(fresh, desired)["metadata"]["status"] == {"status": "Active"}
     assert policy_signature(desired) == policy_signature(existing)
     drifted = {**existing, "principals": [{"id": "other"}]}
     assert policy_signature(drifted) != policy_signature(desired)
@@ -246,7 +256,8 @@ def test_policy_update_signature_status_and_fqdns():
     partial = {"metadata": {"name": NAME}, "principals": [{"id": "a"}]}          # what the list endpoint returns
     assert policy_signature(partial) == {"principals": ["a"], "fqdn_rules": None}
     assert policy_signature({"metadata": {}}) == {"principals": None, "fqdn_rules": None}
-    assert policy_status(existing) == "Active" and policy_status(desired) == "" and policy_status({"metadata": {"status": "suspended"}}) == "Suspended"
+    assert policy_status(existing) == "Active" and policy_status(desired) == "Active"
+    assert policy_status({"metadata": {"status": "suspended"}}) == "Suspended" and policy_status({"metadata": {}}) == ""
     assert exact_fqdns(desired) == ["web01.corp.example.com"]
     assert exact_fqdns({"targets": {"FQDN/IP": {"fqdnRules": [{"operator": "WILDCARD", "computernamePattern": "*.corp"}]}}}) == []
 

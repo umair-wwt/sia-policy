@@ -255,3 +255,10 @@ def test_ca_bundle_and_verify(tmp_path):
         load_config(make(tmp_path, other_sections='[http]\nca_bundle = "/no/such/bundle.pem"\n'))
     with pytest.raises(ConfigError, match="verify = false; pick one"):
         load_config(make(tmp_path, other_sections=f'[http]\nca_bundle = "{bundle}"\nverify = false\n'))
+
+
+def test_policy_status(tmp_path):
+    assert load_config(make(tmp_path)).defaults.policy_status == "Active"
+    assert load_config(make(tmp_path, 'policy_status = "Suspended"\n')).defaults.policy_status == "Suspended"
+    with pytest.raises(ConfigError, match="policy_status must be one of Active, Suspended"):
+        load_config(make(tmp_path, 'policy_status = "Validating"\n'))

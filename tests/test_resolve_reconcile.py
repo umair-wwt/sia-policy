@@ -171,7 +171,7 @@ def test_apply_creates_everything_then_is_idempotent():
     policies = calls(uap, "create_policy")
     assert [p["metadata"]["name"] for p in policies] == [WEB01_FQDN, WEB02_FQDN, DMZ_FQDN]
     assert all(p["metadata"]["policyTags"] == ["automated", OWNER] for p in policies)
-    assert all("status" not in p["metadata"] for p in policies)
+    assert all(p["metadata"]["status"] == {"status": "Active"} for p in policies)   # required by the API on create
     assert [p["id"] for p in policies[1]["principals"]] == [f"id-SIA-Web-Admins-{CDS_UUID[:4]}", f"id-SIA-Platform-Ops-{CDS_UUID[:4]}"]
     assert policies[1]["behavior"]["connectAs"]["rdp"]["localEphemeralUser"]["assignGroups"] == ["Remote Desktop Users"]
     assert policies[0]["targets"]["FQDN/IP"]["fqdnRules"] == [{"operator": "EXACTLY", "computernamePattern": WEB01_FQDN, "domain": "corp.example.com"}]

@@ -89,7 +89,7 @@ flowchart TB
 | `sia/clients.py` | 1:1 endpoint wrappers. `SIAClient.probe()` detects the strong-account and target-set path families (`SIACapabilities`), listings paginate and accept name / strong-account filters, `find_secret()`; `UAPClient` lists (`filter`, `q`, `nextToken`), `owned_vm_filter()`, `find_policies_for_fqdn()`; `IdentityClient`. No business logic. |
 | `sia/pvwa.py` | `PVWAClient`: logon (CyberArk/LDAP), `find_account`, `add_account`, logoff — reuses `HttpClient` with the PVWA token sent verbatim. |
 | `sia/resolve.py` | `PrincipalResolver` (Identity group → UAP principal, with directory pinning and ambiguity errors), `SecretIndex` (deterministic secret lookup), `pick()` (snake/camel-tolerant key access). |
-| `sia/payloads.py` | Pure functions: every request body (SIA secret, target set, UAP policy, PVWA account), template validation/sanitising, `policy_signature` for drift, `policy_status`, `exact_fqdns` for rename detection, ownership predicates. `metadata.status` is never sent (read-only in the API). |
+| `sia/payloads.py` | Pure functions: every request body (SIA secret, target set, UAP policy, PVWA account), template validation/sanitising, `policy_signature` for drift, `policy_status`, `exact_fqdns` for rename detection, ownership predicates. `metadata.status` is required on create (`[defaults] policy_status`); an update carries the live value over instead. |
 | `sia/reconcile.py` | The engine: `snapshot()` reads the tenant once with the chosen lookup strategy; `reconcile()` decides and applies in dependency order (vault → secrets → target sets → policies), enforces ownership, fail-fast, uncertain-write handling, bounded drift reads, conflict reclassification, checkpointing and progress. `workers` parallelises reads, creations and existing-policy comparisons through `_execute()` — the first item of each creating stage always runs alone (canary). |
 | `sia/checkpoint.py` | `Checkpoint` (append-only JSON lines, later lines win), `fingerprint()` over the row's inputs, `is_done()`. |
 | `sia/connect.py` | The consuming side: gateway host, portal URL, login suffix, `zsp_username()`, `rdp_file_text()`, CSV/`.rdp` writers (`connect-info`). |
@@ -405,7 +405,8 @@ replaces the object, so omitting them would reset them to the platform default.
     "timeFrame": {},
     "policyEntitlement": {"targetCategory": "VM", "locationType": "FQDN/IP", "policyType": "Recurring"},
     "policyTags": ["automated", "sia-policy-automation"],
-    "timeZone": "America/New_York"
+    "timeZone": "America/New_York",
+    "status": {"status": "Active"}
   },
   "principals": [{"id": "<InternalName>", "name": "SIA-Web-Admins", "type": "GROUP",
                   "sourceDirectoryId": "<DirectoryServiceUuid>", "sourceDirectoryName": "CyberArk Cloud Directory"}],
@@ -419,7 +420,12 @@ replaces the object, so omitting them would reset them to the platform default.
 }
 ```
 
-`metadata.status` is read-only in the API and is never sent. **Linux policy** — identical except for the
+`metadata.status` is **required** on create -- `ArkUAPMetadata.status` has no default and tenants reject a POST
+without it (`Field required (field: status)`); CyberArk's own SDK example sends
+`ArkUAPPolicyStatus(status=ArkUAPStatusType.ACTIVE)`. Allowed values here are `Active` and `Suspended`
+(`[defaults] policy_status`); `Validating`/`Error`/`Warning` are assigned by the platform and reported back on
+read. `build_policy_update` carries the *existing* status over so an unrelated fix cannot un-suspend a policy.
+**Linux policy** — identical except for the
 behaviour block and no target set / strong account: `"behavior": {"connectAs": {"ssh": {"username": "ec2-user"}}}`.
 
 Conventions confirmed per tenant with `show-policy` (and `--from-list`) before bulk runs: the FQDN-rule encoding
