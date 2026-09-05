@@ -7,6 +7,7 @@ from typing import Any
 
 from sia.clients import SIACapabilities
 from sia.http import SIAApiError
+from sia.clients import PerAccountTargetSetListingRequired
 
 CDS_UUID = "09B9A9B0-6CE8-465F-AB03-65766D33B05E"
 AD_UUID = "5F8C4E2A-0000-4000-8000-000000000AD1"
@@ -88,7 +89,7 @@ class FakeSIA:
     def list_target_sets(self, *, strong_account_id=None, name=None):
         self.calls.append(("list_target_sets", (strong_account_id, name)))
         if not strong_account_id and not self.capabilities.targetsets_list_unfiltered:
-            raise ValueError("this tenant lists target sets per strong account only (strongAccountId is required)")
+            raise PerAccountTargetSetListingRequired("this tenant lists target sets per strong account only (strongAccountId is required)")
         items = [dict(t) for t in self.target_sets]
         if strong_account_id:
             items = [t for t in items if t.get("secret_id") == strong_account_id]

@@ -209,6 +209,57 @@ def test_validate_and_sanitize_template():
     assert TEMPLATE["conditions"]["accessWindow"]["daysOfTheWeek"] == [1, 2, 3]  # deep copy
 
 
+@pytest.mark.parametrize(("mutation", "problem"), [
+    (lambda item: item.update(metadata="bad"), "metadata must be an object"),
+    (lambda item: item["behavior"].update(connectAs=["bad"]), "behavior.connectAs must be an object"),
+    (lambda item: item.update(conditions="bad"), "conditions must be an object"),
+    (lambda item: item["behavior"]["connectAs"]["rdp"].update(localEphemeralUser="bad"),
+     "behavior.connectAs.rdp.localEphemeralUser must be an object"),
+    (lambda item: item["metadata"].update(policyTags="owner"),
+     "metadata.policyTags must be a list of non-empty strings"),
+    (lambda item: item["metadata"].update(policyTags=False),
+     "metadata.policyTags must be a list of non-empty strings"),
+    (lambda item: item["conditions"].update(maxSessionDuration=float("nan")),
+     "conditions.maxSessionDuration must be a finite number"),
+    (lambda item: item["conditions"].update(idleTime=False),
+     "conditions.idleTime must be a finite number"),
+    (lambda item: item["conditions"]["accessWindow"].update(daysOfTheWeek=[1, True, 8]),
+     "conditions.accessWindow.daysOfTheWeek must be a list of integers from 0 through 6"),
+    (lambda item: item["behavior"]["connectAs"]["rdp"]["localEphemeralUser"].update(assignGroups="Administrators"),
+     "behavior.connectAs.rdp.localEphemeralUser.assignGroups must be a list of non-empty strings"),
+    (lambda item: item["behavior"]["connectAs"]["rdp"]["localEphemeralUser"].update(enableEphemeralUserReconnect=1),
+     "behavior.connectAs.rdp.localEphemeralUser.enableEphemeralUserReconnect must be a boolean"),
+])
+def test_malformed_template_subtrees_are_reported_without_crashing(mutation, problem):
+    template = json.loads(json.dumps(TEMPLATE))
+    mutation(template)
+    assert problem in validate_template(template)
+    sanitized = sanitize_template(template)
+    assert isinstance(sanitized["metadata"], dict)
+    assert isinstance(sanitized["conditions"], dict)
+    assert isinstance(sanitized["behavior"]["connectAs"], dict)
+
+
+def test_sanitize_template_omits_invalid_optional_shapes_and_keeps_valid_profile():
+    template = json.loads(json.dumps(TEMPLATE))
+    template["metadata"]["timeZone"] = ["GMT"]
+    template["metadata"]["policyTags"] = ["valid", 3]
+    template["behavior"]["connectAs"]["rdp"]["domainEphemeralUser"] = "bad"
+    template["delegationClassification"] = {"unexpected": True}
+
+    problems = validate_template(template)
+    assert any("timeZone" in problem for problem in problems)
+    assert any("policyTags" in problem for problem in problems)
+    assert any("domainEphemeralUser" in problem for problem in problems)
+    assert any("delegationClassification" in problem for problem in problems)
+    cleaned = sanitize_template(template)
+    assert cleaned["metadata"] == {}
+    assert cleaned["behavior"]["connectAs"]["rdp"] == {
+        "localEphemeralUser": TEMPLATE["behavior"]["connectAs"]["rdp"]["localEphemeralUser"]
+    }
+    assert "delegationClassification" not in cleaned
+
+
 def test_policy_from_template_clones_approved_fields_only():
     policy = build_policy(server(), [build_principal(GROUP_ROW)], DEFAULTS, template=TEMPLATE)
     assert policy["conditions"] == sanitize_template(TEMPLATE)["conditions"]
@@ -254,8 +305,14 @@ def test_policy_update_signature_status_and_fqdns():
     assert policy_signature(drifted) != policy_signature(desired)
     assert policy_signature({"targets": {"FQDN/IP": {"fqdnRules": [{"operator": "exactly", "computernamePattern": "WEB01.corp.example.com", "domain": "CORP.example.com"}]}}})["fqdn_rules"] == [("EXACTLY", "web01.corp.example.com", "corp.example.com")]
     partial = {"metadata": {"name": NAME}, "principals": [{"id": "a"}]}          # what the list endpoint returns
-    assert policy_signature(partial) == {"principals": ["a"], "fqdn_rules": None}
-    assert policy_signature({"metadata": {}}) == {"principals": None, "fqdn_rules": None}
+    signature = policy_signature(partial)
+    assert signature["principals"] == ["a"] and signature["fqdn_rules"] is None
+    assert signature["conditions"] is None and signature["behavior"] is None
+    assert build_policy_update(suspended, desired, status="Active")["metadata"]["status"] == {"status": "Active"}
+    with pytest.raises(ValueError, match="policy status"):
+        build_policy_update(suspended, desired, status="Validating")
+    empty_signature = policy_signature({"metadata": {}})
+    assert empty_signature["principals"] is None and empty_signature["fqdn_rules"] is None
     assert policy_status(existing) == "Active" and policy_status(desired) == "Active"
     assert policy_status({"metadata": {"status": "suspended"}}) == "Suspended" and policy_status({"metadata": {}}) == ""
     assert exact_fqdns(desired) == ["web01.corp.example.com"]

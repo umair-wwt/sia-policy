@@ -1,4 +1,6 @@
-# Copy to config.toml and edit. Contains NO secrets (those live in .env, a password file, or are prompted for).
+# Advanced reference for all settings. Start with the included config.toml or open Settings in `sia`.
+# Example tenant values below are illustrative; use your own tenant in config.toml.
+# Contains NO secrets (those live in .env, a password file, or are prompted for).
 
 [tenant]
 # Your Identity Security Platform tenant subdomain: https://<subdomain>.cyberark.cloud
@@ -17,8 +19,10 @@ identity_url = "https://abc1234.id.cyberark.cloud"
 policy_name_template = "{fqdn}"
 description_template = "Automated: {protocol} ZSP access to {fqdn}"   # {protocol} = RDP or SSH
 policy_tags = ["automated"]
-# metadata.status on create -- the API requires it. "Suspended" stages a rollout: create every policy first,
-# check it, then switch this to "Active" and re-run with --update to switch them on.
+# metadata.status on create -- the API requires it. This is a creation default only: changing it later does not
+# alter existing policies. To deliberately change existing managed policies, preview and apply the explicit action:
+#   sia plan --input input --update --set-policy-status Active
+#   sia apply --input input --update --set-policy-status Active
 policy_status = "Active"
 time_zone = "America/New_York"
 
@@ -87,6 +91,7 @@ oidc_application = "__idaptive_cybr_user_oidc"
 # Optional CSV with columns name,password (name = strong_accounts.csv name, or the name rendered from
 # strong_account_template). Used for type=credentials accounts and for onboarding into the Vault.
 # Keep it OUTSIDE the repository with owner-only permissions; --passwords FILE on the command line overrides this.
+# A relative path here is resolved beside this config.toml file, not beside the shell's working directory.
 password_file = ""
 
 [http]
@@ -100,6 +105,7 @@ secrets_api = "auto"           # auto | public (/api/secrets/public/v1 + v2) | l
 targetsets_api = "auto"        # auto | legacy (/api/targetsets) | discovery (/api/discovery/targetsets)
 # TLS. Behind a proxy that re-signs certificates, export its root CA and point ca_bundle at the PEM file
 # (--ca-bundle FILE does the same for one run; the REQUESTS_CA_BUNDLE environment variable also works).
+# A relative ca_bundle path is resolved beside this config.toml file.
 ca_bundle = ""                 # "" = the built-in trust store (certifi)
 verify = true                  # false disables certificate verification entirely -- lab use only
 

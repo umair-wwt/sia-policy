@@ -1,11 +1,12 @@
 import json
+from dataclasses import replace
 
 import pytest
 
 from sia.checkpoint import Checkpoint
 from sia.config import Defaults
 from sia.http import SIAApiError
-from sia.inputs import Inputs, ServerRow, StrongAccountRow
+from sia.inputs import GroupRow, Inputs, ServerRow, StrongAccountRow
 from sia.reconcile import ReconcileError, Reconciler
 from sia.report import result_dict
 from sia.resolve import PrincipalResolver, ResolveError, SecretIndex
@@ -83,9 +84,9 @@ def test_resolver_builds_principal_and_caches():
     assert p == {"id": f"id-SIA-Web-Admins-{CDS_UUID[:4]}", "name": "SIA-Web-Admins", "type": "GROUP",
                  "sourceDirectoryId": CDS_UUID, "sourceDirectoryName": "CyberArk Cloud Directory"}
     resolver.resolve("sia-web-admins")
-    assert identity.queries == ["SIA-Web-Admins", "sia-web-admins"]
+    assert identity.queries == ["SIA-Web-Admins"]
     resolver.resolve("SIA-Web-Admins")
-    assert len(identity.queries) == 2  # cached
+    assert len(identity.queries) == 1  # cached by case-insensitive identity
 
 
 def test_resolver_not_found_lists_similar():
@@ -234,6 +235,7 @@ def test_checkpoint_and_resume(tmp_path):
     assert cp.path.is_file() and cp.done_count() == 3
     lines = [json.loads(line) for line in cp.path.read_text().splitlines()]
     assert len(lines) == 3 and lines[0]["key"] == f"{WEB01_FQDN}|{WEB01_FQDN}"
+    assert lines[0]["version"] == 2
     assert lines[0]["statuses"] == {"secret": "created", "target_set": "created", "policy": "created"}
     assert lines[0]["refs"]["policy"].startswith("pol-") and "pw" not in json.dumps(lines)
 
@@ -255,6 +257,59 @@ def test_checkpoint_and_resume(tmp_path):
     assert not plan_cp.path.exists()                                             # dry runs never write
 
 
+def test_checkpoint_context_and_record_validation_force_reconciliation(tmp_path):
+    cp = Checkpoint(tmp_path / "cp.jsonl")
+    rec, sia, uap, _ = make(ONE, checkpoint=cp, reconciliation_context={"tenant": "acme"})
+    assert rec.run().failures == 0
+    result = make(ONE, sia=sia, uap=uap, checkpoint=cp, resume=True,
+                  reconciliation_context={"tenant": "other"})[0].run()
+    assert result.resumed == 0
+    assert any("tenant, or input changed" in warning for warning in result.warnings)
+
+    record = json.loads(cp.path.read_text().splitlines()[0])
+    record.pop("version")
+    cp.path.write_text(json.dumps(record) + "\n{not json}\n")
+    invalid = Checkpoint(cp.path)
+    result = make(ONE, sia=sia, uap=uap, checkpoint=invalid, resume=True,
+                  reconciliation_context={"tenant": "acme"})[0].run()
+    assert result.resumed == 0
+    assert any("unsupported checkpoint version" in warning for warning in result.warnings)
+    assert any("not valid JSON" in warning for warning in result.warnings)
+
+    writable = Checkpoint(tmp_path / "new" / "checkpoint.jsonl")
+    ok, detail = writable.check_writable()
+    assert ok and "writable" in detail and not writable.path.exists()
+
+
+def test_checkpoint_fingerprint_covers_defaults_pinned_directories_and_template_content(tmp_path):
+    defaults_cp = Checkpoint(tmp_path / "defaults.jsonl")
+    rec, sia, uap, _ = make(ONE, checkpoint=defaults_cp)
+    assert rec.run().failures == 0
+    changed_defaults = replace(DEFAULTS, idle_minutes=17)
+    result = make(ONE, sia=sia, uap=uap, checkpoint=defaults_cp, resume=True,
+                  defaults=changed_defaults)[0].run()
+    assert result.resumed == 0 and any("settings, template" in warning for warning in result.warnings)
+
+    pinned_a = Inputs(servers=ONE.servers, strong_accounts=ONE.strong_accounts,
+                      groups={"SIA-Web-Admins": GroupRow("SIA-Web-Admins", "CyberArk Cloud Directory", 2)})
+    pins_cp = Checkpoint(tmp_path / "pins.jsonl")
+    rec, sia, uap, _ = make(pinned_a, checkpoint=pins_cp)
+    assert rec.run().failures == 0
+    pinned_b = Inputs(servers=ONE.servers, strong_accounts=ONE.strong_accounts,
+                      groups={"SIA-Web-Admins": GroupRow("SIA-Web-Admins", "CDS", 9)})
+    result = make(pinned_b, sia=sia, uap=uap, checkpoint=pins_cp, resume=True)[0].run()
+    assert result.resumed == 0 and any("input changed" in warning for warning in result.warnings)
+
+    template = json.loads(json.dumps(TEMPLATE))
+    template_cp = Checkpoint(tmp_path / "template.jsonl")
+    template_defaults = replace(DEFAULTS, template_policy="Reference")
+    rec, sia, uap, _ = make(ONE, uap=FakeUAP([template]), defaults=template_defaults, checkpoint=template_cp)
+    assert rec.run().failures == 0
+    next(item for item in uap.policies if item["metadata"]["name"] == "Reference")["conditions"]["idleTime"] = 19
+    result = make(ONE, sia=sia, uap=uap, defaults=template_defaults, checkpoint=template_cp, resume=True)[0].run()
+    assert result.resumed == 0 and any("template" in warning for warning in result.warnings)
+
+
 def test_progress_is_logged(caplog):
     with caplog.at_level("INFO", logger="sia.reconcile"):
         make(progress_every=1)[0].run()
@@ -274,10 +329,18 @@ def test_existing_vault_account_found_by_platform_name_and_type_warning():
     sia = FakeSIA(secrets=[{"secret_id": "s-9", "secret_type": "ProvisionerUser", "secret_name": "SVC_SIA_RDP_sia-strongaccounts", "is_active": False}])
     rec, sia, _, _ = make(ONE, sia=sia)
     result = rec.run()
-    assert result.secrets["SA-corp-rdp"].status == "exists" and result.secrets["SA-corp-rdp"].ref == "s-9"
+    assert result.secrets["SA-corp-rdp"].status == "inactive" and result.secrets["SA-corp-rdp"].ref == "s-9"
     assert any("CSV type=vault but SIA has ProvisionerUser" in w for w in result.warnings)
-    assert any("inactive" in w for w in result.warnings)
-    assert calls(sia, "bulk_create_target_sets")[0][0]["target_sets"][0]["secret_type"] == "ProvisionerUser"
+    assert result.servers[0].target_set.status == "blocked" and result.servers[0].policy.status == "blocked"
+    assert not calls(sia, "bulk_create_target_sets")
+
+
+def test_strong_account_without_identifier_blocks_dependent_changes():
+    sia = FakeSIA(secrets=[{"secret_type": "PCloudAccount", "secret_name": VAULT_SIA_NAME, "is_active": True}])
+    result = make(ONE, sia=sia)[0].run()
+    assert result.secrets["SA-corp-rdp"].status == "unverified"
+    assert result.servers[0].target_set.status == "blocked" and result.servers[0].policy.status == "blocked"
+    assert result.failures == 1 and not calls(sia, "bulk_create_target_sets")
 
 
 def test_target_sets_listed_per_account_when_the_tenant_requires_it():
@@ -299,7 +362,7 @@ def test_secret_create_client_error_aborts_run():
     rec, sia, uap, _ = make(sia=sia)
     result = rec.run()
     assert result.secrets["SA-corp-rdp"].status == "failed" and "safe not found" in result.secrets["SA-corp-rdp"].detail
-    assert result.secrets["SA-dmz"].status == "blocked" and "fail-fast" in result.secrets["SA-dmz"].detail
+    assert result.secrets["SA-dmz"].status == "blocked" and "run stopped" in result.secrets["SA-dmz"].detail
     assert len(result.aborted) == 1 and "SA-corp-rdp" in result.aborted[0]
     assert all(sr.target_set.status == "blocked" and sr.policy.status == "blocked" for sr in result.servers)
     assert len(calls(sia, "create_secret")) == 1 and not calls(uap, "create_policy")
@@ -313,8 +376,10 @@ def test_secret_create_errors_without_fail_fast_or_on_5xx_are_isolated():
     sia = FakeSIA()
     sia.raise_on_create_secret = err(502, "gateway")
     result = make(sia=sia)[0].run()
-    assert all(o.status == "failed" and "may or may not have been applied" in o.detail for o in result.secrets.values())
+    assert all(o.status == "uncertain" and "may or may not have been applied" in o.detail for o in result.secrets.values())
     assert not result.aborted
+    diagnostic = result.secrets["SA-corp-rdp"].diagnostic
+    assert diagnostic and diagnostic["object_name"] == "SA-corp-rdp" and diagnostic["mutation_state"] == "unknown"
 
 
 def test_bulk_client_error_aborts_remaining_target_sets():
@@ -354,7 +419,7 @@ def test_policy_create_client_error_aborts_but_5xx_continues():
     uap = FakeUAP()
     uap.raise_on_create_policy = err(504, "gateway timeout")
     result = make(uap=uap)[0].run()
-    assert all(sr.policy.status == "failed" and "may or may not" in sr.policy.detail for sr in result.servers) and not result.aborted
+    assert all(sr.policy.status == "uncertain" and "may or may not" in sr.policy.detail for sr in result.servers) and not result.aborted
 
 
 # ----------------------------------------------------- ownership / drift
@@ -381,6 +446,53 @@ def test_target_set_drift_requires_ownership_or_adopt():
     sia.target_sets[0].update({"secret_id": "old-again", "description": f"x {MARK}"})  # now carries the marker
     result = make(ONE, sia=sia, update=True)[0].run()
     assert result.servers[0].target_set.status == "updated"
+
+
+def test_full_target_set_drift_includes_managed_fields():
+    rec, sia, uap, _ = make(ONE)
+    assert rec.run().failures == 0
+    target = sia.target_sets[0]
+    target["enable_certificate_validation"] = True
+    target["description"] = f"changed {MARK}"
+    result = make(ONE, sia=sia, uap=uap, drift=True)[0].run()
+    detail = result.servers[0].target_set.detail
+    assert result.servers[0].target_set.status == "drift"
+    assert "certificate validation differs" in detail and "description differs" in detail
+
+    result = make(ONE, sia=sia, uap=uap, update=True)[0].run()
+    assert result.servers[0].target_set.status == "updated"
+    _, payload = calls(sia, "update_target_set")[-1]
+    assert payload["enable_certificate_validation"] is False and payload["description"].endswith(MARK)
+
+
+@pytest.mark.parametrize(("field", "value", "expected"), [
+    ("type", "Domain", "type differs"),
+    ("secret_type", "ProvisionerUser", "secret type differs"),
+    ("description", f"different {MARK}", "description differs"),
+    ("enable_certificate_validation", True, "certificate validation differs"),
+])
+def test_each_target_set_managed_field_updates_then_becomes_noop(field, value, expected):
+    rec, sia, uap, _ = make(ONE)
+    assert rec.run().failures == 0
+    sia.target_sets[0][field] = value
+    result = make(ONE, sia=sia, uap=uap, update=True)[0].run()
+    assert result.servers[0].target_set.status == "updated" and expected in result.servers[0].target_set.detail
+    update_count = len(calls(sia, "update_target_set"))
+    result = make(ONE, sia=sia, uap=uap, update=True)[0].run()
+    assert result.servers[0].target_set.status == "exists"
+    assert len(calls(sia, "update_target_set")) == update_count
+
+
+def test_target_set_provision_format_setting_updates_then_becomes_noop():
+    rec, sia, uap, _ = make(ONE)
+    assert rec.run().failures == 0
+    configured = replace(DEFAULTS, provision_format="<user>-sia")
+    result = make(ONE, sia=sia, uap=uap, defaults=configured, update=True)[0].run()
+    assert result.servers[0].target_set.status == "updated"
+    assert calls(sia, "update_target_set")[-1][1]["provision_format"] == "<user>-sia"
+    update_count = len(calls(sia, "update_target_set"))
+    assert make(ONE, sia=sia, uap=uap, defaults=configured, update=True)[0].run().servers[0].target_set.status == "exists"
+    assert len(calls(sia, "update_target_set")) == update_count
 
 
 def test_unmanaged_target_set_up_to_date_is_reported():
@@ -420,6 +532,116 @@ def test_managed_policy_drift_and_update():
     assert sr3.policy.status == "updated"
     pid, payload = calls(uap, "update_policy")[0]
     assert pid == sr3.policy.ref and payload["metadata"]["policyId"] == pid and len(payload["principals"]) == 2
+
+
+def test_full_policy_drift_includes_schedule_tags_and_connection_behavior():
+    rec, sia, uap, _ = make(ONE)
+    assert rec.run().failures == 0
+    policy = uap.policies[0]
+    policy["conditions"]["idleTime"] = 99
+    policy["metadata"]["policyTags"].append("unexpected")
+    policy["behavior"]["connectAs"]["rdp"]["localEphemeralUser"]["enableEphemeralUserReconnect"] = True
+    result = make(ONE, sia=sia, uap=uap, drift=True)[0].run()
+    detail = result.servers[0].policy.detail
+    assert result.servers[0].policy.status == "drift"
+    assert "access conditions differ" in detail and "policy tags differ" in detail and "connection behavior differs" in detail
+
+    result = make(ONE, sia=sia, uap=uap, update=True)[0].run()
+    assert result.servers[0].policy.status == "updated"
+    updated = uap.policies[0]
+    assert updated["conditions"]["idleTime"] == DEFAULTS.idle_minutes
+    assert "unexpected" not in updated["metadata"]["policyTags"]
+    assert updated["behavior"]["connectAs"]["rdp"]["localEphemeralUser"]["enableEphemeralUserReconnect"] is False
+
+
+@pytest.mark.parametrize("configured", [
+    replace(DEFAULTS, description_template="Configured {protocol} access to {fqdn}"),
+    replace(DEFAULTS, policy_tags=("configured",)),
+    replace(DEFAULTS, time_zone="Europe/London"),
+    replace(DEFAULTS, days_of_week=(1, 2, 3, 4, 5)),
+    replace(DEFAULTS, from_hour="08:00", to_hour="18:00"),
+    replace(DEFAULTS, max_session_hours=4),
+    replace(DEFAULTS, idle_minutes=23),
+    replace(DEFAULTS, assign_local_groups=("Remote Desktop Users",)),
+    replace(DEFAULTS, enable_reconnect=True),
+    replace(DEFAULTS, policy_name_template="SIA-{hostname}"),
+])
+def test_each_policy_setting_updates_then_becomes_noop(configured):
+    rec, sia, uap, _ = make(ONE)
+    assert rec.run().failures == 0
+    result = make(ONE, sia=sia, uap=uap, defaults=configured, update=True)[0].run()
+    assert result.servers[0].policy.status == "updated"
+    update_count = len(calls(uap, "update_policy"))
+    result = make(ONE, sia=sia, uap=uap, defaults=configured, update=True)[0].run()
+    assert result.servers[0].policy.status == "exists"
+    assert len(calls(uap, "update_policy")) == update_count
+
+
+def test_explicit_policy_status_changes_and_routine_updates_preserve_status():
+    with pytest.raises(ValueError, match="requires update"):
+        make(ONE, set_policy_status="Suspended")
+    with pytest.raises(ValueError, match="only='all' or only='policies'"):
+        make(ONE, update=True, only="targetsets", set_policy_status="Suspended")
+
+    rec, sia, uap, _ = make(ONE)
+    assert rec.run().failures == 0
+    policy = uap.policies[0]
+    policy["metadata"]["status"] = {"status": "Suspended"}
+    policy["principals"] = []
+    preserved = make(ONE, sia=sia, uap=uap, update=True)[0].run().servers[0]
+    assert preserved.policy.status == "inactive"
+    assert calls(uap, "update_policy")[-1][1]["metadata"]["status"] == {"status": "Suspended"}
+
+    activated = make(ONE, sia=sia, uap=uap, update=True, set_policy_status="Active")[0].run().servers[0]
+    assert activated.policy.status == "updated"
+    assert calls(uap, "update_policy")[-1][1]["metadata"]["status"] == {"status": "Active"}
+    status_update_count = len(calls(uap, "update_policy"))
+    active_noop = make(ONE, sia=sia, uap=uap, update=True, set_policy_status="Active")[0].run().servers[0]
+    assert active_noop.policy.status == "exists" and len(calls(uap, "update_policy")) == status_update_count
+
+    staged_uap = FakeUAP()
+    staged_uap.create_status = "Suspended"
+    staged_rec, staged_sia, staged_uap, _ = make(
+        ONE, uap=staged_uap, update=True, set_policy_status="Suspended")
+    staged = staged_rec.run().servers[0]
+    assert staged.policy.status == "created"
+    assert calls(staged_uap, "create_policy")[0]["metadata"]["status"] == {"status": "Suspended"}
+    readiness = make(ONE, sia=staged_sia, uap=staged_uap)[0].run().servers[0]
+    assert readiness.policy.status == "inactive"
+
+
+def test_policy_readback_failure_is_unverified():
+    class ReadbackFails(FakeUAP):
+        def get_policy(self, policy_id):
+            raise SIAApiError("GET", f"/api/policies/{policy_id}", 503, "temporarily unavailable")
+
+    result = make(ONE, uap=ReadbackFails())[0].run()
+    assert result.servers[0].policy.status == "unverified"
+    assert "read-back failed" in result.servers[0].policy.detail and result.failures == 1
+    assert result.servers[0].policy.diagnostic["object_name"] == WEB01_FQDN
+
+
+def test_policy_update_readback_failure_is_unverified_and_retains_diagnostic():
+    class UpdateReadbackFails(FakeUAP):
+        fail_reads = False
+
+        def update_policy(self, policy_id, payload):
+            super().update_policy(policy_id, payload)
+            self.fail_reads = True
+
+        def get_policy(self, policy_id):
+            if self.fail_reads:
+                raise SIAApiError("GET", f"/api/policies/{policy_id}", 503, "temporarily unavailable")
+            return super().get_policy(policy_id)
+
+    uap = UpdateReadbackFails()
+    rec, sia, uap, _ = make(ONE, uap=uap)
+    assert rec.run().failures == 0
+    uap.policies[0]["conditions"]["idleTime"] = 44
+    result = make(ONE, sia=sia, uap=uap, update=True)[0].run()
+    outcome = result.servers[0].policy
+    assert outcome.status == "unverified" and outcome.diagnostic["mutation_state"] == "applied"
+    assert outcome.diagnostic["object_name"] == WEB01_FQDN
 
 
 MANUAL = {"metadata": {"name": WEB01_FQDN, "policyId": "manual-1", "policyTags": ["manual"], "status": {"status": "Active"}},
@@ -516,7 +738,8 @@ def test_default_single_status_read_reports_validating():
     uap = FakeUAP()
     uap.statuses_sequence = ["Validating", "Active"]
     result = make(ONE, uap=uap)[0].run()
-    assert result.servers[0].policy.status == "created" and "status=Validating" in result.servers[0].policy.detail
+    assert result.servers[0].policy.status == "unverified" and "status=Validating" in result.servers[0].policy.detail
+    assert result.failures == 1
     assert len(calls(uap, "get_policy")) == 1
 
 
@@ -787,5 +1010,5 @@ def test_adopting_a_domain_target_set_does_not_adopt_its_policies():
     result = rec.run()
     rows = by_fqdn(result)
     assert rows[WEB01_FQDN].target_set.status == "updated"          # the set was adopted
-    assert rows[WEB01_FQDN].policy.status == "drift"                # the policy was not
-    assert "not managed by this tool" in rows[WEB01_FQDN].policy.detail
+    assert rows[WEB01_FQDN].policy.status == "unverified"           # incomplete policy response; never adopted or updated
+    assert "cannot confirm settings or safely update" in rows[WEB01_FQDN].policy.detail

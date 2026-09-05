@@ -1,3 +1,25 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sia-policy-automation"
+version = "0.2.0"
+description = "Guided CyberArk SIA onboarding, configuration, and diagnostics"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = ["requests>=2.31,<3", "tomlkit>=0.13,<1", "tzdata>=2025.1", "prompt-toolkit>=3.0.51,<4", "rich>=13.9,<15"]
+
+[project.scripts]
+sia = "sia.bootstrap:main"
+
+[tool.setuptools]
+packages = ["sia"]
+py-modules = ["sia_onboard"]
+
+[tool.setuptools.package-data]
+sia = ["config.toml"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"

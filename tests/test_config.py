@@ -3,7 +3,8 @@ from pathlib import Path
 
 import pytest
 
-from sia.config import ConfigError, env_var_for_password, load_config, load_dotenv, load_password_file
+from sia.config import (ConfigError, ConfigValidationError, env_var_for_password, load_config, load_dotenv,
+                        load_password_file, read_dotenv, resolve_env, suggest_https_base_url)
 from sia.redact import redact
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -147,6 +148,26 @@ def test_bad_subdomain_rejected(tmp_path):
         load_config(p)
 
 
+def test_subdomain_and_connection_components_reject_injection(tmp_path):
+    with pytest.raises(ConfigError, match="subdomain"):
+        load_config(_write_config(tmp_path / "bad-subdomain.toml", 'subdomain = "acme-"'))
+    for setting in (
+        'gateway_host = "good.example\\nredirectclipboard:i:1"',
+        'login_suffix = "good.example\\npromptcredentialonce:i:0"',
+        'network = "net\\npromptcredentialonce:i:0"',
+        'network = "net /d local"',
+    ):
+        with pytest.raises(ConfigError, match=r"\[connect\]"):
+            load_config(make(tmp_path, other_sections=f"[connect]\n{setting}\n"))
+
+
+def _write_config(path: Path, tenant_subdomain_line: str) -> Path:
+    path.write_text('[tenant]\n' + tenant_subdomain_line
+                    + '\nidentity_url = "https://abc.id.cyberark.cloud"\n[defaults]\n' + REQUIRED_DEFAULTS,
+                    encoding="utf-8")
+    return path
+
+
 def test_missing_file(tmp_path):
     with pytest.raises(ConfigError, match="not found"):
         load_config(tmp_path / "nope.toml")
@@ -160,6 +181,9 @@ def test_dotenv_parsing(tmp_path, monkeypatch):
         encoding="utf-8",
     )
     for key in ("SIA_CLIENT_ID", "SIA_CLIENT_SECRET", "QUOTED", "INLINE"):
+        # Register an undo value even when the real process variable was
+        # initially absent; load_dotenv mutates os.environ outside monkeypatch.
+        monkeypatch.setenv(key, "test-placeholder")
         monkeypatch.delenv(key, raising=False)
     loaded = load_dotenv(env)
     assert loaded == {"SIA_CLIENT_ID": "svc@acme.cyberark.cloud", "SIA_CLIENT_SECRET": "p@ss word",
@@ -176,6 +200,29 @@ def test_dotenv_does_not_override_existing(tmp_path, monkeypatch):
 
 def test_dotenv_missing_file_ok(tmp_path):
     assert load_dotenv(tmp_path / ".env") == {}
+
+
+def test_dotenv_rejects_nonregular_path_instead_of_treating_it_as_missing(tmp_path):
+    directory = tmp_path / "credentials"
+    directory.mkdir()
+    with pytest.raises(ConfigError, match="must be a regular file"):
+        read_dotenv(directory)
+
+    if hasattr(os, "mkfifo"):
+        fifo = tmp_path / "credentials.pipe"
+        os.mkfifo(fifo)
+        with pytest.raises(ConfigError, match="must be a regular file"):
+            read_dotenv(fifo)
+
+
+def test_dotenv_rejects_broken_symlink(tmp_path):
+    path = tmp_path / ".env"
+    try:
+        path.symlink_to(tmp_path / "missing-target")
+    except OSError:
+        pytest.skip("Symlinks are unavailable on this system")
+    with pytest.raises(ConfigError, match="broken symbolic link"):
+        read_dotenv(path)
 
 
 def test_dotenv_bad_line(tmp_path):
@@ -262,3 +309,171 @@ def test_policy_status(tmp_path):
     assert load_config(make(tmp_path, 'policy_status = "Suspended"\n')).defaults.policy_status == "Suspended"
     with pytest.raises(ConfigError, match="policy_status must be one of Active, Suspended"):
         load_config(make(tmp_path, 'policy_status = "Validating"\n'))
+
+
+@pytest.mark.parametrize("section, setting, fragment", [
+    ("http", 'verify = "false"', "verify must be a boolean"),
+    ("http", "timeout_seconds = true", "timeout_seconds must be an integer"),
+    ("http", "max_requests_per_second = false", "max_requests_per_second must be a number"),
+    ("defaults", 'days_of_week = [0, "1"]', "days_of_week must be a list of integers"),
+    ("defaults", 'policy_tags = "automated"', "policy_tags must be a list of strings"),
+    ("pvwa", 'cpm_managed = 1', "cpm_managed must be a boolean"),
+])
+def test_config_types_are_strict(tmp_path, section, setting, fragment):
+    if section == "defaults":
+        key, value = setting.split("=", 1)
+        key = key.strip()
+        path = (make(tmp_path, defaults=defaults_table(**{key: value.strip()})) if key in REQUIRED
+                else make(tmp_path, defaults_extra=setting + "\n"))
+    else:
+        path = make(tmp_path, other_sections=f"[{section}]\n{setting}\n")
+    with pytest.raises(ConfigError, match=fragment):
+        load_config(path)
+
+
+def test_urls_time_zone_and_stray_template_braces_are_validated(tmp_path):
+    with pytest.raises(ConfigError, match="recognized IANA time zone"):
+        load_config(make(tmp_path, 'time_zone = "Central-ish"\n'))
+    with pytest.raises(ConfigError, match="no path"):
+        load_config(make(tmp_path, other_sections='[pvwa]\nbase_url = "https://pvwa.example/path"\n'))
+    with pytest.raises(ConfigError, match="not a valid URL"):
+        load_config(make(tmp_path, other_sections='[pvwa]\nbase_url = "https://[broken"\n'))
+    with pytest.raises(ConfigError, match="whitespace or control characters"):
+        load_config(make(tmp_path, other_sections='[pvwa]\nbase_url = "https://bad host:443"\n'))
+    with pytest.raises(ConfigError, match="control characters"):
+        load_config(make(tmp_path, other_sections='[pvwa]\nbase_url = "https://good.example\\nignored.example"\n'))
+    assert load_config(make(tmp_path, other_sections='[pvwa]\nbase_url = "https://pvwa:8443"\n')).pvwa.enabled
+    with pytest.raises(ConfigError, match="not a valid template"):
+        load_config(make(tmp_path, 'group_template = "SIA-{hostname}}"\n'))
+
+
+def test_config_relative_file_paths_resolve_beside_config(tmp_path):
+    config_dir = tmp_path / "project"
+    config_dir.mkdir()
+    (config_dir / "certs").mkdir()
+    config_path = config_dir / "config.toml"
+    config_path.write_text(
+        TENANT + "\n[defaults]\n" + REQUIRED_DEFAULTS
+        + '\n[auth]\npassword_file = "private/passwords.csv"\n'
+        + '\n[http]\nca_bundle = "certs"\n', encoding="utf-8")
+    cfg = load_config(config_path)
+    assert cfg.auth.password_file == str(config_dir / "private" / "passwords.csv")
+    assert cfg.http.ca_bundle == str(config_dir / "certs")
+
+
+def test_read_dotenv_is_non_mutating_and_reports_source(tmp_path, monkeypatch):
+    env = tmp_path / ".env"
+    env.write_text('ONLY_FILE="value with spaces"\nSHARED=from-file\n', encoding="utf-8")
+    monkeypatch.delenv("ONLY_FILE", raising=False)
+    monkeypatch.setenv("SHARED", "from-shell")
+    values = read_dotenv(env)
+    assert values["ONLY_FILE"] == "value with spaces"
+    assert "ONLY_FILE" not in os.environ
+    assert resolve_env("ONLY_FILE", values).source == "dotenv"
+    assert resolve_env("SHARED", values).value == "from-shell"
+    assert resolve_env("SHARED", values).source == "environment"
+    assert resolve_env("ABSENT", values).source == "missing"
+
+
+def test_dotenv_rejects_duplicates_and_bad_quotes(tmp_path):
+    env = tmp_path / ".env"
+    env.write_text("KEY=first\nKEY=second\n", encoding="utf-8")
+    with pytest.raises(ConfigError, match="duplicate key 'KEY'.*line 1"):
+        read_dotenv(env)
+    env.write_text('KEY="unterminated\n', encoding="utf-8")
+    with pytest.raises(ConfigError, match="invalid double-quoted"):
+        read_dotenv(env)
+    env.write_text("KEY='ok' unexpected\n", encoding="utf-8")
+    with pytest.raises(ConfigError, match="unexpected text"):
+        read_dotenv(env)
+
+
+def test_password_file_rejects_duplicate_and_blank_headers(tmp_path):
+    password_file = tmp_path / "passwords.csv"
+    password_file.write_text("name,password,password\na,b,c\n", encoding="utf-8")
+    with pytest.raises(ConfigError, match="duplicate column"):
+        load_password_file(password_file)
+    password_file.write_text("name,,password\na,b,c\n", encoding="utf-8")
+    with pytest.raises(ConfigError, match="blank column"):
+        load_password_file(password_file)
+    password_file.write_text('name,password\nSA-one,"unterminated\n', encoding="utf-8")
+    with pytest.raises(ConfigError, match="invalid CSV"):
+        load_password_file(password_file)
+
+
+def test_validation_collects_all_issues_with_repair_keys(tmp_path):
+    path = make(
+        tmp_path,
+        defaults=defaults_table(from_hour='"9:00"', to_hour='""', max_session_hours="25", idle_minutes="0"),
+    )
+    text = path.read_text(encoding="utf-8").replace('subdomain = "acme"', 'subdomain = "Bad."')
+    text = text.replace(
+        'identity_url = "https://abc1234.id.cyberark.cloud"',
+        'identity_url = "https://abc1234.id.cyberark.cloud/path"',
+    )
+    path.write_text(text, encoding="utf-8")
+    with pytest.raises(ConfigValidationError) as caught:
+        load_config(path)
+    keys = {key for issue in caught.value.issues for key in issue.dotted_keys}
+    assert {"tenant.subdomain", "tenant.identity_url", "defaults.from_hour",
+            "defaults.to_hour", "defaults.max_session_hours", "defaults.idle_minutes"} <= keys
+    assert len(caught.value.issues) >= 5
+
+
+@pytest.mark.parametrize("raw, expected", [
+    ("tenant.id.cyberark.cloud", "https://tenant.id.cyberark.cloud"),
+    ("http://tenant.id.cyberark.cloud/", "https://tenant.id.cyberark.cloud"),
+    ("https://tenant.id.cyberark.cloud/path?q=1#part", "https://tenant.id.cyberark.cloud"),
+    ("https://tenant.id.cyberark.cloud:8443/", "https://tenant.id.cyberark.cloud:8443"),
+])
+def test_safe_https_base_url_suggestions_preserve_authority(raw, expected):
+    assert suggest_https_base_url(raw) == expected
+
+
+@pytest.mark.parametrize("raw", [
+    "https://user:password@tenant.example",
+    "https://bad host.example",
+    "ftp://tenant.example",
+    "https://tenant.example:0",
+    "https://tenant.example:70000",
+])
+def test_unsafe_https_base_urls_have_no_suggestion(raw):
+    assert suggest_https_base_url(raw) is None
+
+
+@pytest.mark.parametrize("url", [
+    "https://tenant.id.cyberark.cloud?",
+    "https://tenant.id.cyberark.cloud#",
+    "https://tenant.id.cyberark.cloud/",
+    "https://tenant.id.cyberark.cloud:0",
+])
+def test_identity_url_rejects_empty_delimiters_trailing_slash_and_bad_port(tmp_path, url):
+    path = make(tmp_path)
+    path.write_text(path.read_text(encoding="utf-8").replace(
+        "https://abc1234.id.cyberark.cloud", url), encoding="utf-8")
+    with pytest.raises(ConfigError, match="identity_url"):
+        load_config(path)
+
+
+@pytest.mark.parametrize("extra, fragment", [
+    ('group_template = "{hostname!r}"\n', "conversions"),
+    ('group_template = "{hostname:>20}"\n', "format specifications"),
+    ("policy_tags = [" + ", ".join(f'\"tag{i}\"' for i in range(20)) + "]\n", "maximum is 20"),
+])
+def test_template_operators_and_effective_tag_limit_are_rejected(tmp_path, extra, fragment):
+    with pytest.raises(ConfigError, match=fragment):
+        load_config(make(tmp_path, defaults_extra=extra))
+
+
+def test_non_finite_numbers_and_overlong_dns_names_are_rejected(tmp_path):
+    with pytest.raises(ConfigError, match="finite number"):
+        load_config(make(tmp_path, other_sections="[http]\nmax_requests_per_second = nan\n"))
+    with pytest.raises(ConfigError, match="finite number"):
+        load_config(make(tmp_path, other_sections=f"[http]\nmax_requests_per_second = {10 ** 400}\n"))
+    overlong = ".".join(["a" * 63] * 4)
+    path = make(tmp_path)
+    path.write_text(path.read_text(encoding="utf-8").replace(
+        'identity_url = "https://abc1234.id.cyberark.cloud"',
+        f'identity_url = "https://abc1234.id.cyberark.cloud"\nroot_domain = "{overlong}"'), encoding="utf-8")
+    with pytest.raises(ConfigError, match="root_domain"):
+        load_config(path)

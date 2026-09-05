@@ -4,6 +4,41 @@ The [README](../README.md) gets you installed and running. This guide is the ref
 what the results mean, how users connect, day-to-day changes, big rollouts, troubleshooting, questions, glossary
 and the open items.
 
+Run `sia` with no command in an interactive terminal for the home screen. It shows your setup status, a next step,
+and short descriptions of Setup, Settings, Troubleshoot, Plan, Apply, Verify, Connection information and Help.
+Type `/` for suggestions, use Tab to complete, arrow keys to select, and Enter to run. `/menu` shows the menu
+again; `/exit` closes the program. Existing `sia COMMAND ...` and `python sia_onboard.py COMMAND ...` automation remains
+available. The home screen itself, Help, Settings and offline `doctor` do not require tenant credentials.
+
+The package includes a starter with blank tenant fields and explained defaults. The terminal home and Setup
+create local `config.toml` only when the selected file is missing. Existing files are preserved; passwords belong in `.env`.
+`config.example.toml` remains the full advanced reference.
+
+`sia setup` guides you through tenant details, access defaults, and service-user sign-in. It offers explicit `.env` credential storage.
+To keep credentials in memory for a home session, start `sia` and open Settings. `sia settings --show` displays
+saved and effective non-secret values with their source; it reports credentials only as set/missing and their source.
+Exported environment values win over session and `.env`
+values. Settings controlled by `template_policy` and values overridden by a CSV row are labelled in the editor.
+Relative paths stored in TOML resolve beside the TOML file; command-line paths resolve from the current directory.
+
+Settings are grouped by tenant, access, accounts, policies, network, sign-in, connection exports and vault topics.
+Type a setting name, such as `timeout`, to find it; autocomplete also matches labels. Edits remain pending until
+Save. The save summary uses readable labels; choose `details` for the full TOML diff. `/back` returns one screen;
+`/cancel` returns home and retains non-secret edits for this session. Reopen Setup or Settings for the same config
+to resume the draft. Exiting the process discards it; no draft is stored on disk. Credential saves are separate.
+
+Setup validates fields as you enter them. A URL correction is displayed for explicit acceptance before it is
+used. The review screen exposes every settings group and shows where validation errors can be repaired. Invalid
+TOML or unknown keys can be repaired externally and reloaded. If the file changes during editing, Reload preserves
+unrelated edits and asks you to resolve fields changed in both places; review the merged result before Save.
+Credential prompts retain the current entry when a storage choice is mistyped. An empty hidden password returns
+to the service-user field without storing an incomplete credential pair.
+
+Known home commands are kept in memory for that session only. Setting values, credential values and arbitrary
+command arguments are not saved in command history. Completion falls back to plain prompts in basic terminals
+(`TERM=dumb`); `NO_COLOR` turns off colors while preserving completion. Explicit command arguments such as
+`/plan --server web01.example.com --group Admins --drift` use the same parser as the standalone CLI.
+
 ## Contents
 
 1. [What the results mean](#1-what-the-results-mean)
@@ -32,15 +67,20 @@ and the open items.
 | `drift` | The object exists but differs from your list; the detail says how. | Decide who is right. To enforce the list: `apply --update` (section 5). |
 | `blocked` | Not attempted because something it depends on failed, or the run stopped after an error. | Fix the cause in the detail and run again. |
 | `failed` | SIA, Identity or the PVWA rejected it, or a name could not be found. | See [Troubleshooting](#8-troubleshooting). |
+| `uncertain` | A write lost its response, so the tool cannot safely say whether the tenant applied it. | Do not repeat it blindly. Run `plan --drift` to read and reconcile current state. |
+| `unverified` | A response or read-back did not prove the requested object and status. | Run `plan --drift`; inspect the object ID/state before another write. |
 | `skipped` | You limited the run with `--only`. | Nothing. |
 
-`verify` turns these into verdicts: `PASS` (exists / created / n/a), `MISSING` (would be created), `FAIL` (drift,
-failed, blocked, inactive), `SKIP`.
+`verify` turns these into verdicts: `PASS` (exists / created / updated / n/a), `MISSING` (would be created), `FAIL`
+(drift, failed, blocked, inactive, uncertain, unverified), `SKIP`.
 
 Every run writes two reports to `reports/` (`plan-…` or `apply-…` with a UTC timestamp): JSON and CSV, one row per
-policy row with all statuses and details. They contain no passwords and are safe to attach to a change ticket.
-Exit codes: `0` all fine, `1` something needs attention, `2` a file or setting is wrong, `130` interrupted (the
-checkpoint keeps what was finished).
+policy row with all statuses and details. They contain no passwords; inspect tenant names and object details before
+sharing them outside the change team.
+Interrupted or failed runs retain completed object references and distinguish unattempted work from writes with
+unknown outcomes. Their JSON includes `complete: false`; interruption also sets `interrupted: true`.
+Exit codes: `0` all fine, `1` something needs attention, `2` a file or setting is wrong, `130` interrupted.
+Checkpoints contain only fully completed rows; reports can also show partial rows and uncertain writes.
 
 ## 2. How a user connects
 
@@ -196,7 +236,13 @@ sensitive and cannot be delegated*, not in *Protected Users*; local accounts nee
   `apply --update` re-points it.
 - **Someone changed a policy in the portal.** `plan` shows `drift` with what differs. Update your list to match,
   or `apply --update` to put the policy back. `--update` only changes objects carrying the tool's tag
-  (`sia-policy-automation`). Target changes are compared only with `--drift` (implied by `--update`).
+  (`sia-policy-automation`). A full policy/target-set comparison needs `--drift` (implied by `--update`) and covers
+  descriptions, tags, time frame/time zone, principals and directory metadata, entitlement, delegation,
+  conditions, target rules, and RDP/SSH behavior including local groups and reconnect. Target-set account, type,
+  description, certificate-validation and provisioning-format changes are also detected.
+- **Activating or suspending policies.** `[defaults] policy_status` is a creation default. It does not alter an
+  existing policy. Preview `plan --update --set-policy-status Active|Suspended`, then use the same flags with
+  `apply`. Without that explicit action, ordinary updates preserve the live status.
 - **Taking over a hand-built object.** It shows as `exists (unmanaged)` or `drift … not managed by this tool`.
   `apply --update --adopt web01.corp.example.com` (FQDN or policy name) lets the tool manage it; `--adopt-all`
   adopts everything matching. Adopting adds the tag.
@@ -215,9 +261,12 @@ The programme this tool was built for has ~70,000 servers and up to two policies
 
 - **Waves.** One `servers.csv` per wave, or slice one big file: `--offset 0 --limit 5000`, then
   `--offset 5000 --limit 5000`, … (rows of one server always travel together). Run `verify` after each wave.
-- **Resume, do not restart.** `apply` records every finished row in `<input>/.sia-checkpoint.jsonl`
-  (`--checkpoint FILE` to move it). After an interruption run the same command with `--resume`: finished rows
-  are skipped without a single request; a row whose CSV values changed is always re-checked.
+- **Resume completed work.** `apply` records complete, verified rows in `<input>/.sia-checkpoint.jsonl`
+  (`--checkpoint FILE` to move it). Version 2 fingerprints the tenant identity, effective object settings, template
+  content, account mapping and row input. With `--resume`, only a complete record whose version and fingerprint
+  still match is skipped without a request. Older, malformed, incomplete, uncertain and unverified records, or
+  rows affected by a setting/template/input change, are reconciled again with an explanatory warning. A checkpoint
+  proves only what an earlier tool run verified; it is not current live-tenant evidence.
 - **Lookups scale with the wave.** `--lookup search` (default up to 2,000 servers per run) reads the objects of
   the servers in the wave, one request per server in parallel; `--lookup list` (default above that) reads one
   listing each of strong accounts, target sets and the policies tagged by the tool. A tenant with 70,000
@@ -235,8 +284,8 @@ The programme this tool was built for has ~70,000 servers and up to two policies
 - **Reports.** The CSV always has every row; the console shows totals plus the rows needing attention once a run
   exceeds 200 rows; the JSON keeps per-row detail up to 10,000 rows.
 
-Rough timing: with 8 workers a few policies per second; 100 servers in about a minute, 10,000 in roughly an
-hour, depending on tenant rate limits. Confirm the tenant-side limits in [Open items](#11-open-items) first.
+Measure throughput and rate limits with a small tenant-specific wave before choosing production wave sizes. The
+offline suite does not establish live API capacity or end-user connectivity.
 
 ## 7. Safety
 
@@ -247,9 +296,26 @@ hour, depending on tenant rate limits. Confirm the tenant-side limits in [Open i
   adopted.
 - The first rejected create stops the run (`blocked` for the rest) unless you pass `--keep-going`.
 - A request that fails mid-way is not retried blindly; the next `plan` shows whether the object exists.
+- Malformed mutation responses and failed read-backs are `uncertain`/`unverified`, do not count as success, and
+  are not written as completed checkpoint rows.
+- Malformed or incomplete discovery, pagination cycles and ambiguous names stop missing-object decisions. Resolve
+  the response or conflicting names before applying again.
+- Interruptions and checkpoint failures stop scheduling new writes. Requests already sent are allowed to finish
+  within their configured timeouts so their results can be included in the partial report.
+- Exports are fully staged before publication. Automatically named reports and RDP files do not overwrite earlier
+  files. If publishing several files fails partway through, the error lists the files already completed.
 - Passwords never appear in lists, logs, reports, checkpoints or `.rdp` files.
 
 ## 8. Troubleshooting
+
+The [recovery coverage matrix](RECOVERY.md) lists the validated navigation, file, input, API, and interrupted-run
+paths and their expected recovery behavior.
+
+Start with `sia doctor`. It checks Python/dependencies, the configuration, credential status/permissions, input
+files and local output paths independently without authenticating. `sia doctor --online` adds read-only tenant
+checks. Errors use a stable diagnostic code and three sections: **What happened**, **What changed**, and **What to
+do next**. The message distinguishes known causes from suggestions; `-v` adds sanitized technical details. Use
+`sia help CODE` (for example `sia help SIA-TLS`) for the built-in explanation.
 
 | What you see | What it means | What to do |
 |---|---|---|
@@ -276,12 +342,14 @@ hour, depending on tenant rate limits. Confirm the tenant-side limits in [Open i
 | `password not available: …` | A `credentials` account needs a password. | Put it in `.env` or the password file, or run `apply` interactively. |
 | target set `failed: bulk create …` | SIA rejected the target set. | Usually the strong account is inactive or the wrong type. |
 | policy `status=Error` | SIA created the policy but flagged it. | Read the detail; compare with a hand-built policy (`show-policy`). |
-| policy `inactive … status=Suspended` | Someone suspended the policy. | Activate it in the portal, or accept `verify` reporting `FAIL`. |
+| policy `inactive … status=Suspended` | The existing policy is suspended. | Activate it in the portal, or preview and apply `--update --set-policy-status Active`. |
 | `Unable to create an Authorization Policy. Error(s): Field required (field: status)` | The tenant requires `metadata.status` on a policy create. | Fixed in the tool — it now sends `[defaults] policy_status` (`Active`). Upgrade if you see this. |
 | `Run aborted (fail-fast): …` | The first create was rejected. | Fix the cause, `plan`, `apply` again. |
 | `drift: … not managed by this tool` | `--update` on a hand-built object. | Add `--adopt <fqdn>` (for a shared target set, `--adopt <target set name>`). |
 | `SSLError` / `CERTIFICATE_VERIFY_FAILED` | A proxy is re-signing TLS with a certificate the tool does not trust. | Export the proxy's root CA and pass `--ca-bundle FILE` (or set `[http] ca_bundle`). Do **not** disable verification to get past this on a real tenant. |
-| `… may or may not have been applied` | A request failed on the network mid-way. | Run `plan`; if the object exists it shows `exists`. |
+| `uncertain` / `… may or may not have been applied` | A request failed on the network after a write may have reached the service. | Do not repeat the write blindly. Run `plan --drift` and inspect current tenant state. |
+| `unverified` | The API response/read-back did not prove a usable object or requested status. | Run `plan --drift`; confirm the referenced object before applying again. |
+| `checkpoint … reconciling it again` | A version, record, fingerprint or completed-stage reference is missing/mismatched. | Let the read-only snapshot reconcile it; do not treat the old checkpoint as live proof. |
 | `interrupted … re-run apply with --resume` | You stopped the run. | Run the same command with `--resume`. |
 | `… is readable by other users` | File permissions are too open. | `chmod 600 <file>` (macOS/Linux). |
 | Many `429` lines in the `-v` log | The tenant is rate-limiting. | Set `[http] max_requests_per_second`, lower `--workers`. |
@@ -307,9 +375,9 @@ created in the portal.
 `<account>_<safe>` for Vault references and rejects custom names. The tool uses the same name so it always finds
 the right one.
 
-**Does this work with PAM Self-Hosted, not Privilege Cloud?** Yes; SIA stores the reference the same way for
-both. Which Vault it talks to comes from the *PAM Self-Hosted* settings in SIA (PAM 14.4+). Onboarding missing
-accounts uses the PVWA REST API of that Vault.
+**Does this work with PAM Self-Hosted, not Privilege Cloud?** The tool has a PVWA REST path for onboarding missing
+accounts and models the SIA Vault reference. Confirm the configured PAM Self-Hosted integration, platform and
+payload on a one-server pilot; the offline suite is not proof of compatibility with a particular live tenant.
 
 **Does it touch the strong accounts I already have?** No. Existing accounts are only looked up; nothing is ever
 changed or deleted, in SIA or in the Vault.
@@ -332,7 +400,8 @@ create local ephemeral users on every server it administers, which is exactly wh
 
 **Can it be called from a build job?** Yes — `apply --server <fqdn> --yes --json --no-report` onboards one server
 without a `servers.csv`, reading `domains.csv` for its group and strong account. Exit code `0` success, `1`
-something needs attention, `2` bad input or configuration; the JSON result is on stdout, the table on stderr.
+something needs attention, `2` bad input or configuration; valid JSON is written on stdout for success and failure,
+while human messages and the table use stderr.
 
 **Can I undo a run?** No automatic undo, but every report lists exactly what was created (policy, then target
 set, then strong account if unused).
@@ -356,7 +425,7 @@ own `config.toml`, `.env` and password file.
 | Vault account (PVWA) | the `vault` stage, `[pvwa]` | Onboarded only when missing |
 | Service user (Identity) | `SIA_CLIENT_ID` / `SIA_CLIENT_SECRET` | Needs the `DpaAdmin` role |
 | Tag `sia-policy-automation` | "managed by the tool" | `--update` only touches tagged objects unless you `--adopt` |
-| Checkpoint | `<input>/.sia-checkpoint.jsonl` | Finished rows; `--resume` skips them |
+| Checkpoint | `<input>/.sia-checkpoint.jsonl` | Versioned record of locally verified completed rows; matching `--resume` may skip them, but it is not a live receipt |
 
 ## 11. Open items
 
@@ -367,7 +436,6 @@ own `config.toml`, `.env` and password file.
    limit was found in the documentation.
 3. **Two policies matching one user and one server**: confirm in the portal what the user sees when both apply.
 4. **PVWA onboarding fields**: confirm the platform ID and any extra required properties on the real PVWA.
-5. **Local-group changes as drift**: a change to `assign_groups` is not reported as drift today.
-6. **Decommissioning**: the tool never deletes; a controlled "remove these servers" mode would have to be gated by
+5. **Decommissioning**: the tool never deletes; a controlled "remove these servers" mode would have to be gated by
    the tool's tag.
-7. **Automatic test run on GitHub** (CI).
+6. **Automatic test run on GitHub** (CI).

@@ -138,9 +138,43 @@ def test_missing_files(tmp_path):
         load_inputs(tmp_path)
 
 
+def test_servers_csv_requires_data_and_unambiguous_headers(tmp_path):
+    (tmp_path / "servers.csv").write_text("fqdn,strong_account,group\n", encoding="utf-8")
+    with pytest.raises(InputError, match="no data rows found"):
+        load_inputs(tmp_path)
+    (tmp_path / "servers.csv").write_text("fqdn,group,group\na.b.c,G,G2\n", encoding="utf-8")
+    with pytest.raises(InputError, match="duplicate column.*group"):
+        load_inputs(tmp_path)
+    (tmp_path / "servers.csv").write_text("fqdn,,group\na.b.c,SA1,G\n", encoding="utf-8")
+    with pytest.raises(InputError, match="blank column name"):
+        load_inputs(tmp_path)
+
+
+def test_malformed_csv_has_file_and_line(tmp_path):
+    (tmp_path / "servers.csv").write_text('fqdn,strong_account,group\n"a.b.c,SA1,G\n', encoding="utf-8")
+    with pytest.raises(InputError, match=r"servers\.csv:\d+: invalid CSV"):
+        load_inputs(tmp_path)
+    (tmp_path / "servers.csv").write_bytes(b"fqdn,strong_account,group\na.b.c,SA1,\xff\n")
+    with pytest.raises(InputError, match="must be UTF-8"):
+        load_inputs(tmp_path)
+
+
 def test_groups_csv_duplicates(tmp_path):
     make_inputs(tmp_path, "a.b.c,SA1,G\n", "SA1,existing,,,,,\n", groups="G,\nG,CyberArk Cloud Directory\n")
     with pytest.raises(InputError, match="duplicate group"):
+        load_inputs(tmp_path)
+
+
+def test_password_env_names_and_collisions_are_rejected(tmp_path):
+    make_inputs(tmp_path, "a.b.c,SA-one,G\nd.b.c,SA-two,G\n",
+                "SA-one,credentials,,,admin,,BAD-NAME\nSA-two,credentials,,,admin,,BAD-NAME\n")
+    with pytest.raises(InputError) as exc:
+        load_inputs(tmp_path)
+    assert "not a valid environment variable name" in str(exc.value)
+    (tmp_path / "strong_accounts.csv").write_text(
+        ACCOUNTS_HDR + "SA-one,credentials,,,admin,,SHARED_PASSWORD\n"
+        + "SA-two,credentials,,,admin,,shared_password\n", encoding="utf-8")
+    with pytest.raises(InputError, match="collides with account 'SA-one'"):
         load_inputs(tmp_path)
 
 
@@ -459,3 +493,77 @@ def test_domain_wide_target_set_may_not_be_typed_target(tmp_path):
     with pytest.raises(InputError) as exc:
         load_inputs(path, target_set_scope="auto")
     assert "target_set_type = Target names a single machine" in str(exc.value)
+
+
+def test_generated_account_name_collision_reports_conflicting_operational_fields(tmp_path):
+    make_inputs(tmp_path, "web01.corp.example.com,,G\nweb02.corp.example.com,,G\n", "")
+    spec = StrongAccountTemplate(
+        name="SHARED", type="vault", safe="SIA", account_name="{hostname}-Administrator",
+        username="Administrator", account_domain="local",
+    )
+    with pytest.raises(InputError) as caught:
+        load_inputs(tmp_path, strong_account_template=spec)
+    message = str(caught.value)
+    assert "generated strong account 'SHARED' conflicts" in message
+    assert "servers.csv:2" in message and "servers.csv:3" in message
+    assert "account_name" in message and "address" in message
+
+
+def test_identical_generated_shared_account_definition_is_allowed(tmp_path):
+    make_inputs(tmp_path, "web01.corp.example.com,,G\nweb02.corp.example.com,,G\n", "")
+    spec = StrongAccountTemplate(
+        name="SHARED-{domain}", type="vault", safe="SIA", account_name="Domain-Administrator",
+        username="Administrator", account_domain="{domain}",
+    )
+    inputs = load_inputs(tmp_path, strong_account_template=spec)
+    assert set(inputs.strong_accounts) == {"SHARED-corp.example.com"}
+    assert all(row.strong_account == "SHARED-corp.example.com" for row in inputs.servers)
+
+
+def test_account_and_group_pins_are_case_insensitive(tmp_path):
+    make_inputs(
+        tmp_path, "web01.corp.example.com,sa-one,team-ops\n", "SA-One,existing,,,,,\n",
+        groups="Team-Ops,CyberArk Cloud Directory\n",
+    )
+    inputs = load_inputs(tmp_path)
+    assert inputs.servers[0].strong_account == "SA-One"
+    assert inputs.strong_account_for(inputs.servers[0]).name == "SA-One"
+    assert inputs.pinned_directory("TEAM-OPS") == "CyberArk Cloud Directory"
+
+
+def test_repeated_server_rows_accept_case_variants_of_the_same_account(tmp_path):
+    make_inputs(
+        tmp_path,
+        "web01.corp.example.com,sa-one,Team,,\nweb01.corp.example.com,SA-ONE,Other,,-ops\n",
+        "SA-One,existing,,,,,\n",
+        servers_hdr="fqdn,strong_account,group,policy_name,policy_suffix\n",
+    )
+    inputs = load_inputs(tmp_path)
+    assert [row.strong_account for row in inputs.servers] == ["SA-One", "SA-One"]
+
+
+def test_groups_reject_case_only_duplicates(tmp_path):
+    make_inputs(tmp_path, "web01.corp.example.com,SA1,G\n", "SA1,existing,,,,,\n",
+                groups="Team,CyberArk Cloud Directory\nteam,corp.example.com\n")
+    with pytest.raises(InputError, match="duplicate group"):
+        load_inputs(tmp_path)
+
+
+def test_target_mapping_must_name_the_consuming_server_exactly(tmp_path):
+    path = make_inputs(
+        tmp_path, "web01.corp.example.com,,G,\n", "", servers_hdr=SERVERS_MIN,
+        domains="corp.example.com,SA-CORP,other.corp.example.com,Target,\n",
+    )
+    with pytest.raises(InputError) as caught:
+        load_inputs(path, target_set_scope="auto")
+    assert "Target must name this exact server 'web01.corp.example.com'" in str(caught.value)
+
+
+def test_dns_total_length_and_template_operators_are_rejected(tmp_path):
+    overlong = ".".join(["a" * 63] * 4)
+    make_inputs(tmp_path, f"{overlong},SA1,G\n", "SA1,existing,,,,,\n")
+    with pytest.raises(InputError, match="not a valid FQDN"):
+        load_inputs(tmp_path)
+    make_inputs(tmp_path, "web01.corp.example.com,SA1,G\n", "SA1,existing,,,,,\n")
+    with pytest.raises(InputError, match="format specifications are not supported"):
+        load_inputs(tmp_path, policy_name_template="{hostname:>20}")

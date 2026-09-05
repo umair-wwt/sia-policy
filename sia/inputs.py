@@ -14,11 +14,13 @@ Which of those two routes supplied the account also decides how wide the server'
 from __future__ import annotations
 
 import csv
+import io
 import re
+import string
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
-from .config import StrongAccountTemplate, env_var_for_password
+from .config import ConfigError, StrongAccountTemplate, env_var_for_password
 
 FQDN_LABEL = r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
 FQDN_RE = re.compile(rf"^(?:{FQDN_LABEL}\.)+{FQDN_LABEL}$")
@@ -33,6 +35,9 @@ MAX_POLICY_NAME = 200          # UAP: metadata.name is 1..200 characters
 MAX_WINDOWS_USERNAME = 20      # SAM account names longer than this cannot log on
 TRUE_WORDS = ("yes", "y", "true", "1")
 FALSE_WORDS = ("no", "n", "false", "0")
+ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+MAX_DNS_NAME = 253
+TEMPLATE_FIELDS = {"hostname", "fqdn", "domain", "hostname_upper", "hostname_lower", "domain_upper"}
 
 
 class InputError(Exception):
@@ -144,10 +149,17 @@ class Inputs:
     def strong_account_for(self, server: ServerRow) -> StrongAccountRow:
         if server.strong_account is None:
             raise KeyError(f"{server.fqdn} ({server.protocol}) has no strong account")
-        return self.strong_accounts[server.strong_account]
+        direct = self.strong_accounts.get(server.strong_account)
+        if direct is not None:
+            return direct
+        wanted = server.strong_account.casefold()
+        return next(value for name, value in self.strong_accounts.items() if name.casefold() == wanted)
 
     def pinned_directory(self, group_name: str) -> str | None:
         row = self.groups.get(group_name)
+        if row is None:
+            wanted = group_name.casefold()
+            row = next((value for name, value in self.groups.items() if name.casefold() == wanted), None)
         return row.directory if row else None
 
     @property
@@ -208,14 +220,35 @@ def _parse_bool(value: str | None, default: bool) -> bool | None:
     return None
 
 
-def read_csv(path: Path, required: tuple[str, ...], optional: tuple[str, ...]) -> list[tuple[int, dict[str, str]]]:
+def _valid_dns_name(value: str, *, fqdn: bool = False) -> bool:
+    labels = value.split(".")
+    return (bool(value) and len(value) <= MAX_DNS_NAME and (not fqdn or len(labels) > 1)
+            and all(re.fullmatch(FQDN_LABEL, label) for label in labels)
+            and (not fqdn or not all(label.isdigit() for label in labels)))
+
+
+def read_csv(path: Path, required: tuple[str, ...], optional: tuple[str, ...], *,
+             require_rows: bool = False) -> list[tuple[int, dict[str, str]]]:
     """Read a CSV with a header row. Returns (line_number, row) pairs; cells stripped; blank rows skipped."""
     problems: list[str] = []
-    with path.open(encoding="utf-8-sig", newline="") as fh:
-        reader = csv.DictReader(fh)
-        header = [h.strip() for h in (reader.fieldnames or [])]
+    try:
+        text = path.read_text(encoding="utf-8-sig")
+    except UnicodeDecodeError as exc:
+        raise InputError(f"{path.name}: file must be UTF-8 text: {exc}") from exc
+    except OSError as exc:
+        raise InputError(f"cannot read {path}: {exc}") from exc
+    with io.StringIO(text, newline="") as fh:
+        reader = csv.DictReader(fh, strict=True)
+        raw_header = reader.fieldnames or []
+        header = [h.strip() for h in raw_header]
         if not header:
             raise InputError(f"{path.name}: file is empty (expected a header row)")
+        blank_positions = [str(index + 1) for index, name in enumerate(header) if not name]
+        duplicates = sorted({name for name in header if name and header.count(name) > 1})
+        if blank_positions:
+            problems.append(f"{path.name}: header has blank column name(s) at position(s) {', '.join(blank_positions)}")
+        if duplicates:
+            problems.append(f"{path.name}: duplicate column(s): {', '.join(duplicates)}")
         missing = [c for c in required if c not in header]
         unknown = [c for c in header if c and c not in required + optional]
         if missing:
@@ -225,14 +258,19 @@ def read_csv(path: Path, required: tuple[str, ...], optional: tuple[str, ...]) -
         if problems:
             raise InputError("\n".join(problems))
         rows: list[tuple[int, dict[str, str]]] = []
-        for raw in reader:
-            line = reader.line_num
-            cells = {(k or "").strip(): (v or "").strip() for k, v in raw.items() if k is not None}
-            if None in raw and any((x or "").strip() for x in raw[None]):  # type: ignore[index]
-                problems.append(f"{path.name}:{line}: more cells than header columns")
-            if not any(cells.values()):
-                continue
-            rows.append((line, cells))
+        try:
+            for raw in reader:
+                line = reader.line_num
+                cells = {(k or "").strip(): (v or "").strip() for k, v in raw.items() if k is not None}
+                if None in raw and any((x or "").strip() for x in raw[None]):  # type: ignore[index]
+                    problems.append(f"{path.name}:{line}: more cells than header columns")
+                if not any(cells.values()):
+                    continue
+                rows.append((line, cells))
+        except csv.Error as exc:
+            problems.append(f"{path.name}:{reader.line_num}: invalid CSV: {exc}")
+        if require_rows and not rows:
+            problems.append(f"{path.name}: no data rows found (add at least one server below the header)")
     if problems:
         raise InputError("\n".join(problems))
     return rows
@@ -244,6 +282,16 @@ def _render_name(template: str, fqdn: str, domain: str) -> str:
     The *_upper / *_lower variants exist because FQDNs are lower-cased on the way in while Identity group names are
     often written in upper case; group lookup is case-insensitive either way, but the rendered name should read right.
     """
+    parsed = list(string.Formatter().parse(template))
+    for _, field_name, format_spec, conversion in parsed:
+        if field_name is None:
+            continue
+        if field_name not in TEMPLATE_FIELDS:
+            raise KeyError(field_name)
+        if conversion:
+            raise ValueError("template conversions such as !r or !s are not supported")
+        if format_spec:
+            raise ValueError("template format specifications are not supported")
     hostname = fqdn.split(".", 1)[0]
     return template.format(hostname=hostname, fqdn=fqdn, domain=domain,
                            hostname_upper=hostname.upper(), hostname_lower=hostname.lower(),
@@ -264,6 +312,8 @@ def _templated_account(spec: StrongAccountTemplate, fqdn: str, dns_domain: str, 
     if username and len(username) > MAX_WINDOWS_USERNAME:
         warnings.append(f"{where}: strong account user name {username!r} is longer than {MAX_WINDOWS_USERNAME} characters")
     domain = _render_name(spec.account_domain, fqdn, dns_domain) if spec.account_domain else "local"
+    if domain.casefold() != "local" and not _valid_dns_name(domain.lower().rstrip(".")):
+        raise ValueError(f"strong_account_domain rendered invalid DNS name {domain!r}")
     address = fqdn if domain.lower() == "local" else domain
     if spec.type == "vault":
         return StrongAccountRow(name=name, type="vault", safe=_render_name(spec.safe, fqdn, dns_domain),
@@ -285,6 +335,7 @@ class ParseContext:
     group_template: str = ""
     target_set_scope: str = "server"
     domains: dict[str, DomainRow] = field(default_factory=dict)
+    generated_origins: dict[str, str] = field(default_factory=dict)
 
     def domain_row(self, dns_domain: str) -> DomainRow | None:
         return self.domains.get((dns_domain or "").lower())
@@ -326,9 +377,25 @@ def _resolve_strong_account(cell: str | None, domain_joined: bool, fqdn: str, dn
     if domain_joined and entry is not None and entry.strong_account:
         return entry.strong_account, True
     if ctx.spec:
-        account = _templated_account(ctx.spec, fqdn, dns_domain, warnings, where)
-        templated.setdefault(account.name, account)
-        return account.name, False
+        try:
+            account = _templated_account(ctx.spec, fqdn, dns_domain, warnings, where)
+        except (ConfigError, KeyError, IndexError, ValueError) as exc:
+            problems.append(f"{where}: strong_account_template is invalid: {exc}")
+            return None, False
+        existing_name = next((name for name in templated if name.casefold() == account.name.casefold()), None)
+        if existing_name is None:
+            templated[account.name] = account
+            ctx.generated_origins[account.name.casefold()] = where
+            return account.name, False
+        existing = templated[existing_name]
+        operational = ("type", "safe", "account_name", "username", "account_domain", "password_env", "address")
+        differences = [name for name in operational if getattr(existing, name) != getattr(account, name)]
+        if differences:
+            first_where = ctx.generated_origins.get(existing_name.casefold(), "an earlier row")
+            problems.append(
+                f"{where}: generated strong account {account.name!r} conflicts with {first_where}; the same account "
+                f"renders different {', '.join(differences)} values")
+        return existing_name, False
     # A workgroup server can never take its domain's account, so don't send the operator to domains.csv for one.
     via_domain = ("" if not domain_joined else
                   f"add {dns_domain!r} to domains.csv with its domain strong account, ")
@@ -356,14 +423,14 @@ def _build_server_row(c: dict[str, str], where: str, line: int, ctx: ParseContex
                       warnings: list[str], templated: dict[str, StrongAccountRow]) -> ServerRow:
     """One servers.csv row (or one --server invocation) -> a validated ServerRow. Problems are collected, not raised."""
     fqdn = c["fqdn"].lower().rstrip(".")
-    if not FQDN_RE.match(fqdn) or all(label.isdigit() for label in fqdn.split(".")):
+    if not _valid_dns_name(fqdn, fqdn=True):
         problems.append(f"{where}: fqdn {c['fqdn']!r} is not a valid FQDN (host.domain.tld; IPs not supported)")
     protocol = (c.get("protocol") or "rdp").lower()
     if protocol not in PROTOCOLS:
         problems.append(f"{where}: protocol must be one of {', '.join(PROTOCOLS)}, got {c['protocol']!r}")
         protocol = "rdp"
     domain = c.get("domain", "").lower().rstrip(".") or None
-    if domain and not all(re.fullmatch(FQDN_LABEL, label) for label in domain.split(".")):
+    if domain and not _valid_dns_name(domain):
         problems.append(f"{where}: domain {c['domain']!r} is not a valid DNS name")
     dns_domain = domain or (fqdn.split(".", 1)[1] if "." in fqdn else "")
     domain_joined = _parse_bool(c.get("domain_joined"), True)
@@ -395,6 +462,11 @@ def _build_server_row(c: dict[str, str], where: str, line: int, ctx: ParseContex
             strong_account, domain_joined, fqdn, dns_domain, entry, ctx, where, problems, warnings, templated)
         target_set_name, target_set_type = _resolve_target_set(
             from_domains_csv, explicit_account, domain_joined, dns_domain, entry, ctx, where, problems)
+        if (target_set_type == "Target" and target_set_name
+                and target_set_name.casefold() != fqdn.casefold()):
+            problems.append(
+                f"{where}: target_set_type = Target must name this exact server {fqdn!r}, "
+                f"but the resolved target set is {target_set_name!r}")
     groups = _resolve_groups(c.get("group"), fqdn, dns_domain, entry, ctx, where, problems)
 
     policy_name = c.get("policy_name") or None
@@ -440,6 +512,9 @@ def _check_row_agreement(row: ServerRow, where: str, first_row: dict[str, Server
     for label, mine, theirs in (("strong_account", row.strong_account, first.strong_account),
                                 ("domain", row.domain, first.domain), ("protocol", row.protocol, first.protocol),
                                 ("target set", row.target_set_key, first.target_set_key)):
+        if label in ("strong_account", "target set") and isinstance(mine, str) and isinstance(theirs, str):
+            if mine.casefold() == theirs.casefold():
+                continue
         if mine != theirs:
             problems.append(f"{where}: {label} {mine!r} conflicts with line {first.line} ({theirs!r}) for the same fqdn {row.fqdn}")
 
@@ -448,7 +523,7 @@ def _parse_servers(path: Path, problems: list[str], warnings: list[str],
                    ctx: ParseContext) -> tuple[list[ServerRow], dict[str, StrongAccountRow]]:
     rows = read_csv(path, ("fqdn",),
                     ("strong_account", "group", "policy_name", "policy_suffix", "assign_groups", "domain",
-                     "description", "protocol", "ssh_username", "domain_joined"))
+                     "description", "protocol", "ssh_username", "domain_joined"), require_rows=True)
     servers: list[ServerRow] = []
     templated: dict[str, StrongAccountRow] = {}
     first_row: dict[str, ServerRow] = {}
@@ -486,11 +561,24 @@ def _parse_strong_accounts(path: Path, problems: list[str]) -> dict[str, StrongA
             problems.append(f"{path.name}:{line}: type=credentials requires username")
         if kind == "existing" and any(c.get(k) for k in ("safe", "account_name", "username", "password_env", "address")):
             problems.append(f"{path.name}:{line}: type=existing rows must not set safe/account_name/username/password_env/address")
-        password_env = c.get("password_env") or (env_var_for_password(name) if kind == "credentials" else None)
+        password_env = c.get("password_env") or None
+        if kind == "credentials" and not password_env:
+            try:
+                password_env = env_var_for_password(name)
+            except ConfigError as exc:
+                problems.append(f"{path.name}:{line}: {exc}")
+        if password_env and not ENV_NAME_RE.fullmatch(password_env):
+            problems.append(f"{path.name}:{line}: password_env {password_env!r} is not a valid environment variable name")
+        account_domain = c.get("account_domain") or "local"
+        if account_domain.casefold() != "local" and not _valid_dns_name(account_domain.lower().rstrip(".")):
+            problems.append(f"{path.name}:{line}: account_domain {account_domain!r} is not a valid DNS name or 'local'")
+        address = c.get("address") or None
+        if address and not _valid_dns_name(address.lower().rstrip(".")):
+            problems.append(f"{path.name}:{line}: address {address!r} is not a valid DNS name")
         accounts[name] = StrongAccountRow(
             name=name, type=kind, safe=c.get("safe") or None, account_name=c.get("account_name") or None,
-            username=c.get("username") or None, account_domain=(c.get("account_domain") or "local"),
-            password_env=password_env, line=line, address=c.get("address") or None,
+            username=c.get("username") or None, account_domain=account_domain,
+            password_env=password_env, line=line, address=address,
         )
     return accounts
 
@@ -507,7 +595,7 @@ def _parse_domains(path: Path, problems: list[str]) -> dict[str, DomainRow]:
         if not domain:
             problems.append(f"{where}: domain is required")
             continue
-        if not all(re.fullmatch(FQDN_LABEL, label) for label in domain.split(".")):
+        if not _valid_dns_name(domain):
             problems.append(f"{where}: domain {c['domain']!r} is not a valid DNS name")
             continue
         if domain in domains:
@@ -524,6 +612,9 @@ def _parse_domains(path: Path, problems: list[str]) -> dict[str, DomainRow]:
             problems.append(f"{where}: target_set_type = Target names a single machine, but this row's target set is "
                             f"the domain {domain!r}; use Domain (or Suffix), or name a specific target_set")
             raw_type = "domain"
+        target_set = (c.get("target_set") or "").lower().rstrip(".") or None
+        if target_set and not _valid_dns_name(target_set):
+            problems.append(f"{where}: target_set {c['target_set']!r} is not a valid DNS name")
         group_template = c.get("group_template") or None
         if group_template:
             try:
@@ -532,7 +623,7 @@ def _parse_domains(path: Path, problems: list[str]) -> dict[str, DomainRow]:
                 problems.append(f"{where}: group_template {group_template!r} is invalid: {exc}")
                 group_template = None
         domains[domain] = DomainRow(
-            domain=domain, strong_account=c.get("strong_account") or None, target_set=c.get("target_set") or None,
+            domain=domain, strong_account=c.get("strong_account") or None, target_set=target_set,
             target_set_type=TARGET_SET_TYPES[raw_type], group_template=group_template, line=line)
     _check_shared_target_sets(path, domains, problems)
     return domains
@@ -549,7 +640,7 @@ def _check_target_set_accounts(servers: list[ServerRow], origin: str, problems: 
     for server in servers:
         if server.is_ssh or not server.strong_account:
             continue
-        owner = first.setdefault(server.target_set_key, server)
+        owner = first.setdefault(server.target_set_key.casefold(), server)
         if owner is not server and owner.strong_account != server.strong_account:
             problems.append(
                 f"{origin}:{server.line}: {server.fqdn} shares target set {server.target_set_key!r} with "
@@ -563,7 +654,8 @@ def _check_shared_target_sets(path: Path, domains: dict[str, DomainRow], problem
     by_set: dict[str, DomainRow] = {}
     for row in domains.values():
         first = by_set.setdefault(row.target_set_name.lower(), row)
-        if first is not row and first.strong_account != row.strong_account:
+        if (first is not row
+                and (first.strong_account or "").casefold() != (row.strong_account or "").casefold()):
             problems.append(
                 f"{path.name}:{row.line}: domain {row.domain!r} shares target set {row.target_set_name!r} with "
                 f"{first.domain!r} (line {first.line}) but names strong account {row.strong_account!r} instead of "
@@ -577,11 +669,17 @@ def _domain_strong_accounts(domains: dict[str, DomainRow]) -> dict[str, StrongAc
     rather than being created behind the operator's back.
     """
     accounts: dict[str, StrongAccountRow] = {}
+    lowered: dict[str, str] = {}
     for row in domains.values():
-        if row.strong_account and row.strong_account not in accounts:
-            accounts[row.strong_account] = StrongAccountRow(
-                name=row.strong_account, type="existing", safe=None, account_name=None, username=None,
-                account_domain=row.domain, password_env=None, line=row.line, address=None)
+        if not row.strong_account:
+            continue
+        key = row.strong_account.casefold()
+        if key in lowered:
+            continue
+        lowered[key] = row.strong_account
+        accounts[row.strong_account] = StrongAccountRow(
+            name=row.strong_account, type="existing", safe=None, account_name=None, username=None,
+            account_domain=row.domain, password_env=None, line=row.line, address=None)
     return accounts
 
 
@@ -590,13 +688,16 @@ def _parse_groups(path: Path, problems: list[str]) -> dict[str, GroupRow]:
         return {}
     rows = read_csv(path, ("name",), ("directory",))
     groups: dict[str, GroupRow] = {}
+    lowered: dict[str, str] = {}
     for line, c in rows:
         if not c["name"]:
             problems.append(f"{path.name}:{line}: name is required")
             continue
-        if c["name"] in groups:
-            problems.append(f"{path.name}:{line}: duplicate group {c['name']!r}")
+        folded = c["name"].casefold()
+        if folded in lowered:
+            problems.append(f"{path.name}:{line}: duplicate group {c['name']!r} (also {lowered[folded]!r})")
             continue
+        lowered[folded] = c["name"]
         groups[c["name"]] = GroupRow(name=c["name"], directory=c.get("directory") or None, line=line)
     return groups
 
@@ -620,11 +721,30 @@ def _finish(servers: list[ServerRow], templated: dict[str, StrongAccountRow], ct
     accounts = _parse_strong_accounts(input_dir / "strong_accounts.csv", problems)
     groups = _parse_groups(input_dir / "groups.csv", problems)
     # Explicit strong_accounts.csv rows win over accounts derived from domains.csv or a template.
+    canonical = {name.casefold(): name for name in accounts}
     for source in (_domain_strong_accounts(ctx.domains), templated):
         for name, account in sorted(source.items()):
-            accounts.setdefault(name, account)
-    for server in servers:
-        if server.strong_account and server.strong_account not in accounts:
+            if name.casefold() not in canonical:
+                accounts[name] = account
+                canonical[name.casefold()] = name
+    env_owners: dict[str, str] = {}
+    for account in accounts.values():
+        if not account.password_env:
+            continue
+        env_key = account.password_env.upper()
+        first = env_owners.setdefault(env_key, account.name)
+        if first != account.name:
+            problems.append(
+                f"strong_accounts.csv:{account.line}: password_env {account.password_env!r} for {account.name!r} "
+                f"collides with account {first!r}; give each credentials account a unique password_env"
+            )
+    for index, server in enumerate(servers):
+        if server.strong_account and server.strong_account.casefold() in canonical:
+            canonical_name = canonical[server.strong_account.casefold()]
+            if canonical_name != server.strong_account:
+                server = replace(server, strong_account=canonical_name)
+                servers[index] = server
+        elif server.strong_account:
             problems.append(
                 f"{origin}:{server.line}: strong_account {server.strong_account!r} is not defined in strong_accounts.csv "
                 f"or domains.csv (add a row with type=existing if it already exists in SIA)")

@@ -18,8 +18,9 @@ This document is for people who maintain or extend the tool. Operators should re
 
 ## 1. Architecture
 
-Plain Python 3.11+, one third-party dependency (`requests`). The tenant is the source of truth and the CSVs are
-the desired state; the only local state is an optional checkpoint file (finished rows, no secrets). Units of
+Python 3.11+ with `requests`, `tomlkit`, `tzdata`, `prompt-toolkit` and `rich`. The tenant is the source of truth and the CSVs are
+the desired state; local state is configuration, optional credentials/reports, and a resumable checkpoint with no
+secrets. Units of
 work: one strong account per referenced account, one target set per distinct *target-set name*, one access policy
 per `servers.csv` row (a server may have several rows). The target-set name is normally the server's FQDN, but
 with `target_set_scope = "auto"/"domain"` a server that takes its strong account from `domains.csv` uses a single
@@ -33,7 +34,7 @@ flowchart TB
         CFG["config.toml"]
         ENV[".env, password file or no-echo prompts"]
     end
-    CLI["sia_onboard.py<br/>preflight · show-policy · plan · apply · verify · connect-info"]
+    CLI["sia / sia_onboard.py<br/>home · setup · settings · doctor · help<br/>preflight · show-policy · plan · apply · verify · connect-info"]
     subgraph core["sia/ package"]
         INP["inputs.py<br/>CSV parsing, multi-row servers, templated accounts"]
         CONF["config.py<br/>TOML + .env loading, StrongAccountTemplate"]
@@ -81,19 +82,24 @@ flowchart TB
 
 | Module | Responsibility |
 |---|---|
-| `sia_onboard.py` | CLI (`argparse`): wires config, auth adapters, clients, the rate limiter, the optional PVWA client and the reconciler; the six commands; prompts; exit codes; last-resort redacted error handler. |
-| `sia/config.py` | Loads `config.toml` (stdlib `tomllib`) and `.env`; validates every key; enforces the four required `[defaults]` keys; `StrongAccountTemplate` + `Defaults.strong_account_spec` (per-server accounts by convention); `[connect]`, `[pvwa]` and the `[http]` scale keys. `load_password_file()` reads the optional `name,password` CSV (permission warning, values registered with the redactor). |
+| `sia_onboard.py` / `sia/bootstrap.py` | Installable `sia` entry point and CLI (`argparse`): wires config, session-scoped credentials, clients and reconciliation; routes terminal/offline commands before tenant authentication; emits valid structured failures for `--json`. The script entry point remains compatible. |
+| `sia/config.py` | Strictly parses and validates typed TOML, IANA time zones, templates, URLs and ranges; resolves TOML file paths beside the config; reads `.env` without mutation (`read_dotenv`) while retaining `load_dotenv` compatibility; loads password CSVs. |
+| `sia/settings.py` / `sia/terminal.py` | Complete typed setting registry, comment-preserving TOML editor, grouped/searchable settings, readable change review, atomic saves with external-edit protection, safe `.env` updates, and guided home/setup/workflows. |
+| `sia/console.py` / `sia/starter.py` | Live command/value/path completion, memory-only allowlisted command history, wrapping terminal presentation with plain fallback; bundled non-secret config template created exclusively when missing. |
+| `sia/diagnostics.py` / `sia/doctor.py` / `sia/help.py` | Stable redacted diagnostic codes and `What happened / What changed / What to do next` rendering; independent offline/online checks; searchable built-in operator guidance. |
+| `sia/runtime.py` | Per-terminal-session credential overlay, non-secret config drafts keyed by resolved path, and temporary process-environment bridge. Exported values take precedence; file values are not permanently copied into the process. |
 | `sia/inputs.py` | Reads the CSVs into frozen dataclasses (`ServerRow`, `StrongAccountRow`, `GroupRow`, `DomainRow`); reports every problem with `file:line`; allows several rows per FQDN (they must agree on strong account, domain, protocol, target set) and rejects duplicate effective policy names before any tenant contact (`effective_policy_name`); resolves each row's group (`_resolve_groups`), strong account (`_resolve_strong_account`) and target set (`_resolve_target_set`); renders templated accounts of type `existing`/`vault`/`credentials`; `Inputs.unique_fqdns`, `rows_for`, `target_rows`, `window()` (waves). `_build_server_row` is shared by `load_inputs` (servers.csv) and `inline_inputs` (`--server`), so the two paths cannot validate differently. |
 | `sia/auth.py` | `PlatformTokenProvider` (documented client-credentials flow) and `ServiceUserOIDCTokenProvider` (the SDKs' `Oauth2/Token` + `OAuth2/Authorize` flow). Both cache until a minute before expiry, refresh on demand, and register every secret with the redactor. |
 | `sia/http.py` | One `requests.Session`; bearer header; the retry policy in [§5](#5-safety-mechanisms); `RateLimiter` (token bucket + shared 429 penalty); `SIAApiError` with redacted body, `status` (0 for network errors), `client_error`, `not_found`, `uncertain`. |
 | `sia/clients.py` | 1:1 endpoint wrappers. `SIAClient.probe()` detects the strong-account and target-set path families (`SIACapabilities`), listings paginate and accept name / strong-account filters, `find_secret()`; `UAPClient` lists (`filter`, `q`, `nextToken`), `owned_vm_filter()`, `find_policies_for_fqdn()`; `IdentityClient`. No business logic. |
 | `sia/pvwa.py` | `PVWAClient`: logon (CyberArk/LDAP), `find_account`, `add_account`, logoff — reuses `HttpClient` with the PVWA token sent verbatim. |
 | `sia/resolve.py` | `PrincipalResolver` (Identity group → UAP principal, with directory pinning and ambiguity errors), `SecretIndex` (deterministic secret lookup), `pick()` (snake/camel-tolerant key access). |
-| `sia/payloads.py` | Pure functions: every request body (SIA secret, target set, UAP policy, PVWA account), template validation/sanitising, `policy_signature` for drift, `policy_status`, `exact_fqdns` for rename detection, ownership predicates. `metadata.status` is required on create (`[defaults] policy_status`); an update carries the live value over instead. |
+| `sia/payloads.py` | Pure functions: every request body (SIA secret, target set, UAP policy, PVWA account), template validation/sanitising, full managed-field signatures, `policy_status`, rename detection and ownership. `metadata.status` uses `[defaults] policy_status` on create; updates preserve the live value unless an explicit status action is requested. |
 | `sia/reconcile.py` | The engine: `snapshot()` reads the tenant once with the chosen lookup strategy; `reconcile()` decides and applies in dependency order (vault → secrets → target sets → policies), enforces ownership, fail-fast, uncertain-write handling, bounded drift reads, conflict reclassification, checkpointing and progress. `workers` parallelises reads, creations and existing-policy comparisons through `_execute()` — the first item of each creating stage always runs alone (canary). |
-| `sia/checkpoint.py` | `Checkpoint` (append-only JSON lines, later lines win), `fingerprint()` over the row's inputs, `is_done()`. |
+| `sia/checkpoint.py` | Version-2 append-only JSON-lines checkpoint; validates complete stage status/reference records and fingerprints the tenant, effective settings, template, account mapping and row inputs before resume. |
 | `sia/connect.py` | The consuming side: gateway host, portal URL, login suffix, `zsp_username()`, `rdp_file_text()`, CSV/`.rdp` writers (`connect-info`). |
-| `sia/report.py` | Console summary (capped for large runs), `reports/<mode>-<timestamp>.json` and `.csv`, exit code, `verify` verdicts and outputs. |
+| `sia/report.py` | Console summary and diagnostics, collision-resistant atomic JSON/CSV reports, explicit report-write failures after tenant work, exit codes, and verify verdicts. |
+| `sia/artifacts.py` | Stages all output bytes before publication, preserves existing file modes, publishes generated names exclusively, and reports intended/completed paths on partial output failure. |
 | `sia/redact.py` | Registry of secrets bucketed by length; `redact()` (cost independent of the number of secrets); `RedactingFilter` for logging. |
 
 ## 2. Run flow
@@ -117,11 +123,13 @@ Details worth knowing:
 - `snapshot()` runs once per command; `apply` without `--yes` previews and applies from the same snapshot (no
   second tenant read). A create that then hits a name conflict is reclassified (§3), so a stale preview is safe.
 - Policy creation reads the policy back `status_polls` times (default 1; `[http] status_polls`), 2 s apart while the
-  status is `Validating`; `Error` is a failure, `Validating` is reported as created and settles by the next `plan`.
+  status is `Validating`. A failed read-back, missing ID, malformed response, or status that never proves the
+  requested final state is `unverified`; it is not counted or checkpointed as success. `Error` is a failure.
 - Group resolution stays single-threaded (the resolver cache is not thread-safe and groups are few); reads,
   creates and existing-policy comparisons fan out on a `ThreadPoolExecutor`.
 - `--only <stage>` disables writes for the other stages; lookups and comparisons still run for everything.
-- Every finished row is written to the checkpoint as soon as its policy outcome is final (apply only).
+- A row is written to the checkpoint only after every stage has a complete good status and required object reference
+  (apply only). `uncertain`, `unverified`, malformed and incomplete outcomes are reconciled again.
 
 ## 3. Decision logic
 
@@ -207,7 +215,7 @@ flowchart TD
     O -->|no| C["create (apply) / planned (plan)"]
     C -->|409 or 'already exists'| CF["look it up by name -> compare"]
     O -->|yes| D["renamed in the UI - treat as existing"]
-    N -->|yes| CMP{"name, principals (if present in the object),<br/>targets (only with --drift / --update) all match?"}
+    N -->|yes| CMP{"normal comparison, or every managed field<br/>with --drift / --update, matches?"}
     D --> CMP
     CF --> CMP
     CMP -->|yes, status Active| EX["exists"]
@@ -219,10 +227,15 @@ flowchart TD
     OWN -->|yes| UP["updated (PUT, adds the owner tag if adopting)"]
 ```
 
-`policy_signature()` normalises: sorted principal IDs; FQDN rules as `(OPERATOR, pattern.lower(), domain.lower())`;
-a key missing from a partial object is `None` and skipped. Tags, descriptions, status and read-only metadata are
-not compared (status is reported separately by `policy_status()`). Names are compared HTML-unescaped (the SDKs
-escape policy names).
+`policy_signature()` normalises every policy field the tool writes: name/description, time frame, entitlement,
+sorted tags, time zone, principal IDs/types/source-directory metadata, delegation classification, conditions,
+FQDN rules, and complete RDP/SSH behavior (including local groups and reconnect). A top-level key missing from a
+partial list object is `None`; `--drift` / `--update` fetches the full object before using the complete signature.
+Names are compared HTML-unescaped. Status is handled separately: normal updates preserve the live value;
+`--set-policy-status Active|Suspended` requires `--update` and deliberately includes it in preview/update behavior.
+
+`target_set_signature()` compares the account ID/type, target-set type, description, certificate validation and
+provisioning format during full drift checks. Without `--drift`, the account link remains the lightweight check.
 
 ### Template policy
 
@@ -253,10 +266,13 @@ fetched in full only when their description mentions one of the wave's FQDNs.
 **Conflict reclassification.** A create answered with 409 (or a 400 mentioning an existing/duplicate name) — e.g. a
 same-name policy hidden from the owner-tag listing — is looked up by name and compared instead of failing.
 
-**Checkpoint / resume.** `Checkpoint.record()` appends `{key, fingerprint, statuses, refs, at}` per finished row
-(apply only); `--resume` drops rows whose record matches `fingerprint(server, account, policy_name)` and whose
-statuses are all in {created, exists, updated, n/a} *before* the snapshot, so nothing is read for them. Ctrl-C
-prints the resume hint. `verify` and `connect-info` never use it.
+**Checkpoint / resume.** Version 2 records append `{version, key, fingerprint, statuses, refs, at}` only for rows
+whose exact `secret`, `target_set` and `policy` stages are complete and whose non-`n/a` stages have references.
+The fingerprint covers the tenant URLs, all effective object-shaping settings, sanitized template content, account
+mapping and full row input. `--resume` drops only a matching complete record before the snapshot. Older, malformed,
+incomplete and mismatched records emit a warning and are reconciled. `uncertain`/`unverified` outcomes are never a
+successful record. A checkpoint is a local cache of an earlier verified result, not proof of current tenant state.
+`verify` and `connect-info` never use it.
 
 **Parallelism and pacing.** `_parallel()` for reads (no canary), `_execute()` for writes (canary first, then the
 pool). `RateLimiter` (token bucket at `[http] max_requests_per_second`, shared by every `HttpClient`) is acquired
@@ -274,7 +290,7 @@ so a password file with 70,000 entries does not slow down logging.
 
 **Retry policy (`http.py`).**
 
-| Response | GET / HEAD / OPTIONS / PUT / DELETE | POST |
+| Response | Reads: GET / HEAD / OPTIONS and explicitly marked read-only POST | Mutations: POST / PUT / PATCH / DELETE |
 |---|---|---|
 | 401 | refresh token once, retry | same |
 | 429 | retry with backoff (honours `Retry-After`), penalises the shared limiter | same |
@@ -282,8 +298,26 @@ so a password file with 70,000 entries does not slow down logging.
 | network error / timeout | retry with backoff | **no retry** — `status=0`, `uncertain=True` |
 | other 4xx | raise immediately (`client_error=True`) | same |
 
-An uncertain POST may have been applied; the reconciler leaves the object `failed` and the next run finds it by
-name if it landed.
+An uncertain mutation may have been applied. The reconciler reports `uncertain`, does not retry or checkpoint it as
+complete, and requires a read-only reconciliation before another mutation. A write accepted without a usable ID,
+complete response or successful read-back becomes `unverified` under the same rule.
+
+Read-only POST calls explicitly pass `mutation=False`; HTTP verb alone cannot classify Identity query endpoints.
+Discovery validates response envelopes and identifiers, bounds pagination, detects repeated pages/tokens, and
+rejects conflicting duplicate names. Incomplete discovery cannot be used as evidence that an object is missing.
+
+**Cancellation and partial results.** Read and mutation pools submit at most `workers` outstanding tasks. A fatal
+worker/checkpoint error or interruption sets a shared stop event, cancels queued work, and waits for in-flight
+requests within the HTTP timeouts. The HTTP and PVWA mutation boundaries check the event immediately before
+sending. Confirmed receipts survive later read-back/checkpoint failures; pending rows become blocked and uncertain
+writes retain their state. The CLI writes the available report with `complete: false` and restores session client
+callbacks after the command. Checkpoint records are flushed and fsynced before being considered durable.
+
+**Settings recovery.** Structured validation issues carry affected section/key pairs so Setup and Settings can
+route repair to the right group. Scalar/list input parsing is strict; cross-field checks run before save.
+`SettingsDocument.rebase()` merges base/disk/draft values without discarding unresolved conflicts. Atomic config
+and credential saves recheck the source digest immediately before replacement. Setup and Settings share only a
+non-secret draft within the current home session; standalone exit and process termination discard it.
 
 **Fail-fast (`reconcile.py`).** `_systematic(exc)` is true for a 4xx other than 404/409/429 when `fail_fast` is
 on (default). The first such error from a create/update calls `_abort(reason)`: the reason is recorded in
@@ -307,10 +341,12 @@ checkpoint, reports, connection CSV and `.rdp` files never contain secrets.
 
 ## 6. Configuration internals
 
-- `load_config()` rejects unknown sections/keys, requires `[tenant]`, and requires the four `[defaults]` keys
-  `days_of_week`, `from_hour`, `to_hour`, `target_set_cert_validation` to be present in the file (the dataclass
-  keeps programmatic defaults for tests).
-- `validate()` checks hour format, session/idle ranges, day values, `provision_format` containing `<user>`,
+- `load_config()` rejects unknown sections/keys and wrong TOML types (including quoted booleans), requires
+  `[tenant]`, and requires the four `[defaults]` keys `days_of_week`, `from_hour`, `to_hour`,
+  `target_set_cert_validation` to be present. Relative `[auth] password_file` and `[http] ca_bundle` paths resolve
+  beside the config file. Command-line paths remain relative to the invocation directory.
+- `validate()` checks HTTPS base URLs, IANA time zones, hour format, session/idle ranges, day values, lists,
+  `provision_format` containing `<user>`,
   the `owner_tag` charset, `identity_auth`, `status_polls` 1–10, `target_set_scope`, that `[http] ca_bundle`
   exists on disk and is not combined with `verify = false`, that every name template (now including
   `group_template` and `strong_account_domain`) uses only `{hostname}`, `{fqdn}`, `{domain}` and their
@@ -320,8 +356,13 @@ checkpoint, reports, connection CSV and `.rdp` files never contain secrets.
   `lookup_search_max_rows >= 0`, the two path-family pins), `[pvwa]` (https URL, auth type, platform) and
   `[connect]` (bare host, suffix without `@`).
 - Defaults changed for this programme: `policy_name_template = "{fqdn}"`, `max_session_hours = 2`.
-- `load_dotenv()` never overrides variables already in the environment and warns (POSIX) when the file mode has
-  group/other bits. `PVWA_USER` / `PVWA_PASSWORD` are read the same way.
+- `read_dotenv()` is non-mutating, rejects duplicate keys/malformed quoting, and returns file values for explicit
+  source resolution. `load_dotenv()` retains compatibility without overriding exported variables. The terminal
+  keeps a session overlay, and `settings.update_dotenv()` preserves unrelated lines/comments, atomically writes
+  safely quoted values, rejects external-edit races, and applies mode 0600 on POSIX.
+- `settings.SETTING_DESCRIPTORS` covers every dataclass field. `open_settings()` can open syntactically valid but
+  semantically invalid TOML for repair; save validates, previews a diff, detects outside edits and atomically
+  replaces the file while preserving TOML comments.
 - URLs: `https://{subdomain}.dpa.{root_domain}`, `https://{subdomain}.uap.{root_domain}`, portal
   `https://{subdomain}.{root_domain}`; `identity_url` is used verbatim.
 
@@ -422,9 +463,11 @@ replaces the object, so omitting them would reset them to the platform default.
 
 `metadata.status` is **required** on create -- `ArkUAPMetadata.status` has no default and tenants reject a POST
 without it (`Field required (field: status)`); CyberArk's own SDK example sends
-`ArkUAPPolicyStatus(status=ArkUAPStatusType.ACTIVE)`. Allowed values here are `Active` and `Suspended`
+`ArkUAPPolicyStatus(status=ArkUAPStatusType.ACTIVE)`. Allowed create defaults are `Active` and `Suspended`
 (`[defaults] policy_status`); `Validating`/`Error`/`Warning` are assigned by the platform and reported back on
 read. `build_policy_update` carries the *existing* status over so an unrelated fix cannot un-suspend a policy.
+Only `--update --set-policy-status Active|Suspended` deliberately substitutes the requested status, and the same
+option is available on `plan` for preview.
 **Linux policy** — identical except for the
 behaviour block and no target set / strong account: `"behavior": {"connectAs": {"ssh": {"username": "ec2-user"}}}`.
 
@@ -454,8 +497,8 @@ target_set_status, policy_status, policy_id, portal_url, gateway_host, rdp_usern
 ## 9. Tests and development workflow
 
 ```bash
-pip install -r requirements-dev.txt
-python -m pytest                 # 185 tests, ~1 s, fully offline
+python -m pip install -r requirements-dev.txt
+python -m pytest                 # fully offline
 ```
 
 - `tests/fakes.py`: an in-memory tenant (`FakeSIA` with `capabilities`, name/account filters; `FakeUAP` honouring the
@@ -469,12 +512,47 @@ python -m pytest                 # 185 tests, ~1 s, fully offline
   `--workers` with the canary, `--only`.
 - `tests/test_http_auth_clients.py`: both auth adapters, the retry policy, the rate limiter, redaction, the SIA
   probe and both path families, secrets v2/v1 pagination, per-account target sets, UAP filters, PVWA calls.
-- `tests/test_inputs.py` / `tests/test_config.py`: every validation rule, templated accounts, waves, new sections.
+- `tests/test_inputs.py` / `tests/test_config.py` / `tests/test_settings.py`: strict types and semantic validation,
+  malformed CSV/TOML/.env cases, source/path precedence, templated accounts, comment-preserving atomic edits and
+  external-edit protection.
 - `tests/test_connect.py`, `tests/test_report_redact.py`: the consuming side, report caps, verify verdicts, the
   checkpoint file, redaction at 50k secrets.
-- `tests/test_cli.py`: the real CLI against the fake tenant (all six commands, prompts, exit codes, resume, waves,
-  the vault stage, redacted unexpected errors). CLI tests pass `--checkpoint` so nothing is written into `input/`.
+- `tests/test_terminal.py`: settings display/edit/setup, session versus `.env` credentials, secret non-disclosure,
+  Back/Cancel/EOF/Ctrl-C at each setup stage, session drafts, safe URL corrections, external-edit merge and conflict
+  recovery, credential reprompts, editable workflow review, and POSIX/Windows command parsing.
+- `tests/test_client_response_safety.py`: malformed read/write envelopes, pagination loops and limits, duplicate
+  identities, conservative mutation retries and cancellation immediately before sending.
+- `tests/test_execution_recovery.py`: controlled concurrent checkpoint failure, bounded scheduling, interruption,
+  partial results, and ambiguous discovery before writes.
+- `tests/test_artifact_recovery.py`: staging and partial publication failures, generated-name races, portable RDP
+  names, collisions between rows, and preservation of existing outputs.
+- `tests/test_console.py`, `tests/test_starter.py`, `tests/test_shell_dispatch.py`: completion and history boundaries,
+  narrow/plain rendering, starter-file preservation and concurrent creation, and help/parser recovery in the shell.
+- `tests/test_cli.py`: the real CLI against the fake tenant (legacy and new commands, structured/JSON failures,
+  prompts, exit codes, resume, waves, the vault stage, redacted unexpected errors). CLI tests pass `--checkpoint`
+  so nothing is written into `input/`.
 - `tests/conftest.py` resets the redaction registry between tests.
+- `tests/test_windows_install.py`: interpreter/runtime selection, pip repair, source fingerprints, failed-candidate
+  cleanup, pointer publication, and preservation of user files. Subprocess boundaries are injected for offline tests.
+- `tests/test_windows_launchers.py`: native Windows CMD fallback, launch, and automatic repair with a stub backend;
+  skipped on other platforms. `tests/test_windows_security.py` exercises credential-protection failure paths and
+  performs a native DACL round trip on Windows.
+
+Windows installation starts at `install.cmd`, which prefers `install.ps1` and can invoke
+`scripts/windows_install.py` directly when PowerShell cannot run the script. The backend uses immutable environment
+directories and atomically publishes `.sia-python.path` only after validation. `Start-SIA.cmd` runs the backend's
+`--check` before launch and attempts repair once if needed. Avoid moving virtual environments, using activation as
+a prerequisite, or treating successful package installation alone as successful startup.
+
+`.github/workflows/windows.yml` runs the suite and real install/reinstall/launcher checks on native Windows with
+PowerShell 5.1/Python 3.11 and PowerShell 7/Python 3.14. It uses temporary source copies and makes no tenant calls.
+Local macOS runs skip Windows-only checks; a newly added workflow still needs a successful hosted run.
+`tests/windows_installer_smoke.ps1` exercises actual installer functions with offline mocks for downloads,
+signatures, process launches, WinGet, and Python discovery; it requires no Pester installation.
+
+`sia/windows_security.py` owns Win32 descriptor allocation and freeing, secure temporary-file creation, DACL changes,
+and inspection. `WindowsCredentialProtectionError.published` distinguishes a pre-save failure from a replaced
+destination whose final ACL could not be confirmed. Terminal messages must preserve that distinction.
 
 Code must stay Python 3.11-compatible (no 3.12-only f-string nesting, no PEP 695 syntax).
 
@@ -490,7 +568,7 @@ Code must stay Python 3.11-compatible (no 3.12-only f-string nesting, no PEP 695
 | Another Vault (Privilege Cloud accounts API) for the vault stage | a sibling of `pvwa.PVWAClient` with the same three methods; `reconcile._ensure_vault` is client-agnostic |
 | New API call or path family | `clients.py` (thin wrapper, `SIACapabilities`) + a fake method in `tests/fakes.py` |
 | New decision / status | `reconcile.py` + a case in `tests/test_resolve_reconcile.py`; add the status to `report.VERDICT_BY_STATUS` |
-| New configuration key | `config.Defaults` / section dataclass (+ `validate()`, `config.example.toml`, README table) |
+| New configuration key | Section dataclass + `validate()`, the `settings` descriptor/help registry, `config.example.toml`, tests and operator docs |
 | New connection-string flag | `connect.zsp_username` (+ `tests/test_connect.py`) |
 | Deleting objects | deliberately absent; if added, gate it behind ownership and an explicit flag |
 

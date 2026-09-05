@@ -3,20 +3,25 @@ import json
 import logging
 import time
 
-from sia.checkpoint import Checkpoint, fingerprint, is_done, row_key
+import pytest
+
+from sia.checkpoint import Checkpoint, CheckpointWriteError, fingerprint, is_done, row_key
 from sia.inputs import ServerRow, StrongAccountRow
 from sia.reconcile import Outcome, RunResult, ServerResult
-from sia.redact import MASK, RedactingFilter, redact, register_secret, secret_count
-from sia.report import exit_code, print_summary, print_verify, verdict_for, verify_rows, write_reports, write_verify_csv
+from sia.redact import MASK, RedactingFilter, redact, register_secret, sanitize, secret_count
+from sia.report import (ReportWriteError, exit_code, print_summary, print_verify, result_dict, verdict_for,
+                        verify_rows, write_reports, write_verify_csv)
 
 
 # ---------------------------------------------------------------- redact
-def test_redact_masks_longest_first_and_ignores_short_values():
-    register_secret("abc")          # too short to be a secret
+def test_redact_masks_longest_first_and_short_values_as_complete_tokens():
+    register_secret("abc")
+    register_secret("x")
     register_secret("abcdef")
     register_secret("abcdefghij")
-    assert secret_count() == 2
-    assert redact("x abcdefghij y abcdef z abc") == f"x {MASK} y {MASK} z abc"
+    assert secret_count() == 4
+    assert redact("x abcdefghij y abcdef z abc extra") == f"{MASK} {MASK} y {MASK} z {MASK} extra"
+    assert redact("extra example") == "extra example"  # short values do not destroy normal prose
     assert redact("") == "" and redact("nothing here") == "nothing here"
     assert redact("abcdefabcdef") == f"{MASK}{MASK}"
 
@@ -45,6 +50,15 @@ def test_logging_filter_redacts_message_and_args():
     finally:
         logger.removeHandler(handler)
     assert "hunter2-secret" not in stream.getvalue() and MASK in stream.getvalue()
+
+
+def test_sanitize_recurses_and_masks_sensitive_fields_and_bearer_tokens():
+    register_secret("known-value")
+    value = {"message": "known-value", "nested": [{"password": "unknown-value"}],
+             "header": "Authorization: Bearer not-registered", "secret_status": "exists"}
+    clean = sanitize(value)
+    assert clean["message"] == MASK and clean["nested"][0]["password"] == MASK
+    assert "not-registered" not in clean["header"] and clean["secret_status"] == "exists"
 
 
 # ---------------------------------------------------------------- report
@@ -86,6 +100,19 @@ def test_write_reports_thresholds(tmp_path):
     assert exit_code(result) == 1 and exit_code(result_with([("exists", "exists")])) == 0
 
 
+def test_reports_never_collide_and_wrap_local_io_failures(tmp_path):
+    result = result_with([("exists", "exists")])
+    first = write_reports(result, tmp_path / "reports")
+    second = write_reports(result, tmp_path / "reports")
+    assert first != second and all(path.exists() for path in (*first, *second))
+
+    not_a_directory = tmp_path / "blocked"
+    not_a_directory.write_text("file")
+    with pytest.raises(ReportWriteError) as caught:
+        write_reports(result, not_a_directory)
+    assert isinstance(caught.value, OSError) and caught.value.path == not_a_directory
+
+
 def test_verify_verdicts_and_outputs(tmp_path):
     result = result_with([("exists", "exists"), ("planned", "planned"), ("exists", "drift"), ("exists", "inactive"),
                           ("blocked", "blocked"), ("n/a", "created"), ("skipped", "skipped")])
@@ -104,6 +131,29 @@ def test_verify_verdicts_and_outputs(tmp_path):
     assert print_verify(result_with([("exists", "exists")] * 300), out, max_rows=10) == 0 and "PASS=300" in out.getvalue()
 
 
+def test_uncertain_and_unverified_are_failed_verdicts():
+    result = result_with([("uncertain", "exists"), ("exists", "unverified")])
+    assert [verdict_for(row)[0] for row in result.servers] == ["FAIL", "FAIL"]
+    diagnostics = result_dict(result)["diagnostics"]
+    assert [(item["code"], item["mutation_state"]) for item in diagnostics] == [
+        ("SIA-UNCERTAIN", "unknown"), ("SIA-UNVERIFIED", "unknown")]
+    assert diagnostics[0]["stage"] == "target sets" and diagnostics[0]["object_name"] == "s0.corp"
+    out = io.StringIO()
+    print_summary(result, out)
+    assert "Troubleshooting:" in out.getvalue() and "What to do next" in out.getvalue()
+
+
+def test_inactive_policy_help_does_not_call_the_policy_a_strong_account():
+    result = result_with([("exists", "inactive")])
+    diagnostic = result_dict(result)["diagnostics"][0]
+    assert diagnostic["stage"] == "policies"
+    assert "set-policy-status Active" in diagnostic["actions"][0]
+    assert "strong account" not in " ".join(diagnostic["actions"]).lower()
+
+    result.servers[0].policy.detail = "fields were updated but the existing suspended state was preserved"
+    assert result_dict(result)["diagnostics"][0]["mutation_state"] == "applied"
+
+
 # ------------------------------------------------------------ checkpoint
 def test_checkpoint_roundtrip_and_fingerprint(tmp_path):
     server = ServerRow(fqdn="a.corp", strong_account="SA", groups=("G",), policy_name=None, assign_groups=None, domain=None,
@@ -116,12 +166,27 @@ def test_checkpoint_roundtrip_and_fingerprint(tmp_path):
     assert fp != fingerprint(server, None, "a.corp") and fp != fingerprint(server, account, "other")
     cp = Checkpoint(tmp_path / "sub" / "cp.jsonl")
     assert len(cp) == 0 and cp.get(row_key("a.corp", "a.corp"), fp) is None
-    cp.record(row_key("a.corp", "a.corp"), fp, {"secret": "created", "target_set": "created", "policy": "failed"}, {"policy": None, "secret": "s1"})
+    cp.record(row_key("a.corp", "a.corp"), fp, {"secret": "created", "target_set": "created", "policy": "failed"},
+              {"policy": None, "secret": "s1", "target_set": "a.corp"})
     assert not is_done(cp.get(row_key("a.corp", "a.corp"), fp))
-    cp.record(row_key("a.corp", "a.corp"), fp, {"secret": "exists", "target_set": "exists", "policy": "created"}, {"policy": "p1"})
+    cp.record(row_key("a.corp", "a.corp"), fp, {"secret": "exists", "target_set": "exists", "policy": "created"},
+              {"policy": "p1", "secret": "s1", "target_set": "a.corp"})
     record = cp.get(row_key("a.corp", "a.corp"), fp)
-    assert is_done(record) and record["refs"] == {"policy": "p1"} and cp.done_count() == 1
+    assert is_done(record) and record["refs"] == {"policy": "p1", "secret": "s1", "target_set": "a.corp"} and cp.done_count() == 1
     assert cp.get(row_key("a.corp", "a.corp"), "other-fingerprint") is None
     (tmp_path / "sub" / "cp.jsonl").open("a").write("not json\n")
     fresh = Checkpoint(tmp_path / "sub" / "cp.jsonl")
     assert len(fresh) == 1 and is_done(fresh.get(row_key("a.corp", "a.corp"), fp))
+
+
+def test_checkpoint_write_error_retains_completed_object_evidence(tmp_path):
+    path = tmp_path / "checkpoint.jsonl"
+    path.mkdir()
+    checkpoint = Checkpoint(path)
+    with pytest.raises(CheckpointWriteError) as caught:
+        checkpoint.record("web01.corp|policy", "a" * 64,
+                          {"secret": "exists", "target_set": "created", "policy": "updated"},
+                          {"secret": "s1", "target_set": "web01.corp", "policy": "p1"})
+    exc = caught.value
+    assert exc.row_key == "web01.corp|policy" and exc.refs["policy"] == "p1"
+    assert exc.statuses["policy"] == "updated" and exc.mutation_state == "applied"

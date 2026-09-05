@@ -47,30 +47,43 @@ class PrincipalResolver:
     def _directory_labels(self, uuid: str | None) -> set[str]:
         labels: set[str] = set()
         for d in self.directories:
-            if pick(d, "directoryServiceUuid", "DirectoryServiceUuid") == uuid:
+            actual = pick(d, "directoryServiceUuid", "DirectoryServiceUuid")
+            if str(actual or "").casefold() == str(uuid or "").casefold():
                 for key in ("DisplayName", "Service", "Name", "DisplayNameShort"):
                     value = pick(d, key)
                     if value:
-                        labels.add(str(value).lower())
+                        labels.add(str(value).casefold())
         return labels
 
     def _matches_pin(self, row: dict[str, Any], pinned: str) -> bool:
-        wanted = pinned.strip().lower()
-        localized = str(pick(row, "ServiceInstanceLocalized", default="")).lower()
+        wanted = pinned.strip().casefold()
+        localized = str(pick(row, "ServiceInstanceLocalized", default="")).casefold()
         if localized == wanted:
             return True
         return wanted in self._directory_labels(pick(row, "DirectoryServiceUuid"))
 
     def resolve(self, group_name: str) -> dict[str, Any]:
-        if group_name in self._cache:
-            return self._cache[group_name]
+        cache_key = group_name.casefold()
+        if cache_key in self._cache:
+            return self._cache[cache_key]
         rows = self._identity.query_groups(group_name, self._directory_uuids())
-        wanted = group_name.lower()
-        exact = [r for r in rows if wanted in (str(pick(r, "SystemName", default="")).lower(),
-                                                str(pick(r, "DisplayName", default="")).lower())]
+        wanted = group_name.casefold()
+        exact = [r for r in rows if wanted in (str(pick(r, "SystemName", default="")).casefold(),
+                                                str(pick(r, "DisplayName", default="")).casefold())]
         pinned = self._pinned(group_name)
         if pinned:
             exact = [r for r in exact if self._matches_pin(r, pinned)]
+        # Identity can repeat the same object in search results.  Collapse
+        # those observations, while retaining distinct ids/directories so a
+        # real name collision remains an explicit ambiguity.
+        unique: dict[tuple[str, str], dict[str, Any]] = {}
+        for row in exact:
+            identity = (
+                str(pick(row, "InternalName", default="")).casefold(),
+                str(pick(row, "DirectoryServiceUuid", default="")).casefold(),
+            )
+            unique.setdefault(identity, row)
+        exact = list(unique.values())
         if not exact:
             near = sorted({f"{pick(r, 'SystemName') or pick(r, 'DisplayName')} ({pick(r, 'ServiceInstanceLocalized')})" for r in rows})
             hint = f"; similar names: {', '.join(near[:8])}" if near else ""
@@ -85,7 +98,7 @@ class PrincipalResolver:
         if missing:
             raise ResolveError(f"group {group_name!r}: Identity row lacks {', '.join(missing)}; cannot build a principal")
         principal = build_principal(row)
-        self._cache[group_name] = principal
+        self._cache[cache_key] = principal
         return principal
 
 
@@ -93,25 +106,37 @@ class SecretIndex:
     """In-memory index of SIA VM secrets (strong accounts) keyed by name, case-insensitively."""
 
     def __init__(self, secrets: list[dict[str, Any]]):
-        self._by_name: dict[str, dict[str, Any]] = {}
+        self._by_name: dict[str, list[dict[str, Any]]] = {}
         for secret in secrets:
             self.add(secret)
 
     def add(self, secret: dict[str, Any]) -> None:
         name = pick(secret, "secret_name", "secretName")
         if name:
-            self._by_name[str(name).lower()] = secret
+            key = str(name).casefold()
+            candidates = self._by_name.setdefault(key, [])
+            new_id = secret_id_of(secret)
+            if any((new_id and secret_id_of(existing) == new_id) or (not new_id and existing == secret)
+                   for existing in candidates):
+                return
+            candidates.append(secret)
 
     def find(self, account: StrongAccountRow) -> dict[str, Any] | None:
         """Deterministic: vault accounts by the platform's <account_name>_<safe> name, others by their CSV name."""
-        return self._by_name.get(account.sia_name.lower())
+        candidates = self._by_name.get(account.sia_name.casefold(), [])
+        if len(candidates) > 1:
+            ids = sorted(secret_id_of(secret) or "<missing>" for secret in candidates)
+            raise ResolveError(
+                f"strong account {account.sia_name!r} is ambiguous across object ids: {', '.join(ids)}")
+        return candidates[0] if candidates else None
 
     def __len__(self) -> int:
         return len(self._by_name)
 
 
 def secret_id_of(secret: dict[str, Any]) -> str:
-    return str(pick(secret, "secret_id", "secretId"))
+    value = pick(secret, "secret_id", "secretId", default="")
+    return str(value) if value is not None else ""
 
 
 def secret_type_of(secret: dict[str, Any]) -> str:

@@ -241,14 +241,14 @@ def test_preflight_target_sets_need_account_is_soft(workspace, capsys, monkeypat
     assert "per-account listing will be used" in capsys.readouterr().out
 
 
-def test_preflight_identity_rejection_hints_other_adapter(workspace, capsys, monkeypatch):
+def test_preflight_identity_rejection_explains_permission_and_context(workspace, capsys, monkeypatch):
     class Ident(FakeIdentity):
         def list_directories(self):
             raise SIAApiError("GET", "https://abc.id.cyberark.cloud/Core/GetDirectoryServices", 403, "denied")
     shared_context(monkeypatch, identity=Ident())
     assert run(workspace, "preflight") == 1
     out = capsys.readouterr().out
-    assert "Identity: FAILED" in out and 'try [auth] identity_auth = "service_user_oidc"' in out
+    assert "Identity: FAILED" in out and "SIA-PERMISSION" in out and "What to do next" in out
 
 
 def test_show_policy(workspace, capsys, monkeypatch):
@@ -293,7 +293,7 @@ def test_unexpected_errors_are_redacted(workspace, capsys, monkeypatch):
     monkeypatch.setattr(sia_onboard, "Context", Boom)
     assert run(workspace, "preflight") == 1
     err = capsys.readouterr().err
-    assert "unexpected error: RuntimeError" in err and "very-secret-token" not in err and "***" in err
+    assert "SIA-UNKNOWN" in err and "very-secret-token" not in err and "***" in err
 
 
 def test_real_context_requires_credentials(monkeypatch):
@@ -427,7 +427,8 @@ def test_apply_json_stdout_stays_parseable_without_yes(workspace, monkeypatch, c
     monkeypatch.setattr("builtins.input", lambda prompt="": "no")
     code = run(workspace, "apply", "--input", str(inp), "--server", "web09.corp.example.com", "--json", "--no-report")
     out = capsys.readouterr()
-    assert code == 2 and out.out == ""                       # aborted before applying; nothing printed to stdout
+    data = json.loads(out.out)
+    assert code == 2 and data["cancelled"] and data["diagnostics"][0]["mutation_state"] == "not_applied"
     assert "Type 'yes' to apply these changes:" in out.err and "Aborted; nothing changed." in out.err
     assert [c[0] for c in sia.calls if c[0] == "bulk_create_target_sets"] == []
 

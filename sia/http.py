@@ -4,9 +4,9 @@ Retry policy
   * 401           -> refresh the token once and retry (any method).
   * 429           -> retry with backoff (any method: the request was rejected, not processed). With a RateLimiter,
                      every worker pauses for the same interval.
-  * 5xx / network -> retry only for idempotent methods (GET/HEAD/OPTIONS/PUT/DELETE). A POST that failed this way
-                     is reported as *uncertain*: it may have been applied. The caller re-runs `plan`, which finds the
-                     object by name if it was created, instead of blindly re-posting.
+  * 5xx / network -> retry reads only (GET/HEAD/OPTIONS and explicitly marked read-only POST requests). A mutation is
+                     reported as *uncertain*: it may have reached the service before its response was lost. The caller
+                     re-runs `plan` to determine current state before trying another write.
 Bodies are never logged; error text is passed through the redactor.
 """
 from __future__ import annotations
@@ -18,23 +18,45 @@ from typing import Any, Callable, Iterable
 
 import requests
 
-from .redact import redact
+from .redact import redact, sanitize
 
 RETRY_STATUSES = frozenset({429, 500, 502, 503, 504})
-RETRY_SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS", "PUT", "DELETE"})
+RETRY_SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
+MUTATING_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 _MAX_ERROR_SNIPPET = 600
 UNCERTAIN_HINT = " -- the request may or may not have been applied; run `plan` to reconcile before retrying"
 
 
 class SIAApiError(Exception):
-    """An API call failed. `status` is 0 for network errors. `uncertain` means a non-idempotent request may have landed."""
+    """An API call failed. `status` is 0 for network errors; `uncertain` means a mutation may have landed."""
 
-    def __init__(self, method: str, url: str, status: int, body: str, *, uncertain: bool = False):
+    def __init__(self, method: str, url: str, status: int, body: str, *, uncertain: bool = False,
+                 cause: str | None = None, mutation_state: str | None = None):
         self.method, self.url, self.status, self.uncertain = method, url, status, uncertain
-        self.body = redact(body or "")
+        self.body = str(sanitize(body or ""))
+        self.cause = cause or self._cause_for(status, uncertain)
+        self.mutation_state = mutation_state
         snippet = " ".join(self.body.split())[:_MAX_ERROR_SNIPPET]
         label = f"HTTP {status}" if status else "no response"
-        super().__init__(redact(f"{method} {url} -> {label}: {snippet or '<empty body>'}{UNCERTAIN_HINT if uncertain else ''}"))
+        super().__init__(sanitize(f"{method} {url} -> {label}: {snippet or '<empty body>'}{UNCERTAIN_HINT if uncertain else ''}"))
+
+    @staticmethod
+    def _cause_for(status: int, uncertain: bool) -> str:
+        if uncertain:
+            return "uncertain_mutation"
+        if status == 0:
+            return "network"
+        if status == 401:
+            return "authentication"
+        if status == 403:
+            return "permission"
+        if status in (404, 405, 501):
+            return "unsupported_or_missing"
+        if status == 429:
+            return "rate_limited"
+        if status >= 500:
+            return "service"
+        return "api"
 
     @property
     def client_error(self) -> bool:
@@ -98,6 +120,7 @@ class HttpClient:
         sleep: Callable[[float], None] = time.sleep,
         limiter: RateLimiter | None = None,
         verify: str | bool = True,
+        cancel_check: Callable[[], None] | None = None,
     ):
         self._token_provider = token_provider
         self._timeout = timeout
@@ -108,6 +131,9 @@ class HttpClient:
         self._log = logger or logging.getLogger("sia.http")
         self._sleep = sleep
         self._limiter = limiter
+        # Public on purpose: a run-scoped reconciler can bind/unbind its stop
+        # check without rebuilding the clients that share this HTTP session.
+        self.cancel_check = cancel_check
 
     def request(
         self,
@@ -119,10 +145,16 @@ class HttpClient:
         data: Any = None,
         headers: dict[str, str] | None = None,
         expected: Iterable[int] = (200,),
+        mutation: bool | None = None,
+        cancel_check: Callable[[], None] | None = None,
     ) -> requests.Response:
         expected = set(expected)
         method = method.upper()
-        retry_safe = method in RETRY_SAFE_METHODS
+        is_mutation = method in MUTATING_METHODS if mutation is None else bool(mutation)
+        # A write whose response was lost must be reconciled before another
+        # attempt, even when the HTTP verb is nominally idempotent.  Explicit
+        # read-only POSTs (Identity queries) remain retryable.
+        retry_safe = (method in RETRY_SAFE_METHODS and not is_mutation) or mutation is False
         attempt = 0
         refreshed = False
         while True:
@@ -135,6 +167,13 @@ class HttpClient:
                 hdrs.update(headers)
             if self._limiter is not None:
                 self._limiter.acquire()
+            # The limiter may have blocked while another worker failed.  Make
+            # the final cancellation decision after that wait and immediately
+            # before a mutation can leave this process.  Caller exceptions are
+            # deliberately allowed through unchanged.
+            check = cancel_check if cancel_check is not None else self.cancel_check
+            if is_mutation and check is not None:
+                check()
             try:
                 resp = self._session.request(method, url, json=json, params=params, data=data, headers=hdrs,
                                              timeout=self._timeout)
@@ -147,7 +186,8 @@ class HttpClient:
                     attempt += 1
                     continue
                 raise SIAApiError(method, url, 0, f"network error: {exc.__class__.__name__}: {exc}",
-                                  uncertain=not retry_safe) from exc
+                                  uncertain=is_mutation,
+                                  mutation_state=None if is_mutation else "not_applicable") from exc
             self._log.debug("%s %s -> %s", method, resp.url, resp.status_code)
             if resp.status_code in expected:
                 return resp
@@ -167,7 +207,8 @@ class HttpClient:
                 attempt += 1
                 continue
             raise SIAApiError(method, url, resp.status_code, resp.text or "",
-                              uncertain=(not retry_safe and resp.status_code >= 500))
+                              uncertain=(is_mutation and resp.status_code >= 500),
+                              mutation_state=None if is_mutation else "not_applicable")
 
     @staticmethod
     def _backoff(attempt: int) -> float:
@@ -193,10 +234,14 @@ class HttpClient:
         return self.request("DELETE", url, **kw)
 
 
-def json_or_error(resp: requests.Response) -> Any:
+def json_or_error(resp: requests.Response, *, mutation: bool | None = None) -> Any:
     """Parse JSON, converting decode failures into SIAApiError so callers see the endpoint that misbehaved."""
     try:
         return resp.json()
     except ValueError as exc:
-        raise SIAApiError(resp.request.method or "?", resp.url, resp.status_code,
-                          f"response is not JSON: {exc}") from exc
+        method = (resp.request.method or "?").upper()
+        is_mutation = method in MUTATING_METHODS if mutation is None else bool(mutation)
+        raise SIAApiError(method, resp.url, resp.status_code, f"response is not JSON: {exc}",
+                          uncertain=is_mutation,
+                          cause="malformed_response",
+                          mutation_state="unknown" if is_mutation else "not_applicable") from exc

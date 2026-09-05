@@ -1,11 +1,18 @@
 .venv/
+.sia-runtime/
+.sia-python.path
 __pycache__/
 *.pyc
+*.egg-info/
+build/
+dist/
 
 # secrets — never commit
 .env
-config.toml
 *password*.csv
+
+# Local tenant configuration; the bundled starter lives in sia/config.toml.
+/config.toml
 
 # run artifacts
 reports/

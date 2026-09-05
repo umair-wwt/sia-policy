@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import copy
 import html
+import math
+from collections.abc import Mapping
 from typing import Any
 
 from .config import Defaults
@@ -19,6 +21,53 @@ APPROVED_CONDITION_KEYS = ("accessWindow", "maxSessionDuration", "idleTime", "ac
 # reporting Validating/Error/Warning back. Only these two are meaningful to ask for.
 POLICY_STATUSES = ("Active", "Suspended")
 APPROVED_RDP_KEYS = ("localEphemeralUser", "domainEphemeralUser")
+
+
+def _finite_number(value: Any) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+
+
+def _nonempty_string_list(value: Any) -> bool:
+    return isinstance(value, list) and all(isinstance(item, str) and item.strip() for item in value)
+
+
+def _rdp_profile_errors(profile: Mapping[str, Any], path: str) -> list[str]:
+    errors: list[str] = []
+    for key in ("assignGroups", "assignDomainGroups"):
+        if key in profile and not _nonempty_string_list(profile[key]):
+            errors.append(f"{path}.{key} must be a list of non-empty strings")
+    if ("enableEphemeralUserReconnect" in profile
+            and not isinstance(profile["enableEphemeralUserReconnect"], bool)):
+        errors.append(f"{path}.enableEphemeralUserReconnect must be a boolean")
+    return errors
+
+
+def _condition_errors(conditions: Mapping[str, Any]) -> list[str]:
+    errors: list[str] = []
+    window = conditions.get("accessWindow")
+    if "accessWindow" in conditions:
+        if not isinstance(window, Mapping):
+            errors.append("conditions.accessWindow must be an object")
+        else:
+            days = window.get("daysOfTheWeek")
+            if ("daysOfTheWeek" in window
+                    and (not isinstance(days, list)
+                         or any(not isinstance(day, int) or isinstance(day, bool) or day not in range(7)
+                                for day in days))):
+                errors.append("conditions.accessWindow.daysOfTheWeek must be a list of integers from 0 through 6")
+            for key in ("fromHour", "toHour"):
+                if key in window and not isinstance(window[key], str):
+                    errors.append(f"conditions.accessWindow.{key} must be a string")
+    for key in ("maxSessionDuration", "idleTime"):
+        if key in conditions and not _finite_number(conditions[key]):
+            errors.append(f"conditions.{key} must be a finite number")
+    if "accessApproval" in conditions and not isinstance(conditions["accessApproval"], Mapping):
+        errors.append("conditions.accessApproval must be an object")
+    return errors
+
+
+def _condition_is_safe(key: str, value: Any) -> bool:
+    return not _condition_errors({key: value})
 
 
 def split_fqdn(fqdn: str) -> tuple[str, str]:
@@ -211,21 +260,87 @@ def _default_behavior(server: ServerRow, defaults: Defaults) -> dict[str, Any]:
 
 
 def validate_template(template: dict[str, Any]) -> list[str]:
-    """Reasons a policy cannot serve as a template for generated Windows/RDP policies (empty list = OK)."""
+    """Reasons a policy cannot safely serve as a template (empty list = OK).
+
+    Tenant responses are external input.  Validate the shape of every subtree
+    that :func:`sanitize_template` copies so a malformed response becomes one
+    actionable template error instead of an ``AttributeError`` or a corrupt
+    create payload.
+    """
     errors: list[str] = []
-    entitlement = (template.get("metadata") or {}).get("policyEntitlement") or {}
-    if entitlement.get("targetCategory") != "VM":
-        errors.append(f"targetCategory is {entitlement.get('targetCategory')!r}, expected 'VM'")
-    if entitlement.get("locationType") != "FQDN/IP":
-        errors.append(f"locationType is {entitlement.get('locationType')!r}, expected 'FQDN/IP'")
-    connect_as = (template.get("behavior") or {}).get("connectAs") or {}
-    rdp = connect_as.get("rdp") or {}
-    has_rdp = any(key in rdp for key in APPROVED_RDP_KEYS)
-    has_ssh = bool((connect_as.get("ssh") or {}).get("username"))
+    if not isinstance(template, Mapping):
+        return ["template policy must be an object"]
+
+    metadata = template.get("metadata")
+    if not isinstance(metadata, Mapping):
+        errors.append("metadata must be an object")
+        metadata = {}
+    entitlement = metadata.get("policyEntitlement")
+    if not isinstance(entitlement, Mapping):
+        errors.append("metadata.policyEntitlement must be an object")
+    else:
+        if entitlement.get("targetCategory") != "VM":
+            errors.append(f"targetCategory is {entitlement.get('targetCategory')!r}, expected 'VM'")
+        if entitlement.get("locationType") != "FQDN/IP":
+            errors.append(f"locationType is {entitlement.get('locationType')!r}, expected 'FQDN/IP'")
+
+    time_zone = metadata.get("timeZone")
+    if "timeZone" in metadata and (not isinstance(time_zone, str) or not time_zone.strip()):
+        errors.append("metadata.timeZone must be a non-empty string")
+    tags = metadata.get("policyTags")
+    if "policyTags" in metadata and not _nonempty_string_list(tags):
+        errors.append("metadata.policyTags must be a list of non-empty strings")
+
+    behavior = template.get("behavior")
+    if not isinstance(behavior, Mapping):
+        errors.append("behavior must be an object")
+        behavior = {}
+    connect_as = behavior.get("connectAs")
+    if not isinstance(connect_as, Mapping):
+        errors.append("behavior.connectAs must be an object")
+        connect_as = {}
+
+    rdp = connect_as.get("rdp")
+    if rdp is not None and not isinstance(rdp, Mapping):
+        errors.append("behavior.connectAs.rdp must be an object")
+        rdp = {}
+    elif rdp is None:
+        rdp = {}
+    has_rdp = False
+    for key in APPROVED_RDP_KEYS:
+        if key not in rdp:
+            continue
+        if not isinstance(rdp[key], Mapping):
+            errors.append(f"behavior.connectAs.rdp.{key} must be an object")
+        else:
+            has_rdp = True
+            errors.extend(_rdp_profile_errors(rdp[key], f"behavior.connectAs.rdp.{key}"))
+
+    ssh = connect_as.get("ssh")
+    if ssh is not None and not isinstance(ssh, Mapping):
+        errors.append("behavior.connectAs.ssh must be an object")
+        ssh = {}
+    elif ssh is None:
+        ssh = {}
+    username = ssh.get("username")
+    has_ssh = isinstance(username, str) and bool(username.strip())
+    if username is not None and not has_ssh:
+        errors.append("behavior.connectAs.ssh.username must be a non-empty string")
     if not (has_rdp or has_ssh):
         errors.append("no connection profile (behavior.connectAs.rdp.localEphemeralUser/domainEphemeralUser or connectAs.ssh.username)")
-    if not template.get("conditions"):
+
+    conditions = template.get("conditions")
+    if conditions is not None and not isinstance(conditions, Mapping):
+        errors.append("conditions must be an object")
+    elif not conditions:
         errors.append("no conditions")
+    else:
+        errors.extend(_condition_errors(conditions))
+
+    delegation = template.get("delegationClassification")
+    if ("delegationClassification" in template
+            and (not isinstance(delegation, str) or not delegation.strip())):
+        errors.append("delegationClassification must be a non-empty string")
     return errors
 
 
@@ -233,24 +348,42 @@ def sanitize_template(template: dict[str, Any]) -> dict[str, Any]:
     """Copy only the approved fields of an existing policy: conditions, the RDP ephemeral-user profile, the SSH
     profile's username, timeZone, policyTags and delegationClassification. Names, ids, principals, targets and
     read-only metadata never carry over. build_policy() then uses the profile matching the row's protocol."""
-    meta = template.get("metadata") or {}
-    conditions = {k: copy.deepcopy(v) for k, v in (template.get("conditions") or {}).items() if k in APPROVED_CONDITION_KEYS}
-    connect_as = (template.get("behavior") or {}).get("connectAs") or {}
-    rdp = connect_as.get("rdp") or {}
+    source = template if isinstance(template, Mapping) else {}
+    raw_meta = source.get("metadata")
+    meta = raw_meta if isinstance(raw_meta, Mapping) else {}
+    raw_conditions = source.get("conditions")
+    conditions_source = raw_conditions if isinstance(raw_conditions, Mapping) else {}
+    conditions = {k: copy.deepcopy(v) for k, v in conditions_source.items()
+                  if k in APPROVED_CONDITION_KEYS and _condition_is_safe(k, v)}
+    raw_behavior = source.get("behavior")
+    behavior = raw_behavior if isinstance(raw_behavior, Mapping) else {}
+    raw_connect_as = behavior.get("connectAs")
+    connect_as = raw_connect_as if isinstance(raw_connect_as, Mapping) else {}
+    raw_rdp = connect_as.get("rdp")
+    rdp = raw_rdp if isinstance(raw_rdp, Mapping) else {}
     profiles: dict[str, Any] = {}
-    rdp_profile = {k: copy.deepcopy(v) for k, v in rdp.items() if k in APPROVED_RDP_KEYS}
+    rdp_profile = {
+        k: copy.deepcopy(dict(v)) for k, v in rdp.items()
+        if k in APPROVED_RDP_KEYS and isinstance(v, Mapping)
+        and not _rdp_profile_errors(v, f"behavior.connectAs.rdp.{k}")
+    }
     if rdp_profile:
         profiles["rdp"] = rdp_profile
-    ssh_username = (connect_as.get("ssh") or {}).get("username")
-    if ssh_username:
+    raw_ssh = connect_as.get("ssh")
+    ssh = raw_ssh if isinstance(raw_ssh, Mapping) else {}
+    ssh_username = ssh.get("username")
+    if isinstance(ssh_username, str) and ssh_username.strip():
         profiles["ssh"] = {"username": ssh_username}
     out: dict[str, Any] = {"metadata": {}, "conditions": conditions, "behavior": {"connectAs": profiles}}
-    if meta.get("timeZone"):
-        out["metadata"]["timeZone"] = meta["timeZone"]
-    if meta.get("policyTags"):
-        out["metadata"]["policyTags"] = list(meta["policyTags"])
-    if template.get("delegationClassification"):
-        out["delegationClassification"] = template["delegationClassification"]
+    time_zone = meta.get("timeZone")
+    if isinstance(time_zone, str) and time_zone.strip():
+        out["metadata"]["timeZone"] = time_zone
+    tags = meta.get("policyTags")
+    if isinstance(tags, list) and all(isinstance(tag, str) and tag.strip() for tag in tags):
+        out["metadata"]["policyTags"] = list(tags)
+    delegation = source.get("delegationClassification")
+    if isinstance(delegation, str) and delegation.strip():
+        out["delegationClassification"] = delegation
     return out
 
 
@@ -311,15 +444,19 @@ def build_policy(server: ServerRow, principals: list[dict[str, Any]], defaults: 
     }
 
 
-def build_policy_update(existing: dict[str, Any], desired: dict[str, Any]) -> dict[str, Any]:
+def build_policy_update(existing: dict[str, Any], desired: dict[str, Any], *, status: str | None = None) -> dict[str, Any]:
     """PUT /api/policies/{id} body: desired policy carrying the existing policyId.
 
-    The existing status is carried over rather than reset to defaults.policy_status: an operator who suspended a
-    policy in the portal should not have it silently re-activated by an unrelated principal or target fix.
+    The existing status is carried over rather than reset to defaults.policy_status. A caller may explicitly request
+    Active or Suspended with ``status``; this is the only way an update changes policy status.
     """
     meta = {**desired["metadata"], "policyId": existing["metadata"]["policyId"]}
     current = (existing.get("metadata") or {}).get("status")
-    if current:
+    if status is not None:
+        if status not in POLICY_STATUSES:
+            raise ValueError(f"policy status must be one of {', '.join(POLICY_STATUSES)}")
+        meta["status"] = {"status": status}
+    elif current:
         meta["status"] = {"status": current} if isinstance(current, str) else current
     return {**desired, "metadata": meta}
 
@@ -332,12 +469,32 @@ def policy_status(policy: dict[str, Any]) -> str:
     return str(status.get("status") or "").capitalize()
 
 
+def _normalized(value: Any, key: str = "") -> Any:
+    """Stable nested representation for API fields whose dictionary ordering is irrelevant."""
+    if isinstance(value, dict):
+        return tuple(sorted((str(name), _normalized(item, str(name))) for name, item in value.items()))
+    if isinstance(value, list):
+        items = tuple(_normalized(item) for item in value)
+        return tuple(sorted(set(items), key=repr)) if key in ("assignGroups", "daysOfTheWeek") else items
+    return value
+
+
 def policy_signature(policy: dict[str, Any]) -> dict[str, Any]:
-    """Normalized view used for drift detection (principals + FQDN targets). Keys absent from a partial policy
-    object (the list endpoint omits targets) are reported as None so callers can skip the comparison."""
+    """Normalized view of every policy field this tool writes.
+
+    Missing top-level fields are ``None`` so a list endpoint's partial object is never mistaken for drift. Callers
+    performing a full ``--drift`` comparison fetch the complete object first.
+    """
+    meta = policy.get("metadata") or {}
     principals = None
+    principal_details = None
     if policy.get("principals") is not None:
-        principals = sorted(str(p.get("id")) for p in policy.get("principals") or [])
+        principal_details = sorted(
+            (str(p.get("id") or ""), str(p.get("type") or ""), str(p.get("sourceDirectoryId") or ""),
+             str(p.get("sourceDirectoryName") or ""))
+            for p in policy.get("principals") or []
+        )
+        principals = [item[0] for item in principal_details]
     rules_block = (policy.get("targets") or {}).get("FQDN/IP") if policy.get("targets") is not None else None
     normalized_rules = None
     if rules_block is not None:
@@ -346,7 +503,34 @@ def policy_signature(policy: dict[str, Any]) -> dict[str, Any]:
             (str(r.get("operator", "")).upper(), str(r.get("computernamePattern", "")).lower(), str(r.get("domain") or "").lower())
             for r in rules
         )
-    return {"principals": principals, "fqdn_rules": normalized_rules}
+    return {
+        "name": html.unescape(str(meta.get("name") or "")) if "name" in meta else None,
+        "description": str(meta.get("description") or "") if "description" in meta else None,
+        "time_frame": _normalized(meta.get("timeFrame")) if "timeFrame" in meta else None,
+        "entitlement": _normalized(meta.get("policyEntitlement")) if "policyEntitlement" in meta else None,
+        "tags": tuple(sorted(str(tag) for tag in (meta.get("policyTags") or []))) if "policyTags" in meta else None,
+        "time_zone": str(meta.get("timeZone") or "") if "timeZone" in meta else None,
+        "principals": principals,
+        "principal_details": principal_details,
+        "delegation": str(policy.get("delegationClassification") or "") if "delegationClassification" in policy else None,
+        "conditions": _normalized(policy.get("conditions")) if "conditions" in policy else None,
+        "fqdn_rules": normalized_rules,
+        "behavior": _normalized(policy.get("behavior")) if "behavior" in policy else None,
+    }
+
+
+def target_set_signature(target_set: dict[str, Any]) -> dict[str, Any]:
+    """Normalized view of every target-set field this tool writes, tolerant of API key casing."""
+    cert = target_set.get("enable_certificate_validation", target_set.get("enableCertificateValidation", False))
+    provision = target_set.get("provision_format", target_set.get("provisionFormat", ""))
+    return {
+        "type": str(target_set.get("type") or "Target"),
+        "secret_type": str(target_set.get("secret_type") or target_set.get("secretType") or ""),
+        "secret_id": str(target_set.get("secret_id") or target_set.get("secretId") or ""),
+        "description": str(target_set.get("description") or ""),
+        "certificate_validation": bool(cert),
+        "provision_format": str(provision or ""),
+    }
 
 
 def exact_fqdns(policy: dict[str, Any]) -> list[str]:

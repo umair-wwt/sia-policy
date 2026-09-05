@@ -141,10 +141,11 @@ def test_post_retries_on_429_only():
     assert len(session.requests) == 2
 
 
-def test_put_is_retried_on_5xx():
+def test_put_is_not_retried_on_5xx_and_is_reported_uncertain():
     client, session = http_with([FakeResponse(500, "boom"), FakeResponse(200, {})])
-    client.put("https://x/api/targetsets/a.corp", json={})
-    assert len(session.requests) == 2
+    with pytest.raises(SIAApiError) as exc:
+        client.put("https://x/api/targetsets/a.corp", json={})
+    assert exc.value.uncertain and len(session.requests) == 1
 
 
 def test_http_refreshes_token_once_on_401():
@@ -234,8 +235,9 @@ def test_sia_client_paginates_target_sets_and_parses_shapes():
     assert session.requests[2][2]["params"] == {"secret_type": "ProvisionerUser,PCloudAccount"}
     assert sia.create_secret({"secret_name": "x"})["secret_id"] == "s2"
     assert session.requests[3][:2] == ("POST", "https://acme.dpa.cyberark.cloud/api/secrets")
-    assert sia.bulk_create_target_sets([{"strong_account_id": "s2", "target_sets": []}])[0]["success"] is True
-    assert session.requests[4][2]["json"] == {"target_sets_mapping": [{"strong_account_id": "s2", "target_sets": []}]}
+    mapping = [{"strong_account_id": "s2", "target_sets": [{"name": "c.corp"}]}]
+    assert sia.bulk_create_target_sets(mapping)[0]["success"] is True
+    assert session.requests[4][2]["json"] == {"target_sets_mapping": mapping}
     assert sia.get_settings()["self_hosted_pam"]["tenant_type"] == "SELF_HOSTED"
     sia.update_target_set("a.corp", {"secret_id": "s2"})
     assert session.requests[6][:2] == ("PUT", "https://acme.dpa.cyberark.cloud/api/targetsets/a.corp")
@@ -268,40 +270,53 @@ def test_probe_falls_back_to_legacy_and_propagates_real_errors():
 
 
 def test_public_secrets_v2_pagination_then_v1_fallback():
-    client, session = http_with([FakeResponse(200, {"secrets": [{"secret_name": "a"}], "b64_last_evaluated_key": "k"}),
-                                 FakeResponse(200, {"secrets": [{"secret_name": "b"}]})])
+    client, session = http_with([FakeResponse(200, {"secrets": [{"secret_id": "s1", "secret_name": "a"}], "b64_last_evaluated_key": "k"}),
+                                 FakeResponse(200, {"secrets": [{"secret_id": "s2", "secret_name": "b"}]})])
     sia = SIAClient(client, "https://x", secrets_api="public", targetsets_api="legacy")
     assert [s["secret_name"] for s in sia.list_secrets()] == ["a", "b"]
     assert session.requests[0][1] == "https://x/api/secrets/public/v2" and session.requests[1][2]["params"]["b64StartKey"] == "k"
-    client, session = http_with([FakeResponse(400, "v2 not here"), FakeResponse(200, [{"secret_name": "x"}] * 500),
-                                 FakeResponse(200, [{"secret_name": "y"}])])
+    client, session = http_with([FakeResponse(404, "v2 not here"),
+                                 FakeResponse(200, [{"secret_id": f"s{i}", "secret_name": "x"} for i in range(500)]),
+                                 FakeResponse(200, [{"secret_id": "last", "secret_name": "y"}])])
     sia = SIAClient(client, "https://x", secrets_api="public", targetsets_api="legacy")
     assert len(sia.list_secrets()) == 501
     assert session.requests[1][1] == "https://x/api/secrets/public/v1"
     assert session.requests[1][2]["params"]["count"] == "500" and session.requests[2][2]["params"]["offset"] == "500"
 
+    client, session = http_with([FakeResponse(400, "invalid filter")])
+    with pytest.raises(SIAApiError) as exc:
+        SIAClient(client, "https://x", secrets_api="public", targetsets_api="legacy").list_secrets()
+    assert exc.value.status == 400 and len(session.requests) == 1
+
 
 def test_find_secret_filters_by_name():
-    client, session = http_with([FakeResponse(200, {"secrets": [{"secret_name": "ADM-web01"}, {"secret_name": "ADM-web010"}]})])
+    client, session = http_with([FakeResponse(200, {"secrets": [
+        {"secret_id": "s1", "secret_name": "ADM-web01"},
+        {"secret_id": "s2", "secret_name": "ADM-web010"},
+    ]})])
     sia = SIAClient(client, "https://x", secrets_api="public", targetsets_api="legacy")
     assert sia.find_secret("adm-web01")["secret_name"] == "ADM-web01"
     assert session.requests[0][2]["params"]["secret_name"] == "adm-web01"
-    client, session = http_with([FakeResponse(200, [{"secret_name": "A"}, {"secret_name": "B"}])])
+    client, session = http_with([FakeResponse(200, [
+        {"secret_id": "s1", "secret_name": "A"}, {"secret_id": "s2", "secret_name": "B"},
+    ])])
     sia = SIAClient(client, "https://x", secrets_api="legacy", targetsets_api="legacy")
     assert sia.find_secret("b")["secret_name"] == "B"
     assert "secret_name" not in session.requests[0][2]["params"]
 
 
-def test_create_secret_public_falls_back_to_legacy_on_404():
+def test_create_secret_does_not_fall_back_after_a_rejected_write():
     client, session = http_with([FakeResponse(404, "no route"), FakeResponse(201, {"secret_id": "s1"})])
     sia = SIAClient(client, "https://x", secrets_api="public", targetsets_api="legacy")
-    assert sia.create_secret({"a": 1})["secret_id"] == "s1" and sia.capabilities.secrets_api == "legacy"
-    assert session.requests[0][1] == "https://x/api/secrets/public/v1" and session.requests[1][1] == "https://x/api/secrets"
+    with pytest.raises(SIAApiError) as exc:
+        sia.create_secret({"a": 1})
+    assert exc.value.status == 404 and len(session.requests) == 1
+    assert session.requests[0][1] == "https://x/api/secrets/public/v1"
 
 
 def test_target_sets_per_account_and_discovery_paths():
     client, session = http_with([FakeResponse(200, {"target_sets": [{"name": "a.corp", "secret_id": "s1"}, {"name": "b.corp", "secret_id": "s1"}]}),
-                                 FakeResponse(207, {"results": []}), FakeResponse(200, {}),
+                                 FakeResponse(207, {"results": []}), FakeResponse(200, {"name": "a.corp"}),
                                  FakeResponse(400, {"message": "strong_account_id must be provided"})])
     sia = SIAClient(client, "https://x", secrets_api="legacy", targetsets_api="discovery")
     assert [t["name"] for t in sia.list_target_sets(strong_account_id="s1", name="A.CORP")] == ["a.corp"]
@@ -348,8 +363,23 @@ def test_uap_client_pagination_find_create():
 
 def test_uap_create_without_policy_id_is_error():
     client, _ = http_with([FakeResponse(200, {"something": "else"})])
-    with pytest.raises(SIAApiError, match="no policyId"):
+    with pytest.raises(SIAApiError, match="no policyId") as exc:
         UAPClient(client, "https://u").create_policy({})
+    assert exc.value.uncertain and exc.value.cause == "malformed_response"
+
+
+def test_malformed_successful_mutation_response_is_uncertain():
+    client, session = http_with([FakeResponse(200, "not-json")])
+    with pytest.raises(SIAApiError) as exc:
+        SIAClient(client, "https://x", secrets_api="legacy", targetsets_api="legacy").create_secret({})
+    assert exc.value.uncertain and exc.value.cause == "malformed_response"
+    assert session.requests[0][0] == "POST"
+
+    client, _ = http_with([FakeResponse(207, {"unexpected": []})])
+    sia = SIAClient(client, "https://x", secrets_api="legacy", targetsets_api="legacy")
+    with pytest.raises(SIAApiError) as exc:
+        sia.bulk_create_target_sets([{"strong_account_id": "s1", "target_sets": [{"name": "a"}]}])
+    assert exc.value.uncertain and exc.value.cause == "malformed_response"
 
 
 def test_identity_client_uses_get_for_directories_and_post_for_query():

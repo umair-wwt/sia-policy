@@ -14,6 +14,7 @@ from __future__ import annotations
 import base64
 import json
 import logging
+import math
 import threading
 import time
 from typing import Any
@@ -33,9 +34,13 @@ _HEADERS = {"Accept": "application/json", "X-IDAP-NATIVE-CLIENT": "true"}
 
 
 class AuthError(Exception):
-    """Authentication failed. The message never contains the client secret or a token."""
+    """Authentication failed without exposing a response that may echo credentials."""
 
-    def __init__(self, message: str):
+    def __init__(self, message: str, *, status: int = 0, operation: str = "authentication",
+                 cause: BaseException | None = None):
+        self.status = int(status or 0)
+        self.operation = operation
+        self.cause = cause
         super().__init__(redact(message))
 
 
@@ -44,13 +49,10 @@ def jwt_claims(token: str) -> dict[str, Any]:
     try:
         payload = token.split(".")[1]
         payload += "=" * (-len(payload) % 4)
-        return json.loads(base64.urlsafe_b64decode(payload.encode("ascii")))
+        decoded = json.loads(base64.urlsafe_b64decode(payload.encode("ascii")))
+        return decoded if isinstance(decoded, dict) else {}
     except (IndexError, ValueError, UnicodeDecodeError):
         return {}
-
-
-def _snippet(resp: requests.Response) -> str:
-    return " ".join((resp.text or "").split())[:300] or "<empty>"
 
 
 class _CachingTokenProvider:
@@ -60,7 +62,7 @@ class _CachingTokenProvider:
                  session: requests.Session | None = None, logger: logging.Logger | None = None, clock=time.time,
                  verify: str | bool = True):
         if not client_id or not client_secret:
-            raise AuthError("SIA_CLIENT_ID and SIA_CLIENT_SECRET must be set")
+            raise AuthError("SIA_CLIENT_ID and SIA_CLIENT_SECRET must be set", operation="credential loading")
         register_secret(client_secret)
         self._identity_url = identity_url.rstrip("/")
         self._client_id = client_id
@@ -97,11 +99,26 @@ class _CachingTokenProvider:
 
     def _expiry(self, token: str, lifetime: Any) -> float:
         exp_claim = jwt_claims(token).get("exp")
-        if isinstance(lifetime, (int, float)) and lifetime > 0:
+        if isinstance(lifetime, (int, float)) and not isinstance(lifetime, bool) and math.isfinite(lifetime) and lifetime > 0:
             return self._clock() + float(lifetime)
-        if isinstance(exp_claim, (int, float)):
+        if isinstance(exp_claim, (int, float)) and not isinstance(exp_claim, bool) and math.isfinite(exp_claim):
             return float(exp_claim)
         return self._clock() + _DEFAULT_LIFETIME_SECONDS
+
+    @staticmethod
+    def _token_payload(body: Any, *, status: int, operation: str) -> tuple[str, Any]:
+        if not isinstance(body, dict):
+            raise AuthError(f"{operation} must be a JSON object", status=status, operation=operation)
+        token = body.get("access_token")
+        if not isinstance(token, str) or not token.strip():
+            raise AuthError(f"{operation} has no usable access_token", status=status, operation=operation)
+        lifetime = body.get("expires_in")
+        if lifetime is not None and not (
+            isinstance(lifetime, (int, float)) and not isinstance(lifetime, bool)
+            and math.isfinite(lifetime) and lifetime > 0
+        ):
+            raise AuthError(f"{operation} has an invalid expires_in value", status=status, operation=operation)
+        return token, lifetime
 
     def _fetch(self) -> tuple[str, float]:  # pragma: no cover - abstract
         raise NotImplementedError
@@ -120,18 +137,20 @@ class PlatformTokenProvider(_CachingTokenProvider):
                                                  "client_secret": self._client_secret},
                                       headers=dict(_HEADERS), timeout=self._timeout)
         except requests.RequestException as exc:
-            raise AuthError(f"could not reach {url}: {exc.__class__.__name__}: {exc}") from exc
+            raise AuthError(f"could not reach {url}: {exc.__class__.__name__}: {exc}",
+                            operation="platform token request", cause=exc) from exc
         if resp.status_code != 200:
-            raise AuthError(f"platform token request failed (HTTP {resp.status_code}): {_snippet(resp)}. Check identity_url, "
-                            "the service user's 'Is OAuth confidential client' flag, and its password/role.")
+            raise AuthError(f"platform token request failed (HTTP {resp.status_code}): *** response suppressed because "
+                            "authentication responses may contain credentials. Check identity_url, the service user's "
+                            "'Is OAuth confidential client' flag, and its password/role.", status=resp.status_code,
+                            operation="platform token request")
         try:
             payload = resp.json()
         except ValueError as exc:
-            raise AuthError("platform token response is not JSON") from exc
-        token = payload.get("access_token")
-        if not token:
-            raise AuthError(f"platform token response has no access_token (keys: {sorted(payload)})")
-        return token, self._expiry(token, payload.get("expires_in"))
+            raise AuthError("platform token response is not JSON", status=resp.status_code,
+                            operation="platform token response", cause=exc) from exc
+        token, lifetime = self._token_payload(payload, status=resp.status_code, operation="platform token response")
+        return token, self._expiry(token, lifetime)
 
 
 class ServiceUserOIDCTokenProvider(_CachingTokenProvider):
@@ -151,15 +170,19 @@ class ServiceUserOIDCTokenProvider(_CachingTokenProvider):
                                       data={"grant_type": "client_credentials", "scope": "api"},
                                       headers=dict(_HEADERS), timeout=self._timeout)
         except requests.RequestException as exc:
-            raise AuthError(f"could not reach {token_url}: {exc.__class__.__name__}: {exc}") from exc
+            raise AuthError(f"could not reach {token_url}: {exc.__class__.__name__}: {exc}",
+                            operation="service-user token request", cause=exc) from exc
         if resp.status_code != 200:
-            raise AuthError(f"service-user token request failed (HTTP {resp.status_code}): {_snippet(resp)}")
+            raise AuthError(f"service-user token request failed (HTTP {resp.status_code}): *** response suppressed because "
+                            "authentication responses may contain credentials", status=resp.status_code,
+                            operation="service-user token request")
         try:
-            access_token = resp.json().get("access_token")
+            payload = resp.json()
         except ValueError as exc:
-            raise AuthError("service-user token response is not JSON") from exc
-        if not access_token:
-            raise AuthError("service-user token response has no access_token")
+            raise AuthError("service-user token response is not JSON", status=resp.status_code,
+                            operation="service-user token response", cause=exc) from exc
+        access_token, _ = self._token_payload(payload, status=resp.status_code,
+                                              operation="service-user token response")
         register_secret(access_token)
 
         authorize_url = f"{self._identity_url}/OAuth2/Authorize/{self._app}"
@@ -169,14 +192,18 @@ class ServiceUserOIDCTokenProvider(_CachingTokenProvider):
             resp = self._session.get(authorize_url, headers={"Authorization": f"Bearer {access_token}", **_HEADERS},
                                      params=params, allow_redirects=False, timeout=self._timeout)
         except requests.RequestException as exc:
-            raise AuthError(f"could not reach {authorize_url}: {exc.__class__.__name__}: {exc}") from exc
+            raise AuthError(f"could not reach {authorize_url}: {exc.__class__.__name__}: {exc}",
+                            operation="service-user authorization", cause=exc) from exc
         location = resp.headers.get("Location", "")
-        if resp.status_code != 302 or not location:
-            raise AuthError(f"service-user authorization failed (HTTP {resp.status_code}): {_snippet(resp)}")
+        if resp.status_code != 302 or not isinstance(location, str) or not location:
+            raise AuthError(f"service-user authorization failed (HTTP {resp.status_code}): *** response suppressed because "
+                            "authentication responses may contain credentials", status=resp.status_code,
+                            operation="service-user authorization")
         parts = urlsplit(location)
         id_token = (parse_qs(parts.fragment).get("id_token") or parse_qs(parts.query).get("id_token") or [None])[0]
-        if not id_token:
-            raise AuthError("service-user authorization redirect carries no id_token")
+        if not isinstance(id_token, str) or not id_token.strip():
+            raise AuthError("service-user authorization redirect carries no id_token", status=resp.status_code,
+                            operation="service-user authorization")
         return id_token, self._expiry(id_token, None)
 
 
@@ -190,4 +217,4 @@ def make_identity_token_provider(method: str, platform_provider: PlatformTokenPr
     if method == "service_user_oidc":
         return ServiceUserOIDCTokenProvider(identity_url, client_id, client_secret, application=application,
                                             timeout=timeout, session=session, verify=verify)
-    raise AuthError(f"unknown identity_auth method {method!r}")
+    raise AuthError(f"unknown identity_auth method {method!r}", operation="identity authentication selection")

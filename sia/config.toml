@@ -1,0 +1,51 @@
+# Your project settings. Edit this file or open Settings from the `sia` home screen.
+# Start by filling in the two tenant values below, then review the access defaults.
+# Keep passwords and client secrets in .env, never in this file.
+# config.example.toml documents every advanced option.
+
+[tenant]
+# Tenant name only: the part before .cyberark.cloud in your platform address.
+subdomain = ""
+# Your Identity tenant's https:// address, without a trailing slash.
+identity_url = ""
+
+[defaults]
+# New policies start Active. Existing policy status changes require an explicit action.
+policy_status = "Active"
+policy_name_template = "{fqdn}"
+
+# Review your organization's allowed access window. GMT is UTC (no daylight saving).
+time_zone = "GMT"
+days_of_week = [0, 1, 2, 3, 4, 5, 6]   # Sunday = 0; Saturday = 6
+from_hour = ""                         # Empty start and end = all day
+to_hour = ""                           # Otherwise use 24-hour times such as "17:00"
+
+# Require a trusted certificate on Windows targets using WinRM over HTTPS.
+target_set_cert_validation = true
+max_session_hours = 2
+idle_minutes = 10
+assign_local_groups = ["Administrators"]
+enable_reconnect = false
+
+# Leave blank when server/group/account mappings are provided in the input CSV files.
+group_template = ""
+strong_account_template = ""
+strong_account_type = "existing"
+target_set_scope = "server"
+
+[auth]
+identity_auth = "platform_token"
+password_file = ""    # Optional password CSV kept outside this repository
+
+[http]
+timeout_seconds = 60
+verify = true
+ca_bundle = ""        # Optional trusted proxy CA file, relative to this config file
+
+[connect]
+login_suffix = ""     # Empty = derive from the service user's login
+gateway_host = ""     # Empty = derive from your tenant name
+network = ""          # Optional connector network name
+
+[pvwa]
+base_url = ""         # Empty = do not onboard accounts into PAM Self-Hosted

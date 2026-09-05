@@ -2,19 +2,28 @@
 from __future__ import annotations
 
 import csv
+import ipaddress
+import json
 import logging
+import math
 import os
 import re
 import stat
+import string
 import tomllib
-from dataclasses import dataclass, field, fields
+from dataclasses import dataclass, field, fields, replace
 from pathlib import Path
-from typing import Any
+from types import UnionType
+from typing import Any, Mapping, Union, get_args, get_origin, get_type_hints
+from urllib.parse import urlsplit
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .redact import register_secret
+from .windows_security import inspect_credential_permissions, windows_acl_supported
 
 HOUR_RE = re.compile(r"^(?:[01]\d|2[0-3]):[0-5]\d$")
-SUBDOMAIN_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
+FQDN_LABEL = r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
+SUBDOMAIN_RE = re.compile(rf"^{FQDN_LABEL}$")
 TAG_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
 IDENTITY_AUTH_METHODS = ("platform_token", "service_user_oidc")
 STRONG_ACCOUNT_TYPES = ("existing", "vault", "credentials")
@@ -30,6 +39,27 @@ REQUIRED_DEFAULT_KEYS = ("days_of_week", "from_hour", "to_hour", "target_set_cer
 
 class ConfigError(Exception):
     """Raised for invalid or missing configuration."""
+
+
+@dataclass(frozen=True)
+class ValidationIssue:
+    """One actionable configuration problem and the settings that can repair it."""
+
+    keys: tuple[tuple[str, str], ...]
+    message: str
+    code: str = "invalid"
+
+    @property
+    def dotted_keys(self) -> tuple[str, ...]:
+        return tuple(f"{section}.{key}" for section, key in self.keys)
+
+
+class ConfigValidationError(ConfigError):
+    """A complete set of configuration validation problems."""
+
+    def __init__(self, issues: tuple[ValidationIssue, ...] | list[ValidationIssue]):
+        self.issues = tuple(issues)
+        super().__init__("\n".join(issue.message for issue in self.issues))
 
 
 @dataclass(frozen=True)
@@ -173,15 +203,21 @@ SECTIONS = ("tenant", "defaults", "auth", "http", "connect", "pvwa")
 
 
 def _build(cls, section: dict[str, Any], name: str):
-    """Instantiate a frozen dataclass from a TOML table, rejecting unknown keys and coercing lists to tuples."""
+    """Instantiate a frozen dataclass while rejecting unknown keys and incorrect TOML types."""
     known = {f.name: f for f in fields(cls)}
     unknown = sorted(set(section) - set(known))
     if unknown:
         raise ConfigError(f"[{name}] has unknown key(s): {', '.join(unknown)}")
-    kwargs = {}
+    hints = get_type_hints(cls)
+    kwargs: dict[str, Any] = {}
     for key, value in section.items():
         if isinstance(value, list):
             value = tuple(value)
+        expected = hints[key]
+        if not _matches_type(value, expected):
+            raise ConfigError(
+                f"[{name}] {key} must be {_type_name(expected)}, got {_value_type_name(value)}"
+            )
         kwargs[key] = value
     try:
         return cls(**kwargs)
@@ -189,117 +225,390 @@ def _build(cls, section: dict[str, Any], name: str):
         raise ConfigError(f"[{name}] is invalid: {exc}") from exc
 
 
+def _matches_type(value: Any, expected: Any) -> bool:
+    """Strict runtime check for the small type vocabulary used by the config dataclasses."""
+    origin = get_origin(expected)
+    if origin is tuple:
+        args = get_args(expected)
+        item_type = args[0] if args else Any
+        return isinstance(value, tuple) and all(_matches_type(item, item_type) for item in value)
+    if origin in (UnionType, Union):
+        return any(_matches_type(value, option) for option in get_args(expected))
+    if expected is Any:
+        return True
+    if expected is bool:
+        return type(value) is bool
+    if expected is int:
+        return type(value) is int
+    if expected is float:
+        return type(value) in (int, float)
+    return type(value) is expected
+
+
+def _type_name(expected: Any) -> str:
+    origin = get_origin(expected)
+    if origin is tuple:
+        item = get_args(expected)[0]
+        item_name = {str: "strings", int: "integers", float: "numbers"}.get(item, "values")
+        return f"a list of {item_name}"
+    if expected is str:
+        return "a string"
+    if expected is bool:
+        return "a boolean (true or false, without quotes)"
+    if expected is int:
+        return "an integer"
+    if expected is float:
+        return "a number"
+    return getattr(expected, "__name__", str(expected))
+
+
+def _value_type_name(value: Any) -> str:
+    if isinstance(value, tuple):
+        return "a list with invalid item types"
+    return {str: "a string", bool: "a boolean", int: "an integer", float: "a number"}.get(
+        type(value), type(value).__name__
+    )
+
+
 def _check_template(label: str, template: str, placeholders: tuple[str, ...] = TEMPLATE_PLACEHOLDERS) -> None:
-    # longest first: {hostname_upper} must not be read as {hostname} followed by stray text
-    alternatives = "|".join(sorted(placeholders, key=len, reverse=True))
-    if re.sub(r"\{(" + alternatives + r")\}", "", template).count("{"):
+    try:
+        parsed = list(string.Formatter().parse(template))
+    except ValueError as exc:
+        raise ConfigError(f"[defaults] {label} is not a valid template: {exc}") from exc
+    invalid = [field_name for _, field_name, _, _ in parsed
+               if field_name is not None and field_name not in placeholders]
+    if invalid:
         allowed = ", ".join("{" + p + "}" for p in placeholders)
         raise ConfigError(f"[defaults] {label} may only use {allowed}")
+    if any(conversion for _, field_name, _, conversion in parsed if field_name is not None):
+        raise ConfigError(f"[defaults] {label} must not use template conversions such as !r or !s")
+    if any(format_spec for _, field_name, format_spec, _ in parsed if field_name is not None):
+        raise ConfigError(f"[defaults] {label} must not use template format specifications")
+
+
+def suggest_https_base_url(value: str) -> str | None:
+    """Return a conservative base-URL correction that keeps the supplied host and port.
+
+    This only fixes syntax operators commonly paste incorrectly: a missing/HTTP scheme and a
+    path, query, fragment, or trailing slash. Credentials, malformed ports, whitespace and
+    invalid hosts are never repaired automatically.
+    """
+    if not isinstance(value, str):
+        return None
+    raw = value.strip()
+    if not raw or raw != value or any(not char.isprintable() or char.isspace() for char in raw):
+        return None
+    if "://" in raw:
+        scheme = raw.split("://", 1)[0].lower()
+        if scheme not in ("http", "https"):
+            return None
+        candidate = raw
+    else:
+        if raw.startswith("//"):
+            return None
+        candidate = f"https://{raw}"
+    try:
+        parsed = urlsplit(candidate)
+        hostname = parsed.hostname
+        port = parsed.port
+    except ValueError:
+        return None
+    if not hostname or parsed.username is not None or parsed.password is not None:
+        return None
+    if port is not None and port < 1:
+        return None
+    host = hostname.lower()
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        if not _valid_dns_name(host):
+            return None
+        authority = host
+    else:
+        authority = f"[{host}]" if ip.version == 6 else host
+    if port is not None:
+        authority += f":{port}"
+    return f"https://{authority}"
+
+
+def _validate_https_url(label: str, value: str, *, allow_empty: bool = False) -> None:
+    if not value and allow_empty:
+        return
+    if any(not char.isprintable() or char.isspace() for char in value):
+        raise ConfigError(f"{label} must not contain whitespace or control characters")
+    try:
+        parsed = urlsplit(value)
+        parsed.port
+    except ValueError as exc:
+        raise ConfigError(f"{label} is not a valid URL: {exc}") from exc
+    suggestion = suggest_https_base_url(value)
+    if suggestion != value or parsed.path or parsed.query or parsed.fragment or any(
+            delimiter in value.partition("://")[2] for delimiter in ("?", "#")):
+        raise ConfigError(f"{label} must be an https:// URL with a host and no path, query, fragment, credentials, or trailing slash")
+
+
+def _valid_dns_name(value: str) -> bool:
+    """ASCII DNS host/domain without a trailing dot, whitespace, controls, or empty labels."""
+    return (bool(value) and len(value) <= 253 and value == value.lower() and not value.endswith(".")
+            and all(re.fullmatch(FQDN_LABEL, label) for label in value.split(".")))
+
+
+def validate_dns_name(label: str, value: str) -> str:
+    """Validate a bare DNS host/domain and return it for convenient boundary checks."""
+    if not _valid_dns_name(value):
+        raise ConfigError(f"{label} must be a bare DNS host name such as good.example (no scheme, path, spaces, or control characters)")
+    return value
+
+
+def validate_connection_token(label: str, value: str, *, allow_empty: bool = False) -> str:
+    """Validate one whitespace-delimited value in the SIA RDP login string."""
+    if not value and allow_empty:
+        return value
+    if (not value or any(not char.isprintable() or char.isspace() for char in value)
+            or "/" in value or "\\" in value):
+        raise ConfigError(f"{label} must be one printable value with no whitespace, slash, backslash, or control characters")
+    return value
+
+
+def _issue(section: str, key: str, message: str, *related: tuple[str, str],
+           code: str = "invalid") -> ValidationIssue:
+    return ValidationIssue(((section, key), *related), message, code)
+
+
+def validation_issues(cfg: Config) -> tuple[ValidationIssue, ...]:
+    """Collect every semantic configuration problem in stable settings order."""
+    t, d, h = cfg.tenant, cfg.defaults, cfg.http
+    issues: list[ValidationIssue] = []
+    if not t.subdomain or not SUBDOMAIN_RE.fullmatch(t.subdomain):
+        issues.append(_issue("tenant", "subdomain",
+            "[tenant] subdomain must be the tenant subdomain only, e.g. 'acme' (lowercase letters, digits, '-')"))
+    for section, key, label, value, allow_empty in (
+        ("tenant", "identity_url", "[tenant] identity_url", t.identity_url, False),
+        ("pvwa", "base_url", "[pvwa] base_url", cfg.pvwa.base_url, True),
+    ):
+        try:
+            _validate_https_url(label, value, allow_empty=allow_empty)
+        except ConfigError as exc:
+            issues.append(_issue(section, key, str(exc), code="url"))
+    try:
+        validate_dns_name("[tenant] root_domain", t.root_domain)
+    except ConfigError as exc:
+        issues.append(_issue("tenant", "root_domain", str(exc), code="dns"))
+    for key, value in (("from_hour", d.from_hour), ("to_hour", d.to_hour)):
+        if value and not HOUR_RE.fullmatch(value):
+            issues.append(_issue("defaults", key,
+                f"[defaults] {key} must be HH:MM (24h) or empty, got {value!r}"))
+    if bool(d.from_hour) != bool(d.to_hour):
+        issues.append(_issue("defaults", "from_hour",
+            "[defaults] from_hour and to_hour must both be set or both be empty", ("defaults", "to_hour"),
+            code="dependent"))
+    if not 1 <= d.max_session_hours <= 24:
+        issues.append(_issue("defaults", "max_session_hours", "[defaults] max_session_hours must be between 1 and 24"))
+    if not 1 <= d.idle_minutes <= 120:
+        issues.append(_issue("defaults", "idle_minutes", "[defaults] idle_minutes must be between 1 and 120"))
+    if not d.days_of_week or any(type(x) is not int or x < 0 or x > 6 for x in d.days_of_week):
+        issues.append(_issue("defaults", "days_of_week",
+            "[defaults] days_of_week must be a non-empty list of integers 0 (Sunday) .. 6 (Saturday)"))
+    elif len(set(d.days_of_week)) != len(d.days_of_week):
+        issues.append(_issue("defaults", "days_of_week", "[defaults] days_of_week contains duplicates"))
+    try:
+        ZoneInfo(d.time_zone)
+    except (ZoneInfoNotFoundError, ValueError):
+        issues.append(_issue("defaults", "time_zone",
+            f"[defaults] time_zone {d.time_zone!r} is not a recognized IANA time zone"))
+    if not d.assign_local_groups:
+        issues.append(_issue("defaults", "assign_local_groups",
+            "[defaults] assign_local_groups must list at least one local group"))
+    elif any(not item.strip() for item in d.assign_local_groups):
+        issues.append(_issue("defaults", "assign_local_groups",
+            "[defaults] assign_local_groups must not contain blank group names"))
+    if any(not item.strip() for item in d.policy_tags):
+        issues.append(_issue("defaults", "policy_tags", "[defaults] policy_tags must not contain blank tags"))
+    if len(set(d.policy_tags)) != len(d.policy_tags):
+        issues.append(_issue("defaults", "policy_tags", "[defaults] policy_tags contains duplicates"))
+    effective_tag_count = len(d.policy_tags) + (0 if d.owner_tag in d.policy_tags else 1)
+    if effective_tag_count > 20:
+        issues.append(_issue("defaults", "policy_tags",
+            f"[defaults] policy_tags plus owner_tag would create {effective_tag_count} tags; the maximum is 20",
+            ("defaults", "owner_tag"), code="dependent"))
+    template_fields = (
+        ("policy_name_template", TEMPLATE_PLACEHOLDERS),
+        ("strong_account_template", TEMPLATE_PLACEHOLDERS),
+        ("strong_account_safe_template", TEMPLATE_PLACEHOLDERS),
+        ("strong_account_account_name_template", TEMPLATE_PLACEHOLDERS),
+        ("strong_account_username_template", TEMPLATE_PLACEHOLDERS),
+        ("strong_account_domain", TEMPLATE_PLACEHOLDERS),
+        ("group_template", TEMPLATE_PLACEHOLDERS),
+        ("description_template", TEMPLATE_PLACEHOLDERS + ("protocol",)),
+    )
+    for key, placeholders in template_fields:
+        try:
+            _check_template(key, getattr(d, key), placeholders)
+        except ConfigError as exc:
+            issues.append(_issue("defaults", key, str(exc), code="template"))
+    if not d.policy_name_template.strip():
+        issues.append(_issue("defaults", "policy_name_template", "[defaults] policy_name_template must not be empty"))
+    if d.target_set_scope not in TARGET_SET_SCOPES:
+        issues.append(_issue("defaults", "target_set_scope",
+            f"[defaults] target_set_scope must be one of {', '.join(TARGET_SET_SCOPES)}"))
+    if d.policy_status not in POLICY_STATUSES:
+        issues.append(_issue("defaults", "policy_status",
+            f"[defaults] policy_status must be one of {', '.join(POLICY_STATUSES)} "
+            "(Validating/Error/Warning are set by the platform, not requested)"))
+    if d.strong_account_type not in STRONG_ACCOUNT_TYPES:
+        issues.append(_issue("defaults", "strong_account_type",
+            f"[defaults] strong_account_type must be one of {', '.join(STRONG_ACCOUNT_TYPES)}"))
+    if d.strong_account_type != "existing" and not d.strong_account_template:
+        issues.append(_issue("defaults", "strong_account_type",
+            "[defaults] strong_account_type = vault/credentials needs strong_account_template (the account's name)",
+            ("defaults", "strong_account_template"), code="dependent"))
+    if d.strong_account_template and d.strong_account_type == "vault" and not (
+            d.strong_account_safe_template and d.strong_account_account_name_template):
+        issues.append(_issue("defaults", "strong_account_type",
+            "[defaults] strong_account_type = \"vault\" needs strong_account_safe_template and "
+            "strong_account_account_name_template", ("defaults", "strong_account_safe_template"),
+            ("defaults", "strong_account_account_name_template"), code="dependent"))
+    if d.strong_account_template and d.strong_account_type == "credentials" and not d.strong_account_username_template:
+        issues.append(_issue("defaults", "strong_account_type",
+            "[defaults] strong_account_type = \"credentials\" needs strong_account_username_template",
+            ("defaults", "strong_account_username_template"), code="dependent"))
+    if not d.strong_account_domain:
+        issues.append(_issue("defaults", "strong_account_domain",
+            "[defaults] strong_account_domain must be \"local\" or an AD domain name"))
+    if d.provision_format and "<user>" not in d.provision_format:
+        issues.append(_issue("defaults", "provision_format",
+            "[defaults] provision_format must contain <user> (SIA rejects formats without it)"))
+    if not TAG_RE.fullmatch(d.owner_tag):
+        issues.append(_issue("defaults", "owner_tag",
+            "[defaults] owner_tag must be 1-64 characters of letters, digits, '_', '.' or '-'"))
+    if cfg.auth.identity_auth not in IDENTITY_AUTH_METHODS:
+        issues.append(_issue("auth", "identity_auth",
+            f"[auth] identity_auth must be one of {', '.join(IDENTITY_AUTH_METHODS)}"))
+    if not cfg.auth.oidc_application:
+        issues.append(_issue("auth", "oidc_application", "[auth] oidc_application must not be empty"))
+    if h.timeout_seconds <= 0:
+        issues.append(_issue("http", "timeout_seconds", "[http] timeout_seconds must be > 0"))
+    if h.max_retries < 0:
+        issues.append(_issue("http", "max_retries", "[http] max_retries must be >= 0"))
+    if not 1 <= h.status_polls <= 10:
+        issues.append(_issue("http", "status_polls", "[http] status_polls must be between 1 and 10"))
+    try:
+        request_rate_is_finite = math.isfinite(h.max_requests_per_second)
+    except (OverflowError, TypeError, ValueError):
+        request_rate_is_finite = False
+    if not request_rate_is_finite or h.max_requests_per_second < 0:
+        issues.append(_issue("http", "max_requests_per_second",
+            "[http] max_requests_per_second must be a finite number >= 0 (0 = no limit)"))
+    if h.lookup_search_max_rows < 0:
+        issues.append(_issue("http", "lookup_search_max_rows", "[http] lookup_search_max_rows must be an integer >= 0"))
+    if h.secrets_api not in SECRETS_API_FAMILIES:
+        issues.append(_issue("http", "secrets_api", f"[http] secrets_api must be one of {', '.join(SECRETS_API_FAMILIES)}"))
+    if h.targetsets_api not in TARGETSETS_API_FAMILIES:
+        issues.append(_issue("http", "targetsets_api",
+            f"[http] targetsets_api must be one of {', '.join(TARGETSETS_API_FAMILIES)}"))
+    if h.ca_bundle and not Path(h.ca_bundle).exists():
+        issues.append(_issue("http", "ca_bundle",
+            f"[http] ca_bundle {h.ca_bundle!r} does not exist (expected a PEM file or a directory of them)",
+            code="filesystem"))
+    if h.ca_bundle and not h.verify:
+        issues.append(_issue("http", "ca_bundle", "[http] ca_bundle is set but verify = false; pick one",
+            ("http", "verify"), code="dependent"))
+    if cfg.pvwa.auth_type not in PVWA_AUTH_TYPES:
+        issues.append(_issue("pvwa", "auth_type", f"[pvwa] auth_type must be one of {', '.join(PVWA_AUTH_TYPES)}"))
+    if not cfg.pvwa.platform_id:
+        issues.append(_issue("pvwa", "platform_id", "[pvwa] platform_id must not be empty"))
+    for key, value in (("gateway_host", cfg.connect.gateway_host), ("login_suffix", cfg.connect.login_suffix)):
+        if value:
+            try:
+                validate_dns_name(f"[connect] {key}", value)
+            except ConfigError as exc:
+                issues.append(_issue("connect", key, str(exc), code="dns"))
+    if cfg.connect.network:
+        try:
+            validate_connection_token("[connect] network", cfg.connect.network)
+        except ConfigError as exc:
+            issues.append(_issue("connect", "network", str(exc)))
+    return tuple(issues)
 
 
 def validate(cfg: Config) -> None:
-    t, d, h = cfg.tenant, cfg.defaults, cfg.http
-    if not t.subdomain or not SUBDOMAIN_RE.match(t.subdomain):
-        raise ConfigError("[tenant] subdomain must be the tenant subdomain only, e.g. 'acme' (lowercase letters, digits, '-')")
-    if not t.identity_url.startswith("https://") or t.identity_url.endswith("/"):
-        raise ConfigError("[tenant] identity_url must start with https:// and have no trailing slash")
-    if not t.root_domain or "/" in t.root_domain:
-        raise ConfigError("[tenant] root_domain must be a bare domain such as cyberark.cloud")
-    for label, value in (("from_hour", d.from_hour), ("to_hour", d.to_hour)):
-        if value and not HOUR_RE.match(value):
-            raise ConfigError(f"[defaults] {label} must be HH:MM (24h) or empty, got {value!r}")
-    if bool(d.from_hour) != bool(d.to_hour):
-        raise ConfigError("[defaults] from_hour and to_hour must both be set or both be empty")
-    if not 1 <= d.max_session_hours <= 24:
-        raise ConfigError("[defaults] max_session_hours must be between 1 and 24")
-    if not 1 <= d.idle_minutes <= 120:
-        raise ConfigError("[defaults] idle_minutes must be between 1 and 120")
-    if not d.days_of_week or any((not isinstance(x, int)) or x < 0 or x > 6 for x in d.days_of_week):
-        raise ConfigError("[defaults] days_of_week must be a non-empty list of integers 0 (Sunday) .. 6 (Saturday)")
-    if len(set(d.days_of_week)) != len(d.days_of_week):
-        raise ConfigError("[defaults] days_of_week contains duplicates")
-    if not d.assign_local_groups:
-        raise ConfigError("[defaults] assign_local_groups must list at least one local group")
-    for label in ("policy_name_template", "strong_account_template", "strong_account_safe_template",
-                  "strong_account_account_name_template", "strong_account_username_template",
-                  "strong_account_domain", "group_template"):
-        _check_template(label, getattr(d, label))
-    if not d.policy_name_template.strip():
-        raise ConfigError("[defaults] policy_name_template must not be empty")
-    if d.target_set_scope not in TARGET_SET_SCOPES:
-        raise ConfigError(f"[defaults] target_set_scope must be one of {', '.join(TARGET_SET_SCOPES)}")
-    if d.policy_status not in POLICY_STATUSES:
-        raise ConfigError(f"[defaults] policy_status must be one of {', '.join(POLICY_STATUSES)} "
-                          "(Validating/Error/Warning are set by the platform, not requested)")
-    _check_template("description_template", d.description_template, TEMPLATE_PLACEHOLDERS + ("protocol",))
-    if d.strong_account_type not in STRONG_ACCOUNT_TYPES:
-        raise ConfigError(f"[defaults] strong_account_type must be one of {', '.join(STRONG_ACCOUNT_TYPES)}")
-    if d.strong_account_type != "existing" and not d.strong_account_template:
-        raise ConfigError("[defaults] strong_account_type = vault/credentials needs strong_account_template (the account's name)")
-    if d.strong_account_template and d.strong_account_type == "vault" and not (
-            d.strong_account_safe_template and d.strong_account_account_name_template):
-        raise ConfigError("[defaults] strong_account_type = \"vault\" needs strong_account_safe_template and "
-                          "strong_account_account_name_template")
-    if d.strong_account_template and d.strong_account_type == "credentials" and not d.strong_account_username_template:
-        raise ConfigError("[defaults] strong_account_type = \"credentials\" needs strong_account_username_template")
-    if not d.strong_account_domain:
-        raise ConfigError("[defaults] strong_account_domain must be \"local\" or an AD domain name")
-    if d.provision_format and "<user>" not in d.provision_format:
-        raise ConfigError("[defaults] provision_format must contain <user> (SIA rejects formats without it)")
-    if not TAG_RE.match(d.owner_tag):
-        raise ConfigError("[defaults] owner_tag must be 1-64 characters of letters, digits, '_', '.' or '-'")
-    if cfg.auth.identity_auth not in IDENTITY_AUTH_METHODS:
-        raise ConfigError(f"[auth] identity_auth must be one of {', '.join(IDENTITY_AUTH_METHODS)}")
-    if not cfg.auth.oidc_application:
-        raise ConfigError("[auth] oidc_application must not be empty")
-    if h.timeout_seconds <= 0 or h.max_retries < 0:
-        raise ConfigError("[http] timeout_seconds must be > 0 and max_retries >= 0")
-    if not 1 <= h.status_polls <= 10:
-        raise ConfigError("[http] status_polls must be between 1 and 10")
-    if not isinstance(h.max_requests_per_second, (int, float)) or h.max_requests_per_second < 0:
-        raise ConfigError("[http] max_requests_per_second must be a number >= 0 (0 = no limit)")
-    if not isinstance(h.lookup_search_max_rows, int) or h.lookup_search_max_rows < 0:
-        raise ConfigError("[http] lookup_search_max_rows must be an integer >= 0")
-    if h.secrets_api not in SECRETS_API_FAMILIES:
-        raise ConfigError(f"[http] secrets_api must be one of {', '.join(SECRETS_API_FAMILIES)}")
-    if h.targetsets_api not in TARGETSETS_API_FAMILIES:
-        raise ConfigError(f"[http] targetsets_api must be one of {', '.join(TARGETSETS_API_FAMILIES)}")
-    if h.ca_bundle and not Path(h.ca_bundle).exists():
-        raise ConfigError(f"[http] ca_bundle {h.ca_bundle!r} does not exist (expected a PEM file or a directory of them)")
-    if h.ca_bundle and not h.verify:
-        raise ConfigError("[http] ca_bundle is set but verify = false; pick one")
-    p = cfg.pvwa
-    if p.base_url and (not p.base_url.startswith("https://") or p.base_url.endswith("/")):
-        raise ConfigError("[pvwa] base_url must start with https:// and have no trailing slash")
-    if p.auth_type not in PVWA_AUTH_TYPES:
-        raise ConfigError(f"[pvwa] auth_type must be one of {', '.join(PVWA_AUTH_TYPES)}")
-    if not p.platform_id:
-        raise ConfigError("[pvwa] platform_id must not be empty")
-    c = cfg.connect
-    if c.gateway_host and ("/" in c.gateway_host or " " in c.gateway_host):
-        raise ConfigError("[connect] gateway_host must be a bare host name such as acme.rdp.cyberark.cloud")
-    if c.login_suffix and ("@" in c.login_suffix or " " in c.login_suffix):
-        raise ConfigError("[connect] login_suffix is the part after '@' in login names, e.g. acme.cyberark.cloud")
+    issues = validation_issues(cfg)
+    if issues:
+        raise ConfigValidationError(issues)
 
 
-def load_config(path: str | Path) -> Config:
-    path = Path(path)
-    if not path.is_file():
-        raise ConfigError(f"config file not found: {path} (copy config.example.toml to config.toml)")
+def validate_field(section: str, key: str, value: Any) -> tuple[ValidationIssue, ...]:
+    """Validate one field independently; dependent combinations remain review-time issues."""
+    section_classes = {"tenant": TenantConfig, "defaults": Defaults, "auth": AuthConfig,
+                       "http": HttpConfig, "connect": ConnectConfig, "pvwa": PVWAConfig}
+    cls = section_classes.get(section)
+    if cls is None or key not in {item.name for item in fields(cls)}:
+        raise ConfigError(f"unknown setting [{section}] {key}")
+    if isinstance(value, list):
+        value = tuple(value)
+    expected = get_type_hints(cls)[key]
+    if not _matches_type(value, expected):
+        return (_issue(section, key,
+            f"[{section}] {key} must be {_type_name(expected)}, got {_value_type_name(value)}", code="type"),)
+    base = Config(TenantConfig("placeholder", "https://placeholder.example"))
+    updated_section = replace(getattr(base, section), **{key: value})
+    candidate = replace(base, **{section: updated_section})
+    pair = (section, key)
+    return tuple(issue for issue in validation_issues(candidate)
+                 if issue.keys == (pair,) and issue.code != "filesystem")
+
+
+def parse_config(text: str, source_path: str | Path = "config.toml") -> Config:
+    """Parse and validate TOML text. Relative file settings resolve beside ``source_path``."""
+    path = Path(source_path).expanduser().resolve()
     try:
-        raw = tomllib.loads(path.read_text(encoding="utf-8"))
+        raw = tomllib.loads(text)
     except tomllib.TOMLDecodeError as exc:
         raise ConfigError(f"{path}: invalid TOML: {exc}") from exc
+    structural: list[ValidationIssue] = []
     unknown = sorted(set(raw) - set(SECTIONS))
-    if unknown:
-        raise ConfigError(f"{path}: unknown section(s): {', '.join(unknown)}")
+    for name in unknown:
+        structural.append(_issue(name, "*", f"{path}: unknown section(s): {name}", code="unknown"))
     if "tenant" not in raw:
-        raise ConfigError(f"{path}: missing [tenant] section")
-    missing = [k for k in REQUIRED_DEFAULT_KEYS if k not in raw.get("defaults", {})]
+        structural.append(ValidationIssue(
+            (("tenant", "subdomain"), ("tenant", "identity_url")),
+            f"{path}: missing [tenant] section", "required"))
+    section_classes = {"tenant": TenantConfig, "defaults": Defaults, "auth": AuthConfig,
+                       "http": HttpConfig, "connect": ConnectConfig, "pvwa": PVWAConfig}
+    for section_name, cls in section_classes.items():
+        if section_name not in raw:
+            continue
+        table = raw[section_name]
+        if not isinstance(table, dict):
+            structural.append(ValidationIssue(
+                tuple((section_name, item.name) for item in fields(cls)),
+                f"{path}: [{section_name}] must be a TOML table", "type"))
+            continue
+        hints = get_type_hints(cls)
+        for key in sorted(set(table) - set(hints)):
+            structural.append(_issue(section_name, key, f"[{section_name}] has unknown key(s): {key}", code="unknown"))
+        for key, value in table.items():
+            if key not in hints:
+                continue
+            normalized = tuple(value) if isinstance(value, list) else value
+            if not _matches_type(normalized, hints[key]):
+                structural.append(_issue(section_name, key,
+                    f"[{section_name}] {key} must be {_type_name(hints[key])}, got {_value_type_name(normalized)}",
+                    code="type"))
+    tenant_table = raw.get("tenant") if isinstance(raw.get("tenant"), dict) else {}
+    for key in ("subdomain", "identity_url"):
+        if key not in tenant_table:
+            structural.append(_issue("tenant", key, f"{path}: [tenant] must set required key {key}", code="required"))
+    defaults_table = raw.get("defaults") if isinstance(raw.get("defaults"), dict) else {}
+    missing = [key for key in REQUIRED_DEFAULT_KEYS if key not in defaults_table]
     if missing:
-        raise ConfigError(
-            f"{path}: [defaults] must set {', '.join(missing)} explicitly -- the access window (days_of_week, from_hour/to_hour; "
-            "\"\" = all day) and target_set_cert_validation are organizational decisions, not tool defaults")
+        structural.append(ValidationIssue(
+            tuple(("defaults", key) for key in missing),
+            f"{path}: [defaults] must set {', '.join(missing)} explicitly -- the access window (days_of_week, "
+            "from_hour/to_hour; \"\" = all day) and target_set_cert_validation are organizational decisions, not tool defaults",
+            "required"))
+    if structural:
+        raise ConfigValidationError(structural)
     cfg = Config(
         tenant=_build(TenantConfig, raw["tenant"], "tenant"),
         defaults=_build(Defaults, raw.get("defaults", {}), "defaults"),
@@ -308,40 +617,144 @@ def load_config(path: str | Path) -> Config:
         connect=_build(ConnectConfig, raw.get("connect", {}), "connect"),
         pvwa=_build(PVWAConfig, raw.get("pvwa", {}), "pvwa"),
     )
+    # Paths written in config belong to that config, so they remain stable when the command is launched elsewhere.
+    password_file = cfg.auth.password_file
+    ca_bundle = cfg.http.ca_bundle
+    if password_file and not Path(password_file).expanduser().is_absolute():
+        password_file = str((path.parent / Path(password_file).expanduser()).resolve())
+    elif password_file:
+        password_file = str(Path(password_file).expanduser())
+    if ca_bundle and not Path(ca_bundle).expanduser().is_absolute():
+        ca_bundle = str((path.parent / Path(ca_bundle).expanduser()).resolve())
+    elif ca_bundle:
+        ca_bundle = str(Path(ca_bundle).expanduser())
+    cfg = replace(cfg, auth=replace(cfg.auth, password_file=password_file),
+                  http=replace(cfg.http, ca_bundle=ca_bundle))
     validate(cfg)
     return cfg
+
+
+def load_config(path: str | Path) -> Config:
+    path = Path(path).expanduser()
+    if not path.is_file():
+        raise ConfigError(f"config file not found: {path} (copy config.example.toml to config.toml)")
+    try:
+        text = path.read_text(encoding="utf-8")
+    except UnicodeDecodeError as exc:
+        raise ConfigError(f"{path}: configuration must be UTF-8 text: {exc}") from exc
+    except OSError as exc:
+        raise ConfigError(f"cannot read config file {path}: {exc}") from exc
+    return parse_config(text, path)
 
 
 _ENV_LINE = re.compile(r"^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$")
 
 
-def load_dotenv(path: str | Path, *, override: bool = False) -> dict[str, str]:
-    """Minimal .env loader (KEY=VALUE, '#' comments, optional single/double quotes). Missing file is fine."""
+def _parse_env_value(path: Path, lineno: int, raw: str) -> str:
+    value = raw.strip()
+    if not value:
+        return ""
+    if value[0] == '"':
+        decoder = json.JSONDecoder()
+        try:
+            decoded, end = decoder.raw_decode(value)
+        except (json.JSONDecodeError, ValueError) as exc:
+            raise ConfigError(f"{path}:{lineno}: invalid double-quoted value: {exc}") from exc
+        if not isinstance(decoded, str):
+            raise ConfigError(f"{path}:{lineno}: expected a quoted string value")
+        remainder = value[end:].strip()
+        if remainder and not remainder.startswith("#"):
+            raise ConfigError(f"{path}:{lineno}: unexpected text after quoted value")
+        return decoded
+    if value[0] == "'":
+        end = value.find("'", 1)
+        if end < 0:
+            raise ConfigError(f"{path}:{lineno}: unterminated single-quoted value")
+        remainder = value[end + 1:].strip()
+        if remainder and not remainder.startswith("#"):
+            raise ConfigError(f"{path}:{lineno}: unexpected text after quoted value")
+        return value[1:end]
+    if value[0] in "}]":
+        raise ConfigError(f"{path}:{lineno}: malformed value")
+    return value.split(" #", 1)[0].rstrip()
+
+
+def read_dotenv(path: str | Path) -> dict[str, str]:
+    """Read a .env file without changing ``os.environ``. Missing files return an empty mapping."""
     path = Path(path)
     loaded: dict[str, str] = {}
-    if not path.is_file():
-        return loaded
+    first_lines: dict[str, int] = {}
+    try:
+        path_stat = path.stat()
+    except FileNotFoundError as exc:
+        # exists()/is_file() follow symlinks, so a broken credential symlink
+        # otherwise looks exactly like the intentionally optional missing file.
+        try:
+            path.lstat()
+        except FileNotFoundError:
+            return loaded
+        except OSError as inspect_exc:
+            raise ConfigError(f"cannot inspect credentials path {path}: {inspect_exc}") from inspect_exc
+        raise ConfigError(f"credentials path {path} is a broken symbolic link") from exc
+    except OSError as exc:
+        raise ConfigError(f"cannot inspect credentials path {path}: {exc}") from exc
+    if not stat.S_ISREG(path_stat.st_mode):
+        raise ConfigError(f"credentials path {path} must be a regular file")
     _warn_if_readable_by_others(path)
-    for lineno, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except UnicodeDecodeError as exc:
+        raise ConfigError(f"{path}: credentials file must be UTF-8 text: {exc}") from exc
+    except OSError as exc:
+        raise ConfigError(f"cannot read credentials file {path}: {exc}") from exc
+    for lineno, line in enumerate(lines, start=1):
         stripped = line.strip()
         if not stripped or stripped.startswith("#"):
             continue
         match = _ENV_LINE.match(stripped)
         if not match:
             raise ConfigError(f"{path}:{lineno}: expected KEY=VALUE")
-        key, value = match.group(1), match.group(2).strip()
-        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
-            value = value[1:-1]
-        elif " #" in value:
-            value = value.split(" #", 1)[0].rstrip()
+        key = match.group(1)
+        if key in loaded:
+            raise ConfigError(f"{path}:{lineno}: duplicate key {key!r} (first set on line {first_lines[key]})")
+        value = _parse_env_value(path, lineno, match.group(2))
         loaded[key] = value
+        first_lines[key] = lineno
+    return loaded
+
+
+@dataclass(frozen=True)
+class EnvValue:
+    """An environment value and the source that won precedence resolution."""
+    value: str
+    source: str                         # "environment", "dotenv", or "missing"
+
+
+def resolve_env(name: str, dotenv: Mapping[str, str] | None = None,
+                environ: Mapping[str, str] | None = None) -> EnvValue:
+    """Resolve an environment setting without mutation; exported values override .env values."""
+    environment = os.environ if environ is None else environ
+    if name in environment:
+        return EnvValue(environment[name], "environment")
+    if dotenv is not None and name in dotenv:
+        return EnvValue(dotenv[name], "dotenv")
+    return EnvValue("", "missing")
+
+
+def load_dotenv(path: str | Path, *, override: bool = False) -> dict[str, str]:
+    """Compatibility loader: parse with :func:`read_dotenv`, then update ``os.environ``."""
+    loaded = read_dotenv(path)
+    for key, value in loaded.items():
         if override or key not in os.environ:
             os.environ[key] = value
     return loaded
 
 
 def _warn_if_readable_by_others(path: Path) -> None:
-    if os.name == "nt":
+    if windows_acl_supported():
+        status = inspect_credential_permissions(path)
+        if status.secure is not True:
+            logging.getLogger("sia.config").warning("%s: %s", path, status.message)
         return
     mode = path.stat().st_mode
     if mode & (stat.S_IRWXG | stat.S_IRWXO):
@@ -368,27 +781,51 @@ def load_password_file(path: str | Path) -> dict[str, str]:
         raise ConfigError(f"password file not found: {path}")
     _warn_if_readable_by_others(path)
     passwords: dict[str, str] = {}
+    names_seen: dict[str, str] = {}
     problems: list[str] = []
-    with path.open(encoding="utf-8-sig", newline="") as fh:
-        reader = csv.DictReader(fh)
-        header = [h.strip() for h in (reader.fieldnames or [])]
-        if "name" not in header or "password" not in header:
-            raise ConfigError(f"{path.name}: header must contain the columns name,password")
-        for raw in reader:
-            line = reader.line_num
-            name = (raw.get("name") or "").strip()
-            password = (raw.get("password") or "")
-            if not name and not password.strip():
-                continue
-            if not name:
-                problems.append(f"{path.name}:{line}: name is required")
-            elif name in passwords:
-                problems.append(f"{path.name}:{line}: duplicate name {name!r}")
-            elif not password:
-                problems.append(f"{path.name}:{line}: password for {name!r} is empty")
-            else:
-                passwords[name] = password
-                register_secret(password)
+    reader: csv.DictReader[str] | None = None
+    try:
+        with path.open(encoding="utf-8-sig", newline="") as fh:
+            reader = csv.DictReader(fh, strict=True)
+            raw_header = reader.fieldnames or []
+            header = [h.strip() for h in raw_header]
+            duplicates = sorted({h for h in header if h and header.count(h) > 1})
+            if any(not h for h in header):
+                raise ConfigError(f"{path.name}: header contains a blank column name")
+            if duplicates:
+                raise ConfigError(f"{path.name}: header contains duplicate column(s): {', '.join(duplicates)}")
+            if "name" not in header or "password" not in header:
+                raise ConfigError(f"{path.name}: header must contain the columns name,password")
+            unknown = sorted(set(header) - {"name", "password"})
+            if unknown:
+                raise ConfigError(f"{path.name}: unknown column(s): {', '.join(unknown)} (allowed: name, password)")
+            for raw in reader:
+                line = reader.line_num
+                if None in raw and any((cell or "").strip() for cell in raw[None]):  # type: ignore[index]
+                    problems.append(f"{path.name}:{line}: more cells than header columns")
+                cells = {(key or "").strip(): value for key, value in raw.items() if key is not None}
+                name = (cells.get("name") or "").strip()
+                password = (cells.get("password") or "")
+                if not name and not password.strip():
+                    continue
+                canonical = name.casefold()
+                if not name:
+                    problems.append(f"{path.name}:{line}: name is required")
+                elif canonical in names_seen:
+                    problems.append(f"{path.name}:{line}: duplicate name {name!r} (also {names_seen[canonical]!r})")
+                elif not password:
+                    problems.append(f"{path.name}:{line}: password for {name!r} is empty")
+                else:
+                    names_seen[canonical] = name
+                    passwords[name] = password
+                    register_secret(password)
+    except csv.Error as exc:
+        line = reader.line_num if reader is not None else 1
+        raise ConfigError(f"{path.name}:{line}: invalid CSV: {exc}") from exc
+    except UnicodeDecodeError as exc:
+        raise ConfigError(f"{path}: password file must be UTF-8 text: {exc}") from exc
+    except OSError as exc:
+        raise ConfigError(f"cannot read password file {path}: {exc}") from exc
     if problems:
         raise ConfigError("\n".join(problems))
     return passwords
@@ -397,4 +834,6 @@ def load_password_file(path: str | Path) -> dict[str, str]:
 def env_var_for_password(account_name: str) -> str:
     """Default env var name for a credentials-type strong account: SIA_SA_<NAME>_PASSWORD."""
     normalized = re.sub(r"[^A-Za-z0-9]+", "_", account_name).strip("_").upper()
+    if not normalized:
+        raise ConfigError("strong-account name must contain a letter or digit to derive its password environment variable")
     return f"SIA_SA_{normalized}_PASSWORD"

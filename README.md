@@ -1,19 +1,30 @@
 # sia-policy-automation
 
-Onboard Windows servers into CyberArk / Idira **Secure Infrastructure Access (SIA)** from a spreadsheet.
+Configure and onboard Windows/RDP and Linux/SSH access into CyberArk / Idira **Secure Infrastructure Access
+(SIA)** from a guided terminal or CSV files.
 
 For every server it creates the three things SIA needs for zero-standing-privilege RDP: the server's **strong
 account** (its local administrator, referenced from your Vault), a **target set**, and an **access policy** named
-after the server. It works for 5 servers or 70,000, can be run again at any time without changing anything that is
-already right, and picks up where it stopped if interrupted.
+after the server. It can process small lists or controlled waves from larger inventories, can be run again without
+changing objects that already match, and can reconcile safely after an interruption.
 
 ```text
-python sia_onboard.py preflight                    # can I reach the tenant?
-python sia_onboard.py plan  --input input          # what would change? (changes nothing)
-python sia_onboard.py apply --input input          # do it
-python sia_onboard.py verify --input input         # is every server ready? PASS / FAIL
-python sia_onboard.py connect-info --input input   # what users type into their RDP client
+sia                          # terminal home: setup, settings, help and workflows
+sia setup                    # guided local configuration
+sia doctor                   # offline checks; add --online for read-only tenant checks
+sia plan  --input input      # what would change? (changes nothing)
+sia apply --input input      # do it after showing the plan and asking for confirmation
+sia verify --input input     # is every server ready? PASS / FAIL
 ```
+
+SIA creates your local `config.toml` from the [bundled starter](sia/config.toml): fill in your tenant details
+through Setup or edit it directly. The local file is excluded from Git and contains no credentials.
+[config.example.toml](config.example.toml) is the longer advanced reference.
+
+Run `sia` for the terminal home. It shows the next setup step and explains each command. Type `/` to see
+suggestions, use **Tab** to complete, **↑/↓** to select, and **Enter** to run. `/settings` groups related settings
+and lets you search by name, such as `timeout`. File prompts complete paths too. `/menu` shows the menu again;
+`/exit` closes SIA. The existing `python sia_onboard.py ...` form remains supported for scripts.
 
 ## How it works
 
@@ -56,19 +67,46 @@ Details: [How a user connects](docs/OPERATIONS.md#2-how-a-user-connects).
 
 ## Install
 
-You need Python 3.11 or newer (<https://www.python.org/downloads/>; on Windows tick *Add python.exe to PATH*).
+### Windows: open one file
 
-1. Get the tool: **Code → Download ZIP** on GitHub, or `git clone https://github.com/uakbr/sia-policy-automation.git`.
-2. Open a terminal in the folder and install the one dependency:
+1. Get the tool: **Code → Download ZIP** on GitHub, or `git clone https://github.com/umair-wwt/sia-policy.git`.
+   **Extract the ZIP completely** into a writable folder, such as Documents.
+2. Double-click **`install.cmd`**. Or, from PowerShell in that folder, run:
 
    ```powershell
-   python -m venv .venv
-   .\.venv\Scripts\Activate.ps1          # Windows PowerShell (macOS/Linux: source .venv/bin/activate)
-   pip install -r requirements.txt
+   .\install.cmd
    ```
 
-   Run the *Activate* line again whenever you open a new terminal.
-3. Copy `config.example.toml` to `config.toml` and set these lines (the file explains the rest):
+   Setup runs the PowerShell installer first and automatically tries another available route if that host cannot
+   run it. It finds Python 3.11 or newer, installs Python for your user if needed, installs the app's dependencies,
+   checks the result, and opens SIA. No environment activation, administrator terminal, or permanent execution-policy
+   change is needed. Internet access is needed on a fresh computer unless IT has supplied Python and offline packages.
+
+   **Next time, double-click `Start-SIA.cmd`.** It checks the app and automatically attempts repair if the runtime is
+   missing, damaged, or out of date with the source. Keep these launchers with the extracted project. For scripted
+   commands, use `.\Start-SIA.cmd doctor`. Commands beginning with
+   `sia` elsewhere in this README can use `.\Start-SIA.cmd` instead; no PATH setup is required.
+
+   See the [Windows guide](docs/WINDOWS.md) for automatic fallbacks, offline packages, updates, and managed computers.
+
+### macOS / Linux
+
+With Python 3.11 or newer installed, open a terminal in the extracted project:
+
+```sh
+python3 -m venv .venv
+.venv/bin/python -m pip install .
+.venv/bin/sia
+```
+
+Use `.venv/bin/sia` again in a new terminal, or activate `.venv` to use the shorter `sia` command.
+
+### First setup
+
+1. In SIA, choose `/setup`. The bundled starter starts with blank tenant fields, so it cannot
+   accidentally connect to an example tenant. Setup explains the defaults, lets you customize them, and shows a
+   short summary before saving. When launched from a folder without this file, SIA creates a bundled starter;
+   it never overwrites an existing configuration. You can also edit the generated local file directly:
 
    ```toml
    [tenant]
@@ -86,22 +124,31 @@ You need Python 3.11 or newer (<https://www.python.org/downloads/>; on Windows t
    strong_account_username_template = "Administrator"   # their Windows user name
    ```
 
-4. Copy `.env.example` to `.env` and put in the service user (an Identity user flagged **Is OAuth confidential
-   client**, member of the **Secure Infrastructure Access administrator** role):
+2. Configure the service user (an Identity user flagged **Is OAuth confidential client**, member of the **Secure
+   Infrastructure Access administrator** role). From the terminal home, credentials can stay in memory for that
+   home session or be explicitly saved to `.env`. Standalone setup offers explicit `.env` saving. You may instead
+   copy `.env.example` to `.env`:
 
    ```dotenv
    SIA_CLIENT_ID=svc_sia_automation@acme.cyberark.cloud
    SIA_CLIENT_SECRET=its-password
    ```
 
-   Leave the secret out to be prompted instead. Never share `config.toml` or `.env`.
-5. Check the connection:
+   Exported environment variables take precedence over session and `.env` values. `sia settings --show` reports
+   whether each credential is set and which source wins, without printing its value. Windows saves automatically
+   protect `.env` with a private file ACL. If that protection cannot be established before saving, the terminal home
+   keeps the entered credentials in memory for the session and explains the fallback. Do not share `.env`.
+3. Check local files first, then the tenant:
 
    ```text
-   python sia_onboard.py preflight
+   sia doctor
+   sia doctor --online
+   sia preflight
    ```
 
-   Every line should say `OK`. If not, see [Troubleshooting](docs/OPERATIONS.md#8-troubleshooting).
+   Offline `doctor` needs no credentials. Online checks and `preflight` report each endpoint separately; an optional
+   settings endpoint may be `not verified` while required checks pass. If a check fails, see
+   [Troubleshooting](docs/OPERATIONS.md#8-troubleshooting).
 
 **Before the first server**, three things must be true on your side: a local administrator account for every
 server exists in the Vault under the naming convention above (the tool can onboard missing ones through PVWA, see
@@ -185,6 +232,31 @@ own `Target` set. The default, `server`, keeps one target set per server for eve
 
 `groups.csv` is only needed when a group name exists in two directories.
 
+## Settings and paths
+
+`sia settings` opens the editor; `sia settings --show` prints every setting, its saved value, its effective value
+and whether it came from the config file, a tool default or a command-line override. Related settings appear in
+small groups; search reaches every supported TOML field. Comments and unrelated TOML content are preserved, changes
+are validated before an atomic save, and an external edit made while the screen is open stops the save.
+Reload merges unrelated external changes into your pending edits; when the same field changed in both places,
+choose which value to keep and review again before saving.
+
+Setup validates each entry immediately. If a URL contains a path, trailing slash, or missing HTTPS scheme, it
+offers a corrected base URL for you to accept. `/back` returns one screen; `/cancel` returns home. Unsaved,
+non-secret Setup and Settings drafts stay available for that home session, shared by both editors for the same
+config file. They are not written to disk and disappear when the process exits. Every settings group is available
+from Setup's review screen, so a validation error always has a repair or reload route. Credentials are saved
+separately and are never included in configuration drafts.
+
+Values supplied by `template_policy` take precedence for the approved access-window, session, connection-profile,
+time-zone and tag fields. CSV cells still take precedence where the input format documents an override, such as
+`group`, `assign_groups` and `ssh_username`. The settings screen explains when each field applies.
+
+Relative `password_file` and `ca_bundle` paths written in TOML resolve beside that TOML file. Relative paths passed
+on the command line, including `--config`, `--env`, `--input` and `--report-dir`, resolve from the directory where
+you run the command. This TOML behavior is different from older releases; check a moved config with
+`sia settings --show` or `sia doctor`.
+
 ## Run it
 
 **`plan`** shows one line per row and changes nothing:
@@ -202,7 +274,21 @@ Summary: n/a=1, planned=8
 
 **`apply`** shows the plan again, asks you to type `yes`, then creates the objects in order (strong accounts,
 target sets, policies) and prints the same table with `created`. Run it again and everything says `exists`.
-Anything that differs from your list is shown as `drift`, never changed silently.
+Anything that differs from your list is shown as `drift`, never changed silently. Add `--drift` to fetch complete
+policies and compare every managed field the tool writes: descriptions, tags, time frame, time zone, principals and
+directory metadata, entitlement, delegation, conditions, targets, and RDP/SSH behavior including local groups and
+reconnect. Target-set type, account, description, certificate validation and provisioning format are also compared.
+`--update` implies this full comparison.
+
+`policy_status` in TOML is used only when a policy is created. To activate or suspend existing managed policies,
+make the intent explicit and review it before applying:
+
+```text
+sia plan  --input input --update --set-policy-status Suspended
+sia apply --input input --update --set-policy-status Suspended
+```
+
+The status action requires `--update`; normal updates preserve the policy's current status.
 
 **`verify`** prints `PASS`, `MISSING` or `FAIL` per row and is what you hand to whoever signs the change off.
 **`connect-info --rdp-dir out`** writes a CSV with the connection settings per server and one `.rdp` file each.
@@ -214,7 +300,9 @@ Start with one server, test the login as a member of the group, then load the re
 
 - Work in waves: `--offset 0 --limit 5000`, then `--offset 5000 --limit 5000`, and `verify` after each.
 - Add `--workers 8` and set `max_requests_per_second = 10` in `config.toml`.
-- Interrupted? Run the same `apply` again with `--resume`; finished rows are skipped.
+- Interrupted? Run the same `apply` again with `--resume`. Only complete, verified rows from a matching version-2
+  checkpoint are skipped; changed tenant/config/template/input fingerprints and malformed or older records are
+  reconciled again.
 
 More in [Large rollouts](docs/OPERATIONS.md#6-large-rollouts).
 
@@ -228,8 +316,8 @@ strong account resolve exactly as they would in a bulk run:
 python sia_onboard.py apply --server web09.corp.example.com --yes --json --no-report
 ```
 
-`--json` puts the result on stdout (the table goes to stderr) and the exit code is `0` success, `1` something
-needs attention, `2` bad input or configuration. Add `--group NAME` to name the group explicitly,
+`--json` puts a valid result on stdout for both success and failure (the table and prompts go to stderr) and the
+exit code is `0` success, `1` something needs attention, `2` bad input or configuration. Add `--group NAME` to name the group explicitly,
 `--workgroup` for a server that is not domain-joined.
 
 ## Behind a TLS-inspecting proxy
@@ -247,10 +335,13 @@ in use.
 
 `plan` writes nothing. `apply` asks before changing anything, never deletes, only touches objects it created
 (or that you `--adopt`), stops at the first rejected create instead of failing for every server, and never prints
-a password.
+a password. A timeout or malformed response after a write is `uncertain` or `unverified`, never success; it is not
+stored as a completed checkpoint row. Reconcile with a new read-only plan before deciding whether another write is
+needed.
 
 ## More
 
+- [docs/WINDOWS.md](docs/WINDOWS.md) — Windows installation, automatic repair, offline packages, and troubleshooting.
 - [docs/OPERATIONS.md](docs/OPERATIONS.md) — results, how users connect, first time on a tenant, strong accounts
   in detail, day-to-day changes, large rollouts, troubleshooting, FAQ, glossary, open items.
 - [docs/DEVELOPER.md](docs/DEVELOPER.md) — architecture, API calls, tests.

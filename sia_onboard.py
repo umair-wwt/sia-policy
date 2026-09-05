@@ -11,24 +11,41 @@ Commands:
 """
 from __future__ import annotations
 
+import sys
+
+if __name__ == "__main__":
+    if sys.version_info < (3, 11):
+        from sia.bootstrap import main as bootstrap_main
+        sys.exit(bootstrap_main())
+    try:
+        import requests  # noqa: F401 - give direct-script users an actionable installation error
+        import tomlkit  # noqa: F401
+    except ModuleNotFoundError:
+        from sia.bootstrap import main as bootstrap_main
+        sys.exit(bootstrap_main())
+
 import argparse
+from contextlib import redirect_stdout
+from contextvars import ContextVar
 import getpass
 import json
 import logging
 import os
 import sys
+import tempfile
 import traceback
 from collections import Counter
-from dataclasses import replace
+from dataclasses import asdict, replace
 from datetime import datetime, timezone
 from pathlib import Path
 
 from sia.auth import AuthError, PlatformTokenProvider, make_identity_token_provider
 from sia.checkpoint import DEFAULT_NAME as CHECKPOINT_NAME
 from sia.checkpoint import Checkpoint
-from sia.clients import IdentityClient, SIAClient, UAPClient
-from sia.config import Config, ConfigError, load_config, load_dotenv, load_password_file, validate
-from sia.connect import build_rows, login_suffix, write_connect_csv, write_rdp_files
+from sia.clients import IdentityClient, PerAccountTargetSetListingRequired, SIAClient, UAPClient
+from sia.config import Config, ConfigError, load_config, load_password_file, validate
+from sia.diagnostics import Diagnostic, diagnose, render_diagnostic, sanitize
+from sia.connect import build_rows, login_suffix, write_connection_outputs
 from sia.http import HttpClient, RateLimiter, SIAApiError
 from sia.inputs import LIST_SEPARATOR, InputError, Inputs, StrongAccountRow, inline_inputs, load_inputs
 from sia.payloads import policy_name_for
@@ -37,6 +54,7 @@ from sia.reconcile import LOOKUP_MODES, MAX_WORKERS, STAGES, ReconcileError, Rec
 from sia.redact import RedactingFilter, redact, register_secret
 from sia.report import exit_code, print_summary, print_verify, result_dict, write_reports, write_verify_csv
 from sia.resolve import PrincipalResolver, pick
+from sia.runtime import Session, prompt_secret
 
 EXIT_OK, EXIT_FAILURES, EXIT_USAGE = 0, 1, 2
 PAM_REQUIRED_FIELDS = (("pvwa_base_url", "pvwaBaseUrl"), ("connector_pool_id", "connectorPoolId"),
@@ -44,16 +62,25 @@ PAM_REQUIRED_FIELDS = (("pvwa_base_url", "pvwaBaseUrl"), ("connector_pool_id", "
 MAX_PASSWORD_PROMPTS = 5
 log = logging.getLogger("sia")
 _active_checkpoint: Path | None = None
+_secret_sink: ContextVar[dict[str, str] | None] = ContextVar("secret_sink", default=None)
 
 
 def interactive() -> bool:
-    return sys.stdin.isatty() and sys.stdout.isatty()
+    return sys.stdin.isatty() and sys.stderr.isatty()
+
+
+def remember_secret(name: str, value: str) -> None:
+    register_secret(value)
+    sink = _secret_sink.get()
+    if sink is not None and value:
+        sink[name] = value
 
 
 def resolve_client_secret() -> str:
     secret = os.environ.get("SIA_CLIENT_SECRET", "")
     if not secret and interactive():
-        secret = getpass.getpass("SIA_CLIENT_SECRET (not echoed): ")
+        secret = prompt_secret("SIA_CLIENT_SECRET (not echoed): ")
+        remember_secret("SIA_CLIENT_SECRET", secret)
     if not secret:
         raise ConfigError("SIA_CLIENT_SECRET is not set (put it in .env, export it, or run interactively to be prompted)")
     register_secret(secret)
@@ -94,7 +121,8 @@ class Context:
             user = os.environ.get("PVWA_USER", "")
             password = os.environ.get("PVWA_PASSWORD", "")
             if not password and interactive():
-                password = getpass.getpass(f"PVWA_PASSWORD for {user or 'PVWA user'} (not echoed): ")
+                password = prompt_secret(f"PVWA_PASSWORD for {user or 'PVWA user'} (not echoed): ")
+                remember_secret("PVWA_PASSWORD", password)
             if not user or not password:
                 raise ConfigError("[pvwa] is configured but PVWA_USER / PVWA_PASSWORD are not set (put them in .env)")
             client = PVWAClient(self.cfg.pvwa.base_url, auth_type=self.cfg.pvwa.auth_type,
@@ -104,19 +132,30 @@ class Context:
         return self._pvwa
 
 
+class ArgumentParser(argparse.ArgumentParser):
+    def error(self, message: str) -> None:
+        raise ConfigError(f"Command not understood: {message}. Run 'sia help' or 'sia <command> --help'.")
+
+
+def add_global_flags(parser: argparse.ArgumentParser, *, root: bool = False) -> None:
+    def default(value):
+        return value if root else argparse.SUPPRESS
+    parser.add_argument("--config", default=default("config.toml"), help="configuration path (default: ./config.toml)")
+    parser.add_argument("--env", default=default(".env"), help="credentials file (default: ./.env)")
+    parser.add_argument("--report-dir", default=default("reports"), help="report directory (default: ./reports)")
+    parser.add_argument("-v", "--verbose", action="store_true", default=default(False), help="sanitized technical details")
+    parser.add_argument("--ca-bundle", metavar="FILE", default=default(None), help="trusted CA file/directory; overrides configuration")
+    parser.add_argument("--json", action="store_true", default=default(False), help="machine-readable result on stdout; messages on stderr")
+
+
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="sia_onboard.py", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--config", default="config.toml", help="path to config.toml (default: ./config.toml)")
-    parser.add_argument("--env", default=".env", help="path to .env with SIA_CLIENT_ID/SIA_CLIENT_SECRET (default: ./.env)")
-    parser.add_argument("--report-dir", default="reports", help="where plan/apply reports are written (default: ./reports)")
-    parser.add_argument("-v", "--verbose", action="store_true", help="debug logging (HTTP method/URL/status; never secrets)")
-    sub = parser.add_subparsers(dest="command", required=True)
+    parser = ArgumentParser(prog="sia", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    add_global_flags(parser, root=True)
+    sub = parser.add_subparsers(dest="command")
     sub.add_parser("preflight", help="authenticate and read tenant state (read-only)")
     sp = sub.add_parser("show-policy", help="print an existing UAP policy as JSON")
     sp.add_argument("name")
     sp.add_argument("--from-list", action="store_true", help="print the (partial) object the list endpoint returns instead of the full policy")
-
-    parser.add_argument("--ca-bundle", metavar="FILE", help="PEM file (or directory) of trusted CAs; overrides [http] ca_bundle")
 
     def add_input_flags(p: argparse.ArgumentParser) -> None:
         p.add_argument("--input", default="input", help="directory with servers.csv[, domains.csv, strong_accounts.csv, groups.csv]")
@@ -154,8 +193,8 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--resume", action="store_true", help="skip rows the checkpoint file records as complete")
         p.add_argument("--checkpoint", metavar="FILE", help=f"checkpoint file (default: <input>/{CHECKPOINT_NAME})")
         p.add_argument("--progress-every", type=int, default=100, metavar="N", help="log progress every N objects (0 = off)")
-        p.add_argument("--json", action="store_true",
-                       help="print the run as JSON on stdout (the table goes to stderr); for scripted callers")
+        p.add_argument("--set-policy-status", choices=("Active", "Suspended"),
+                       help="explicitly set the selected policies' status (requires --update)")
         p.add_argument("--no-report", action="store_true", help="do not write the JSON/CSV report files")
         if name == "apply":
             p.add_argument("--yes", "-y", action="store_true", help="do not ask for confirmation")
@@ -170,10 +209,23 @@ def build_parser() -> argparse.ArgumentParser:
     cp.add_argument("--login-user", default="<user>", metavar="USER", help="login name to put in the ZSP user name (default: a placeholder)")
     cp.add_argument("--network", metavar="NAME", help="connector network to add as '/n NAME' (overrides [connect] network)")
     cp.add_argument("--no-tenant", action="store_true", help="do not read the tenant; leave the status columns empty")
+    sub.add_parser("setup", help="guided local configuration and optional credential saving")
+    settings = sub.add_parser("settings", help="view or edit this project's real settings (offline)")
+    settings.add_argument("--show", action="store_true", help="show values and their sources without prompting")
+    doctor = sub.add_parser("doctor", help="check local setup; --online also checks tenant access")
+    add_input_flags(doctor)
+    doctor.add_argument("--online", action="store_true", help="authenticate and run read-only tenant checks")
+    shell = sub.add_parser("shell", help="open the terminal home screen")
+    shell.add_argument("--input", default="input", help="default input directory for this session")
+    help_parser = sub.add_parser("help", help="plain-language help by topic or diagnostic code")
+    help_parser.add_argument("topic", nargs="?", default="")
+    for child in sub.choices.values():
+        add_global_flags(child)
     return parser
 
 
-def cmd_preflight(ctx: Context) -> int:
+def cmd_preflight(ctx: Context, checks: list[dict] | None = None, *, verbose: bool = False) -> int:
+    checks = checks if checks is not None else []
     ok = True
     t = ctx.cfg.tenant
     print(f"Tenant:   {t.subdomain}  SIA={t.dpa_url}  UAP={t.uap_url}  Identity={t.identity_url}")
@@ -189,24 +241,38 @@ def cmd_preflight(ctx: Context) -> int:
         token = ctx.token()
         claims = ctx.token.claims
         print(f"Auth:     OK platform token ({len(token)} chars, subject={claims.get('unique_name') or claims.get('sub') or '?'})")
+        checks.append({"name": "Auth", "status": "passed", "message": "Platform authentication succeeded"})
         claimed = claims.get("subdomain")
         if claimed and str(claimed).lower() != t.subdomain:
             print(f"          WARNING: token says subdomain={claimed!r} but config says {t.subdomain!r}")
+            diagnostic = Diagnostic(code="SIA-TENANT-MISMATCH", message=f"Authenticated token belongs to tenant {claimed!r}, but configuration selects {t.subdomain!r}.",
+                                    actions=("Correct the tenant configuration or credential source before applying changes.",),
+                                    stage="Authentication", mutation_state="not_applicable")
+            checks.append({"name": "Tenant identity", "status": "failed", "message": diagnostic.message, "diagnostic": diagnostic.to_dict()})
+            render_diagnostic(diagnostic, sys.stdout, verbose=verbose)
+            return EXIT_FAILURES
     except AuthError as exc:
-        print(f"Auth:     FAILED: {exc}")
+        diagnostic = diagnose(exc, stage="Authentication")
+        print("Auth:     FAILED")
+        render_diagnostic(diagnostic, sys.stdout, verbose=verbose)
+        checks.append({"name": "Auth", "status": "failed", "message": diagnostic.message, "diagnostic": diagnostic.to_dict()})
         return EXIT_FAILURES
 
     def settings() -> None:
         try:
             s = ctx.sia.get_settings()
         except SIAApiError as exc:
-            if exc.status in (401, 403):
-                print(f"Settings: not verified (HTTP {exc.status}: the service user lacks the Settings API role; this check is optional)")
+            if exc.status in (401, 403, 404, 405, 501):
+                reason = "access was rejected; this endpoint may require a separate role" if exc.status in (401, 403) else "the optional endpoint is unavailable"
+                message = f"Settings not verified (HTTP {exc.status}); {reason}."
+                print(f"Settings: not verified (HTTP {exc.status}: {reason}; this check is optional)")
+                checks.append({"name": "Settings", "status": "warning", "message": message})
                 return
             raise
         pam = pick(s, "self_hosted_pam", "selfHostedPam", default=None)
         if not pam:
             print("Settings: OK  self_hosted_pam: not configured -- vault strong accounts need the PAM integration configured in SIA")
+            checks.append({"name": "Settings", "status": "warning", "message": "PAM integration is not configured; check the required account integration before using Vault accounts."})
             return
         tenant_type = str(pick(pam, "tenant_type", "tenantType", default="") or "")
         missing = [snake for snake, camel in PAM_REQUIRED_FIELDS if not pick(pam, snake, camel)]
@@ -217,11 +283,14 @@ def cmd_preflight(ctx: Context) -> int:
             print("          NOTE: expected tenant_type=SELF_HOSTED for a self-hosted Vault (PCLOUD = Privilege Cloud)")
         if missing:
             print(f"          NOTE: missing {', '.join(missing)}; complete the integration in SIA settings before relying on vault accounts")
+        if state != "configured":
+            checks.append({"name": "Settings", "status": "warning", "message": f"PAM integration is {state}; check the configured tenant integration."})
 
     def api_families() -> None:
         probe = getattr(ctx.sia, "probe", None)
         if probe is None:
             print("SIA API:  not probed")
+            checks.append({"name": "SIA API", "status": "not checked", "message": "Client does not expose API-family probing"})
             return
         caps = probe()
         pins = f"[http] secrets_api = \"{ctx.cfg.http.secrets_api}\", targetsets_api = \"{ctx.cfg.http.targetsets_api}\""
@@ -242,7 +311,7 @@ def cmd_preflight(ctx: Context) -> int:
     def target_sets() -> None:
         try:
             items = ctx.sia.list_target_sets()
-        except ValueError as exc:
+        except PerAccountTargetSetListingRequired as exc:
             print(f"Targets:  OK  ({exc}; per-account listing will be used)")
             return
         types = Counter(str(pick(i, "type", default="?")) for i in items)
@@ -271,6 +340,7 @@ def cmd_preflight(ctx: Context) -> int:
     def pvwa() -> None:
         if not ctx.cfg.pvwa.enabled:
             print("PVWA:     not configured ([pvwa] base_url empty; the vault stage is off)")
+            checks.append({"name": "PVWA", "status": "not checked", "message": "Optional vault onboarding is disabled"})
             return
         client = ctx.pvwa_client()
         print(f"PVWA:     OK  logged on to {ctx.cfg.pvwa.base_url} (auth={ctx.cfg.pvwa.auth_type}, platform={ctx.cfg.pvwa.platform_id})")
@@ -279,11 +349,17 @@ def cmd_preflight(ctx: Context) -> int:
 
     for label, fn in (("Settings:", settings), ("SIA API:", api_families), ("Secrets:", secrets), ("Targets:", target_sets),
                       ("Policies:", policies), ("Identity:", directories), ("PVWA:", pvwa)):
+        previous_checks = len(checks)
         try:
             fn()
-        except (SIAApiError, AuthError, ConfigError) as exc:
+            if len(checks) == previous_checks:
+                checks.append({"name": label.rstrip(":"), "status": "passed", "message": "Read-only API check succeeded"})
+        except Exception as exc:
             ok = False
-            print(f"{label:<9} FAILED: {exc}")
+            diagnostic = diagnose(exc, stage=label.rstrip(":"))
+            print(f"{label:<9} FAILED: {diagnostic.message}")
+            render_diagnostic(diagnostic, sys.stdout, verbose=verbose)
+            checks.append({"name": label.rstrip(":"), "status": "failed", "message": diagnostic.message, "diagnostic": diagnostic.to_dict()})
     print("\nPreflight", "OK" if ok else "finished with failures")
     return EXIT_OK if ok else EXIT_FAILURES
 
@@ -291,11 +367,10 @@ def cmd_preflight(ctx: Context) -> int:
 def cmd_show_policy(ctx: Context, name: str, from_list: bool = False) -> int:
     found = ctx.uap.find_policy_by_name(name)
     if not found:
-        print(f"policy {name!r} not found", file=sys.stderr)
-        return EXIT_FAILURES
+        raise ReconcileError(f"policy {name!r} not found; check its exact name and the selected tenant")
     policy_id = pick(found.get("metadata") or {}, "policyId", "policy_id")
     policy = found if from_list or not policy_id else ctx.uap.get_policy(str(policy_id))
-    print(json.dumps(policy, indent=2, sort_keys=True))
+    print(json.dumps(sanitize(policy), indent=2, sort_keys=True))
     return EXIT_OK
 
 
@@ -317,7 +392,7 @@ def make_password_source(allow_prompt: bool, file_passwords: dict[str, str] | No
         if not value and allow_prompt and interactive():
             if len(prompted) < max_prompts:
                 prompted.append(account.name)
-                value = getpass.getpass(f"Password for strong account {account.name} (user {account.username}, not echoed): ")
+                value = prompt_secret(f"Password for strong account {account.name} (user {account.username}, not echoed): ")
                 cache[account.name] = value
             elif len(prompted) == max_prompts:
                 prompted.append("-")
@@ -358,6 +433,8 @@ def inline_rows(args: argparse.Namespace) -> list[dict[str, str]]:
 
 
 def load_wave(ctx: Context, args: argparse.Namespace) -> Inputs:
+    if getattr(args, "_loaded_inputs", None) is not None:
+        return args._loaded_inputs
     d = ctx.cfg.defaults
     check_server_flags(args)
     common = dict(strong_account_template=d.strong_account_spec or "", ssh_username_default=d.ssh_username,
@@ -398,6 +475,18 @@ def cmd_plan_apply(ctx: Context, args: argparse.Namespace, dry_run: bool) -> int
             log.warning("password file lists %d name(s) not in strong_accounts.csv: %s", len(unknown), ", ".join(unknown[:10]))
     checkpoint_path = Path(args.checkpoint) if args.checkpoint else Path(args.input) / CHECKPOINT_NAME
     checkpoint = Checkpoint(checkpoint_path)
+    if not dry_run:
+        writable, reason = checkpoint.check_writable()
+        if not writable:
+            raise ConfigError(f"Cannot write checkpoint {checkpoint_path}: {reason}. Choose --checkpoint with a writable path before applying.")
+        if not args.no_report:
+            directory = Path(args.report_dir)
+            try:
+                directory.mkdir(parents=True, exist_ok=True)
+                with tempfile.TemporaryFile(dir=directory):
+                    pass
+            except OSError as exc:
+                raise ConfigError(f"Cannot save reports in {directory}: {exc}. Choose --report-dir before applying, or explicitly use --no-report.") from exc
     if checkpoint_path.is_file():
         finished = checkpoint.done_count()
         if finished and not args.resume:
@@ -415,7 +504,19 @@ def cmd_plan_apply(ctx: Context, args: argparse.Namespace, dry_run: bool) -> int
                      lookup=args.lookup, lookup_search_max_rows=ctx.cfg.http.lookup_search_max_rows,
                      checkpoint=checkpoint, resume=args.resume, progress_every=args.progress_every,
                      pvwa=pvwa, pvwa_platform_id=ctx.cfg.pvwa.platform_id, pvwa_cpm_managed=ctx.cfg.pvwa.cpm_managed,
+                     set_policy_status=args.set_policy_status,
+                     reconciliation_context={"tenant": asdict(ctx.cfg.tenant), "pvwa": asdict(ctx.cfg.pvwa)},
                      get_password=make_password_source(allow_prompt=not dry_run, file_passwords=file_passwords))
+    result = None
+    run_stopped = False
+    cleanup_interrupted = False
+    cleanup_error: Exception | None = None
+    previous_cancel = getattr(getattr(ctx, "http", None), "cancel_check", None)
+    previous_pvwa_cancel = getattr(pvwa, "cancel_check", None)
+    if getattr(ctx, "http", None) is not None:
+        ctx.http.cancel_check = rec.check_cancelled
+    if pvwa is not None:
+        pvwa.cancel_check = rec.check_cancelled
     try:
         rec.snapshot()
         if not dry_run and not args.yes:
@@ -432,22 +533,139 @@ def cmd_plan_apply(ctx: Context, args: argparse.Namespace, dry_run: bool) -> int
                 print("\nNo interactive terminal; use --yes to apply without confirmation.", file=human)
             if answer != "yes":
                 print("Aborted; nothing changed.", file=human)
+                if args.json:
+                    print(json.dumps({"ok": False, "mode": "apply", "exit_code": EXIT_USAGE, "cancelled": True,
+                                      "diagnostics": [Diagnostic(code="SIA-CANCELLED", message="Apply cancelled before tenant changes.",
+                                                                 actions=("Review the plan and run apply when ready.",), mutation_state="not_applied").to_dict()]}))
                 return EXIT_USAGE
-        result = rec.reconcile(dry_run=dry_run)
+        args._mutation_started = not dry_run
+        try:
+            result = rec.reconcile(dry_run=dry_run)
+        except (Exception, KeyboardInterrupt) as exc:
+            result = getattr(exc, "partial_result", None)
+            if result is None:
+                raise
+            run_stopped = True
     finally:
-        if pvwa is not None:
-            pvwa.logoff()
-    print_summary(result, human)
+        try:
+            if pvwa is not None:
+                try:
+                    pvwa.logoff()
+                except KeyboardInterrupt:
+                    if result is None:
+                        raise
+                    cleanup_interrupted = True
+                except Exception as exc:
+                    if result is None:
+                        raise
+                    cleanup_error = exc
+        finally:
+            if getattr(ctx, "http", None) is not None:
+                ctx.http.cancel_check = previous_cancel
+            if pvwa is not None:
+                pvwa.cancel_check = previous_pvwa_cancel
+
+    # From this point onward tenant work has stopped and ``result`` is the
+    # authoritative evidence. Persist it before writing the final console view:
+    # stdout/stderr may be a closed pipe even though the report directory works.
+    outcomes = ([outcome for server in result.servers
+                 for outcome in (server.secret, server.target_set, server.policy)]
+                + list(result.secrets.values()) + list(result.vault.values()))
+    confirmed = (any(outcome.status in ("created", "updated") or
+                     (outcome.diagnostic or {}).get("mutation_state") == "applied" for outcome in outcomes)
+                 or any(diagnostic.get("mutation_state") == "applied" for diagnostic in result.diagnostics))
+    mutation_state = ("not_applied" if dry_run else
+                      "unknown" if any(outcome.status == "uncertain" for outcome in outcomes) else
+                      "applied" if confirmed else
+                      "unknown" if any(outcome.status == "unverified" for outcome in outcomes) else "not_applied")
+    if cleanup_interrupted:
+        result.incomplete = True
+        result.interrupted = True
+        result.diagnostics.append(Diagnostic(
+            code="SIA-INTERRUPTED",
+            message="PVWA session cleanup was interrupted after tenant results were collected.",
+            actions=("The PVWA session expires automatically; review the saved results before continuing.",),
+            stage="PVWA logoff",
+            mutation_state=mutation_state,
+        ).to_dict())
+    elif cleanup_error is not None:
+        result.incomplete = True
+        result.diagnostics.append(diagnose(
+            cleanup_error,
+            stage="PVWA logoff",
+            mutation_state=mutation_state,
+        ).to_dict())
+
+    artifact_diagnostics = []
+    report_outputs: tuple[Path, Path] | None = None
+    report_interrupted = False
     if not args.no_report:
-        json_path, csv_path = write_reports(result, args.report_dir)
-        print(f"\nReport: {json_path}\n        {csv_path}", file=human)
-    if not dry_run and checkpoint_path.is_file():
-        print(f"Checkpoint: {checkpoint_path} ({checkpoint.done_count()} row(s) complete; re-run with --resume to skip them)",
-              file=human)
+        try:
+            report_outputs = write_reports(result, args.report_dir)
+        except (Exception, KeyboardInterrupt) as exc:
+            report_interrupted = isinstance(exc, KeyboardInterrupt) or bool(getattr(exc, "interrupted", False))
+            base = diagnose(exc, stage="Saving reports", mutation_state=mutation_state)
+            diagnostic = (Diagnostic(
+                code="SIA-INTERRUPTED",
+                message="Report publication was interrupted; tenant results were retained below.",
+                actions=("Keep any completed report paths listed in the diagnostic, then run plan --drift before another apply.",),
+                stage="Saving reports",
+                mutation_state=mutation_state,
+                details=base.details,
+            ) if report_interrupted else base)
+            artifact_diagnostics.append(diagnostic.to_dict())
+            if report_interrupted:
+                result.incomplete = True
+                result.interrupted = True
+
+    output_interrupted = False
+    output_failed = False
+    try:
+        if run_stopped:
+            print("\nRun stopped. Results below include completed and in-flight operations; pending writes were cancelled.", file=human)
+        print_summary(result, human)
+        if report_outputs is not None:
+            print(f"\nReport: {report_outputs[0]}\n        {report_outputs[1]}", file=human)
+        for item in artifact_diagnostics:
+            render_diagnostic(Diagnostic(**item), human, verbose=args.verbose)
+        if artifact_diagnostics:
+            completed = tuple(path for item in artifact_diagnostics for path in item.get("details", {}).get("completed_paths", ()))
+            if completed:
+                print("Completed report output(s): " + ", ".join(map(str, completed)), file=human)
+            print("The operation results above still apply. A report-saving failure does not undo tenant changes.", file=human)
+        if not dry_run and checkpoint_path.is_file():
+            print(f"Checkpoint: {checkpoint_path} ({checkpoint.done_count()} row(s) complete; re-run with --resume to skip them)",
+                  file=human)
+    except KeyboardInterrupt:
+        output_interrupted = True
+        result.incomplete = True
+        result.interrupted = True
+        result.diagnostics.append(Diagnostic(
+            code="SIA-INTERRUPTED",
+            message="Console output was interrupted after tenant results were collected.",
+            actions=("Use the report files saved before console rendering to review the result.",),
+            stage="Displaying results",
+            mutation_state=mutation_state,
+            details={"reports": [str(path) for path in report_outputs or ()]},
+        ).to_dict())
+    except OSError as exc:
+        output_failed = True
+        result.incomplete = True
+        diagnostic = diagnose(exc, stage="Displaying results", mutation_state=mutation_state)
+        result.diagnostics.append(replace(
+            diagnostic,
+            details={**diagnostic.details, "reports": [str(path) for path in report_outputs or ()]},
+        ).to_dict())
+
+    run_data = result_dict(result)
     if args.json:
-        json.dump(result_dict(result), sys.stdout, indent=2)
+        data = run_data
+        data.setdefault("diagnostics", []).extend(artifact_diagnostics)
+        json.dump(sanitize(data), sys.stdout, indent=2)
         print()
-    return exit_code(result)
+    args._diagnostics = run_data.get("diagnostics", []) + ([] if args.json else artifact_diagnostics)
+    return (130 if result.interrupted or report_interrupted or output_interrupted else
+            EXIT_FAILURES if artifact_diagnostics or output_failed else exit_code(result))
 
 
 def cmd_verify(ctx: Context, args: argparse.Namespace) -> int:
@@ -458,7 +676,21 @@ def cmd_verify(ctx: Context, args: argparse.Namespace) -> int:
                      workers=args.workers, status_polls=1, progress_every=0,
                      get_password=make_password_source(allow_prompt=False))
     result = rec.run()
+    args._result_data = result_dict(result)
+    args._result_data["mode"] = "verify"
     problems = print_verify(result)
+    for row in result.servers:
+        missing = [name for name, outcome in (("strong account", row.secret), ("target set", row.target_set), ("policy", row.policy))
+                   if outcome.status == "planned"]
+        if missing:
+            diagnostic = Diagnostic(code="SIA-MISSING", message=f"Missing {', '.join(missing)} for {row.fqdn}.",
+                                    actions=("Run plan with the same configuration and input/server options to review what is missing.",
+                                             "Apply the reviewed plan, then run verify again."), stage="Verification", object_name=row.fqdn,
+                                    mutation_state="not_applicable")
+            args._result_data.setdefault("diagnostics", []).append(diagnostic.to_dict())
+            render_diagnostic(diagnostic, sys.stdout, verbose=args.verbose)
+    args._result_data["ok"] = not problems
+    args._result_data["exit_code"] = EXIT_FAILURES if problems else EXIT_OK
     if args.out:
         path = write_verify_csv(result, args.out)
         print(f"CSV: {path}")
@@ -481,8 +713,7 @@ def cmd_connect_info(ctx: Context, args: argparse.Namespace) -> int:
                       suffix=login_suffix(ctx.cfg, getattr(ctx, "client_id", os.environ.get("SIA_CLIENT_ID", ""))),
                       network=args.network, rdp_dir=rdp_dir)
     out = Path(args.out) if args.out else Path(args.report_dir) / f"connect-info-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}.csv"
-    write_connect_csv(rows, out)
-    written = write_rdp_files(rows) if rdp_dir else []
+    out, written = write_connection_outputs(rows, out, generated=not bool(args.out), generated_rdp=True)
     windows = [r for r in rows if r.rdp_username]
     print(f"connect-info: {len(rows)} row(s) for {len(inputs.unique_fqdns)} server(s) -> {out}")
     if windows:
@@ -494,55 +725,202 @@ def cmd_connect_info(ctx: Context, args: argparse.Namespace) -> int:
         missing = sum(1 for r in rows if r.policy_status not in ("exists", "n/a") or r.target_set_status not in ("exists", "n/a"))
         if missing:
             print(f"  NOTE: {missing} row(s) are not fully onboarded yet (see the status columns); run plan/apply first")
+    args._result_data = {"mode": "connect-info", "ok": True, "tenant_checked": statuses is not None,
+                         "output": str(out), "rdp_files": [str(path) for path in written], "rows": [asdict(row) for row in rows]}
     return EXIT_OK
 
 
 def configure_logging(verbose: bool) -> None:
     logging.basicConfig(level=logging.DEBUG if verbose else logging.INFO,
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s", stream=sys.stderr)
+    logging.getLogger().setLevel(logging.DEBUG if verbose else logging.INFO)
     for handler in logging.getLogger().handlers:
-        handler.addFilter(RedactingFilter())
-    if not verbose:
-        logging.getLogger("urllib3").setLevel(logging.WARNING)
+        if not any(isinstance(f, RedactingFilter) for f in handler.filters):
+            handler.addFilter(RedactingFilter())
+    logging.getLogger("urllib3").setLevel(logging.DEBUG if verbose else logging.WARNING)
+
+
+class OfflineContext:
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+        self.client_id = os.environ.get("SIA_CLIENT_ID", "")
+
+
+def read_config(args: argparse.Namespace) -> Config:
+    if args.ca_bundle:
+        from sia.settings import open_settings
+        document = open_settings(args.config)
+        document.set("http", "ca_bundle", str(Path(args.ca_bundle).resolve()))
+        document.set("http", "verify", True)
+        return document.validate()
+    return load_config(args.config)
+
+
+def emit_failure(exc: BaseException, args, session: Session, *, code: int | None = None) -> int:
+    interrupted = isinstance(exc, KeyboardInterrupt) or bool(getattr(exc, "interrupted", False))
+    if code is None:
+        code = 130 if interrupted else EXIT_USAGE if isinstance(exc, (ConfigError, InputError, EOFError)) else EXIT_FAILURES
+    recorded_state = getattr(exc, "mutation_state", None)
+    has_evidence = recorded_state in ("not_applied", "applied", "unknown", "not_applicable") or isinstance(exc, SIAApiError)
+    mutation_state = "unknown" if getattr(args, "_mutation_started", False) and not has_evidence else None
+    if isinstance(exc, (EOFError, KeyboardInterrupt)):
+        diagnostic = Diagnostic(code="SIA-INTERRUPTED" if code == 130 else "SIA-CANCELLED",
+                                message="Operation interrupted." if code == 130 else "Input closed; the operation was cancelled.",
+                                actions=("Run plan --drift to check current state before continuing." if mutation_state else "Run the command again when ready.",),
+                                mutation_state=mutation_state or "not_applied")
+    else:
+        diagnostic = diagnose(exc, stage=getattr(args, "command", "Command") or "Command", mutation_state=mutation_state)
+        if interrupted:
+            diagnostic = replace(
+                diagnostic, code="SIA-INTERRUPTED", message="Output publication was interrupted.",
+                actions=("Review any completed output paths listed in the diagnostic before running again.",
+                         *diagnostic.actions),
+            )
+    session.last_diagnostics = [diagnostic.to_dict()]
+    render_diagnostic(diagnostic, sys.stderr, verbose=getattr(args, "verbose", False))
+    if _active_checkpoint is not None and _active_checkpoint.is_file() and mutation_state:
+        print(f"Checkpoint: {_active_checkpoint}. Run plan --drift before using apply --resume.", file=sys.stderr)
+    if getattr(args, "json", False):
+        print(json.dumps({"ok": False, "mode": getattr(args, "command", None), "exit_code": code,
+                          "diagnostics": session.last_diagnostics}, indent=2))
+    log.debug("diagnostic traceback:\n%s", redact("".join(traceback.format_exception(exc))))
+    return code
+
+
+def run_doctor(args, session: Session) -> int:
+    from sia.doctor import local_checks, print_checks
+    checks, cfg = local_checks(args, session, load_config=read_config,
+                               load_inputs=lambda cfg, args: load_wave(OfflineContext(cfg), args))
+    human = sys.stderr if args.json else sys.stdout
+    print_checks(checks, out=human, verbose=args.verbose)
+    if args.online and cfg is not None:
+        online_checks: list[dict] = []
+        try:
+            with session.environment(args.env), redirect_stdout(human):
+                cmd_preflight(Context(cfg), online_checks, verbose=args.verbose)
+        except Exception as exc:
+            diagnostic = diagnose(exc, stage="Tenant authentication")
+            render_diagnostic(diagnostic, human, verbose=args.verbose)
+            online_checks.append({"name": "Tenant authentication", "status": "failed", "message": diagnostic.message,
+                                  "diagnostic": diagnostic.to_dict()})
+        checks.extend(online_checks)
+    else:
+        check = {"name": "Tenant checks", "status": "not checked", "message": "Fix configuration first." if args.online else "Use doctor --online or preflight to check tenant access."}
+        checks.append(check)
+        print(f"[NOT CHECKED] {check['name']}: {check['message']}", file=human)
+    code = EXIT_FAILURES if any(check["status"] == "failed" for check in checks) else EXIT_OK
+    session.last_diagnostics = [check["diagnostic"] for check in checks if check.get("diagnostic")]
+    print("\nDoctor: " + ("some checks need attention" if code else "checks completed; review warnings and items not checked"), file=human)
+    if args.json:
+        print(json.dumps(sanitize({"ok": code == 0, "mode": "doctor", "exit_code": code, "checks": checks}), indent=2))
+    return code
+
+
+def execute(args: argparse.Namespace, session: Session) -> int:
+    """One command boundary used by both the shell and the original CLI."""
+    global _active_checkpoint
+    _active_checkpoint = None
+    session.last_diagnostics = []
+    token = _secret_sink.set(session.secrets)
+    configure_logging(args.verbose)
+    try:
+        if args.command == "help":
+            from sia.help import help_text
+            content = help_text(args.topic)
+            print(json.dumps({"topic": args.topic, "help": content}) if args.json else content)
+            return EXIT_OK
+        if args.command in ("settings", "setup", "shell"):
+            from sia import terminal
+            if args.command == "settings" and args.show:
+                return terminal.settings(args, session)
+            if not (sys.stdin.isatty() and sys.stdout.isatty()) or args.json:
+                raise ConfigError("This screen needs an interactive terminal. Use 'sia settings --show', 'sia doctor --json', or an explicit command in scripts.")
+            try:
+                if args.command == "setup":
+                    return terminal.setup(args, session)
+                if args.command == "settings":
+                    return terminal.settings(args, session)
+                shared = ["--config", args.config, "--env", args.env, "--report-dir", args.report_dir]
+                if args.ca_bundle:
+                    shared += ["--ca-bundle", args.ca_bundle]
+                if args.verbose:
+                    shared.append("--verbose")
+                def run(argv: list[str]) -> int:
+                    try:
+                        child = build_parser().parse_args([*shared, *argv])
+                    except ConfigError as exc:
+                        return emit_failure(exc, args, session)
+                    except SystemExit as exc:
+                        # argparse uses SystemExit after --help. Finish this child
+                        # command without terminating the surrounding home session.
+                        return int(exc.code or 0)
+                    return execute(child, session)
+                return terminal.home(args, session, run)
+            except terminal.Cancelled:
+                print("Cancelled; pending settings were not saved.")
+                return EXIT_USAGE
+        if args.command == "doctor":
+            return run_doctor(args, session)
+        cfg = read_config(args)
+        if args.command in ("plan", "apply", "verify", "connect-info"):
+            # Every CSV is validated before authentication or tenant reads.
+            args._loaded_inputs = load_wave(OfflineContext(cfg), args)
+        if getattr(args, "set_policy_status", None) and (not args.update or args.only not in ("all", "policies")):
+            raise ConfigError("--set-policy-status requires --update and --only all or policies. Preview the selected status change with plan first.")
+        with session.environment(args.env):
+            ctx = OfflineContext(cfg) if args.command == "connect-info" and args.no_tenant else Context(cfg)
+            if args.command == "preflight":
+                checks: list[dict] = []
+                with redirect_stdout(sys.stderr if args.json else sys.stdout):
+                    code = cmd_preflight(ctx, checks, verbose=args.verbose)
+                session.last_diagnostics = [c["diagnostic"] for c in checks if c.get("diagnostic")]
+                if args.json:
+                    print(json.dumps(sanitize({"ok": code == 0, "mode": "preflight", "exit_code": code, "checks": checks}), indent=2))
+                return code
+            if args.command == "show-policy":
+                return cmd_show_policy(ctx, args.name, args.from_list)
+            if args.command == "verify":
+                with redirect_stdout(sys.stderr if args.json else sys.stdout):
+                    code = cmd_verify(ctx, args)
+                session.last_diagnostics = args._result_data.get("diagnostics", [])
+                if args.json:
+                    print(json.dumps(sanitize(args._result_data), indent=2))
+                return code
+            if args.command == "connect-info":
+                with redirect_stdout(sys.stderr if args.json else sys.stdout):
+                    code = cmd_connect_info(ctx, args)
+                if args.json:
+                    print(json.dumps(sanitize(args._result_data), indent=2))
+                return code
+            code = cmd_plan_apply(ctx, args, dry_run=(args.command == "plan"))
+            session.last_diagnostics = getattr(args, "_diagnostics", [])
+            return code
+    except (Exception, KeyboardInterrupt) as exc:
+        return emit_failure(exc, args, session)
+    finally:
+        _secret_sink.reset(token)
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
-    configure_logging(args.verbose)
+    argv = list(sys.argv[1:] if argv is None else argv)
+    session = Session()
+    parser = build_parser()
     try:
-        load_dotenv(args.env)
-        cfg = load_config(args.config)
-        if args.ca_bundle:
-            cfg = replace(cfg, http=replace(cfg.http, ca_bundle=args.ca_bundle, verify=True))
-            validate(cfg)
-        ctx = Context(cfg)
-        if args.command == "preflight":
-            return cmd_preflight(ctx)
-        if args.command == "show-policy":
-            return cmd_show_policy(ctx, args.name, args.from_list)
-        if args.command == "verify":
-            return cmd_verify(ctx, args)
-        if args.command == "connect-info":
-            return cmd_connect_info(ctx, args)
-        return cmd_plan_apply(ctx, args, dry_run=(args.command == "plan"))
-    except (ConfigError, InputError) as exc:
-        print(f"error: {redact(str(exc))}", file=sys.stderr)
-        return EXIT_USAGE
-    except (AuthError, ReconcileError) as exc:
-        print(f"error: {redact(str(exc))}", file=sys.stderr)
-        return EXIT_FAILURES
-    except SIAApiError as exc:
-        print(f"API error: {exc}", file=sys.stderr)
-        return EXIT_FAILURES
-    except KeyboardInterrupt:
-        print("interrupted", file=sys.stderr)
-        if _active_checkpoint is not None and _active_checkpoint.is_file():
-            print(f"rows finished so far are recorded in {_active_checkpoint}; re-run apply with --resume", file=sys.stderr)
-        return 130
-    except Exception as exc:  # noqa: BLE001 - last resort: never leak a raw traceback (or a secret) to the terminal
-        log.debug("unexpected error:\n%s", redact(traceback.format_exc()))
-        print(f"unexpected error: {exc.__class__.__name__}: {redact(str(exc))} (run with -v for details)", file=sys.stderr)
-        return EXIT_FAILURES
+        args = parser.parse_args(argv)
+    except ConfigError as exc:
+        args = argparse.Namespace(command=None, json="--json" in argv, verbose="-v" in argv or "--verbose" in argv)
+        return emit_failure(exc, args, session, code=EXIT_USAGE)
+    except SystemExit as exc:
+        return int(exc.code or 0)
+    if args.command is None:
+        if not (sys.stdin.isatty() and sys.stdout.isatty()) or args.json:
+            if args.json:
+                return emit_failure(ConfigError("Choose a command, for example: sia doctor --json."), args, session, code=EXIT_USAGE)
+            parser.print_help()
+            return EXIT_USAGE
+        args.command = "shell"
+        args.input = "input"
+    return execute(args, session)
 
 
 if __name__ == "__main__":

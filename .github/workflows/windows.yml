@@ -1,0 +1,152 @@
+name: Windows verification
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Windows Server 2022 / Python 3.11 / Windows PowerShell 5.1
+            os: windows-2022
+            python: "3.11"
+            shell: powershell
+          - name: Windows Server 2025 / Python 3.14 / PowerShell 7
+            os: windows-2025
+            python: "3.14"
+            shell: pwsh
+
+    steps:
+      - name: Check out the trusted source
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Select Python ${{ matrix.python }}
+        uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Install test dependencies
+        shell: ${{ matrix.shell }}
+        run: |
+          python -m pip install --disable-pip-version-check --upgrade pip
+          if ($LASTEXITCODE -ne 0) { throw "pip could not update itself." }
+          python -m pip install --disable-pip-version-check -r requirements-dev.txt
+          if ($LASTEXITCODE -ne 0) { throw "Development dependencies could not be installed." }
+          python -m pip install --disable-pip-version-check --no-deps -e .
+          if ($LASTEXITCODE -ne 0) { throw "The SIA package could not be installed for testing." }
+
+      - name: Run the complete test suite
+        shell: ${{ matrix.shell }}
+        env:
+          PYTHONUTF8: "1"
+          PYTHONIOENCODING: utf-8
+        run: python -m pytest
+
+      - name: Verify PowerShell bootstrap decisions offline
+        shell: ${{ matrix.shell }}
+        run: .\tests\windows_installer_smoke.ps1
+
+      - name: Exercise native install and fallback launchers
+        shell: ${{ matrix.shell }}
+        env:
+          PYTHONUTF8: "1"
+          PYTHONIOENCODING: utf-8
+        run: |
+          $ErrorActionPreference = "Stop"
+          $SourceRoot = (Resolve-Path ".").Path
+          $BasePython = (Get-Command python -ErrorAction Stop).Source
+          $Token = [Guid]::NewGuid().ToString("N")
+          $Archive = Join-Path $env:RUNNER_TEMP ("sia-source-" + $Token + ".zip")
+          $ProjectRoot = Join-Path $env:RUNNER_TEMP ("sia-install-" + $Token)
+
+          & git -C $SourceRoot archive --format=zip --output=$Archive HEAD
+          if ($LASTEXITCODE -ne 0) { throw "Could not create the trusted-source archive." }
+          New-Item -ItemType Directory -Path $ProjectRoot | Out-Null
+          Expand-Archive -LiteralPath $Archive -DestinationPath $ProjectRoot
+
+          # The installer smoke test gets synthetic local data. No credential,
+          # configuration, or report from the checkout is copied into its project.
+          foreach ($Relative in @(".env", "config.toml", "reports", ".sia-runtime", ".sia-python.path", ".venv")) {
+              Remove-Item -LiteralPath (Join-Path $ProjectRoot $Relative) -Recurse -Force -ErrorAction SilentlyContinue
+          }
+          $Utf8 = New-Object System.Text.UTF8Encoding($false)
+          $ConfigSentinel = Join-Path $ProjectRoot "config.toml"
+          $EnvSentinel = Join-Path $ProjectRoot ".env"
+          $InputSentinel = Join-Path $ProjectRoot "input\ci-install-sentinel.txt"
+          $ReportSentinel = Join-Path $ProjectRoot "reports\ci-install-sentinel.txt"
+          New-Item -ItemType Directory -Path (Split-Path $InputSentinel) -Force | Out-Null
+          New-Item -ItemType Directory -Path (Split-Path $ReportSentinel) -Force | Out-Null
+          [IO.File]::WriteAllText($ConfigSentinel, "CI config sentinel`n", $Utf8)
+          [IO.File]::WriteAllText($EnvSentinel, "CI_ENV_SENTINEL=unchanged`n", $Utf8)
+          [IO.File]::WriteAllText($InputSentinel, "CI input sentinel`n", $Utf8)
+          [IO.File]::WriteAllText($ReportSentinel, "CI report sentinel`n", $Utf8)
+          $Sentinels = @($ConfigSentinel, $EnvSentinel, $InputSentinel, $ReportSentinel)
+          $ExpectedHashes = @{}
+          foreach ($Sentinel in $Sentinels) {
+              $ExpectedHashes[$Sentinel] = (Get-FileHash -LiteralPath $Sentinel -Algorithm SHA256).Hash
+          }
+
+          Push-Location $ProjectRoot
+          try {
+              & .\install.ps1 -NoLaunch -NoBootstrap -PythonExecutable $BasePython
+              if ($LASTEXITCODE -ne 0) { throw "install.ps1 returned $LASTEXITCODE." }
+
+              $PointerPath = Join-Path $ProjectRoot ".sia-python.path"
+              if (-not (Test-Path -LiteralPath $PointerPath -PathType Leaf)) {
+                  throw "install.ps1 did not create the verified runtime pointer."
+              }
+              $FirstPointer = ([IO.File]::ReadAllText($PointerPath, [Text.Encoding]::UTF8)).Trim()
+              if (-not (Test-Path -LiteralPath $FirstPointer -PathType Leaf)) {
+                  throw "The runtime pointer does not name an installed Python executable."
+              }
+
+              & $BasePython .\scripts\windows_install.py --check
+              if ($LASTEXITCODE -ne 0) { throw "The installed runtime failed --check." }
+
+              & .\install.ps1 -NoLaunch -NoBootstrap -PythonExecutable $BasePython
+              if ($LASTEXITCODE -ne 0) { throw "The repeated install.ps1 run failed." }
+              $SecondPointer = ([IO.File]::ReadAllText($PointerPath, [Text.Encoding]::UTF8)).Trim()
+              if ($SecondPointer -ne $FirstPointer) {
+                  throw "A repeated installation did not reuse the verified runtime."
+              }
+
+              & $env:ComSpec /d /c "Start-SIA.cmd --help"
+              if ($LASTEXITCODE -ne 0) { throw "Start-SIA.cmd could not launch the installed CLI." }
+
+              $env:SIA_INSTALL_SKIP_POWERSHELL = "1"
+              & $env:ComSpec /d /c "install.cmd --no-launch --no-bootstrap"
+              if ($LASTEXITCODE -ne 0) { throw "The forced CMD fallback installer failed." }
+              $CmdPointer = ([IO.File]::ReadAllText($PointerPath, [Text.Encoding]::UTF8)).Trim()
+              if ($CmdPointer -ne $FirstPointer) {
+                  throw "The CMD fallback did not reuse the verified runtime."
+              }
+
+              & $BasePython .\scripts\windows_install.py --check
+              if ($LASTEXITCODE -ne 0) { throw "The runtime was unhealthy after the CMD fallback." }
+          }
+          finally {
+              Pop-Location
+          }
+
+          foreach ($Sentinel in $Sentinels) {
+              if (-not (Test-Path -LiteralPath $Sentinel -PathType Leaf)) {
+                  throw "The installer removed protected local data: $Sentinel"
+              }
+              $ActualHash = (Get-FileHash -LiteralPath $Sentinel -Algorithm SHA256).Hash
+              if ($ActualHash -ne $ExpectedHashes[$Sentinel]) {
+                  throw "The installer changed protected local data: $Sentinel"
+              }
+          }
