@@ -38,7 +38,8 @@ every PowerShell host or Python installation. Retries are bounded so an unrecove
 The installer creates `.sia-python.path` and versioned environments in `.sia-runtime` (or the local application-data
 folder for a network project). It does not overwrite `config.toml`, `.env`, input files, or reports. A failed candidate
 does not replace the selected working environment. Validated environments are kept at their original paths because
-[Python virtual environments are not portable](https://docs.python.org/3/library/venv.html#how-venvs-work).
+[Python virtual environments are not portable](https://docs.python.org/3/library/venv.html#how-venvs-work); once a
+newer environment has been verified and selected, the earlier ones in that runtime folder are removed.
 
 ## Daily commands and updates
 

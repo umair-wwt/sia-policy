@@ -1,7 +1,6 @@
 """Command-boundary tests: real local paths, fake tenant side effects, and parseable failures."""
 import json
 import os
-from pathlib import Path
 
 import pytest
 
@@ -12,7 +11,7 @@ from sia.http import SIAApiError
 from sia.report import ReportPaths, ReportWriteError
 from sia.runtime import Session
 from tests.fakes import FakePVWA, FakeSIA, FakeUAP
-from tests.test_cli import ROOT, FakeContext, cp, run, shared_context, workspace
+from tests.test_cli import ROOT, FakeContext, cp, run, shared_context, workspace  # noqa: F401 - pytest fixture
 
 
 def test_offline_export_never_constructs_context(tmp_path, monkeypatch, capsys):
@@ -233,7 +232,7 @@ def test_password_prompt_never_falls_back_to_echo(monkeypatch):
     import warnings
     from sia.runtime import prompt_secret
     def unavailable(prompt):
-        warnings.warn("Can not control echo on the terminal", getpass.GetPassWarning)
+        warnings.warn("Can not control echo on the terminal", getpass.GetPassWarning, stacklevel=2)
         pytest.fail("Warning should have stopped echoed input")
     monkeypatch.setattr(getpass, "getpass", unavailable)
     with pytest.raises(ConfigError, match="Hidden password input is unavailable"):

@@ -143,9 +143,6 @@ class Inputs:
     warnings: tuple[str, ...] = field(default=())
     domains: dict[str, DomainRow] = field(default_factory=dict)
 
-    def domain_for(self, dns_domain: str) -> DomainRow | None:
-        return self.domains.get((dns_domain or "").lower())
-
     def strong_account_for(self, server: ServerRow) -> StrongAccountRow:
         if server.strong_account is None:
             raise KeyError(f"{server.fqdn} ({server.protocol}) has no strong account")

@@ -246,6 +246,18 @@ def atomic_write_pointer(path: Path, python: Path) -> None:
             pass
 
 
+def _prune_superseded_environments(runtime: Path, keep: Path) -> None:
+    """Remove runtime environments the pointer no longer references (best effort; never the selected one)."""
+    try:
+        candidates = list((runtime / "envs").iterdir())
+    except OSError:
+        return
+    selected = os.path.normcase(str(_absolute(keep)))
+    for candidate in candidates:
+        if candidate.is_dir() and os.path.normcase(str(_absolute(candidate))) != selected:
+            shutil.rmtree(str(candidate), ignore_errors=True)
+
+
 def _new_environment_path(runtime: Path) -> Path:
     stamp = time.strftime("%Y%m%d-%H%M%S")
     return runtime / "envs" / (stamp + "-" + uuid.uuid4().hex[:8])
@@ -395,6 +407,7 @@ def install(base_python: Path, root: Path) -> Tuple[Path, Path, bool]:
             raise InstallError("Project files changed while the existing runtime was checked. Run install.cmd again.")
         print("Using the verified existing SIA runtime...", flush=True)
         atomic_write_pointer(pointer, python_in(existing))
+        _prune_superseded_environments(runtime, existing)
         return python_in(existing), pointer, True
 
     env = _new_environment_path(runtime)
@@ -413,6 +426,8 @@ def install(base_python: Path, root: Path) -> Tuple[Path, Path, bool]:
         print("Selecting the verified runtime...", flush=True)
         publication_attempted = True
         atomic_write_pointer(pointer, python_in(env))
+        # Every source change builds a new environment; once this one is selected the earlier ones are only disk use.
+        _prune_superseded_environments(runtime, env)
     except BaseException:
         # os.replace is atomic, but a signal can arrive immediately after it.
         # Never remove an environment once the durable pointer references it.

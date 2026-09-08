@@ -184,7 +184,7 @@ class Reconciler:
                  drift: bool | None = None, lookup: str = "auto", lookup_search_max_rows: int = 2000,
                  checkpoint: Checkpoint | None = None, resume: bool = False, progress_every: int = 100,
                  pvwa: Any = None, pvwa_platform_id: str = "WinServerLocal", pvwa_cpm_managed: bool = True,
-                 set_policy_status: str | None = None,
+                 set_policy_status: str | None = None, suspended_ok: bool = False,
                  reconciliation_context: dict[str, Any] | None = None):
         if only not in STAGES:
             raise ValueError(f"only must be one of {STAGES}")
@@ -208,6 +208,9 @@ class Reconciler:
         self.progress_every = max(0, progress_every)
         self.pvwa, self.pvwa_platform_id, self.pvwa_cpm_managed = pvwa, pvwa_platform_id, pvwa_cpm_managed
         self.set_policy_status = set_policy_status
+        # plan/apply with [defaults] policy_status = "Suspended" (a staged rollout): an existing Suspended policy is
+        # the requested state. verify never sets this -- users still cannot connect through a suspended policy.
+        self.suspended_ok = suspended_ok
         self.reconciliation_context = dict(reconciliation_context or {})
         self._get_password = get_password
         self._log = logger or logging.getLogger("sia.reconcile")
@@ -285,7 +288,7 @@ class Reconciler:
                                                target_set_name=old.target_set_name)))
         self._rows = fresh
         ordered: dict[tuple[str, str], ServerResult] = {}
-        for key, (server, old, record) in self._resumed.items():
+        for key, (_server, old, record) in self._resumed.items():
             sr = ServerResult(fqdn=old.fqdn, strong_account=old.strong_account, policy_name=old.policy_name,
                               protocol=old.protocol, line=old.line, target_set_name=old.target_set_name)
             statuses, refs, at = record.get("statuses") or {}, record.get("refs") or {}, record.get("at", "")
@@ -294,7 +297,7 @@ class Reconciler:
                 note = f"checkpoint {at}: {status}"
                 setattr(sr, label, Outcome(NOT_APPLICABLE if status == NOT_APPLICABLE else "exists", note, refs.get(label)))
             ordered[key] = sr
-        for server, sr in self._rows:
+        for _server, sr in self._rows:
             ordered[sr.key] = sr
         # keep CSV order
         result.servers = [ordered[(s.fqdn, policy_name_for(s, self.defaults))] for s in self.inputs.servers
@@ -361,6 +364,10 @@ class Reconciler:
                 "cpm_managed": self.pvwa_cpm_managed,
             },
             "set_policy_status": self.set_policy_status,
+            # What a completed row was checked against: a row verified without --drift must be reconciled again by
+            # an --update run, which compares every managed field.
+            "update": self.update,
+            "drift": self.drift,
         }
 
     def _plan_rows(self) -> None:
@@ -413,8 +420,14 @@ class Reconciler:
                 future.cancel()
             pool.shutdown(wait=True, cancel_futures=True)
 
+    def _secrets_family(self) -> str:
+        caps = getattr(self.sia, "capabilities", None)
+        return str(getattr(caps, "secrets_api", "") or "")
+
     def _snapshot_secrets(self, accounts: list[StrongAccountRow]) -> None:
-        if self._lookup_mode == "search":
+        # The legacy secrets API has no server-side name filter: a per-account search would list every secret once
+        # per account, so read the listing once and index it, whatever the lookup mode.
+        if self._lookup_mode == "search" and self._secrets_family() != "legacy":
             self._secrets = SecretIndex([])
             found = self._parallel(accounts, lambda a: self.sia.find_secret(a.sia_name))
             for secret in found:
@@ -491,11 +504,16 @@ class Reconciler:
         self._policies = self._policies_by_name(self._policy_list)
         wanted = {sr.policy_name.casefold() for _, sr in self._rows}
         required = ("principals", "targets", "conditions", "behavior") if self.drift else ("targets",)
-        for name in wanted:
+        incomplete = []
+        for name in sorted(wanted):
             policy = self._policies.get(name)
             if policy is not None and (self.drift or self.set_policy_status is not None or policy.get("principals") is None):
                 if any(policy.get(key) is None for key in required):
-                    self._policies[name] = self._full_policy(policy, force=self.drift)
+                    incomplete.append(name)
+        # One GET per existing policy: with --drift over a large tenant this dominates the snapshot, so fan out.
+        fetched = self._parallel(incomplete, lambda n: self._full_policy(self._policies[n], force=self.drift))
+        for name, full in zip(incomplete, fetched, strict=True):
+            self._policies[name] = full
         if any(sr.policy_name.casefold() not in self._policies for _, sr in self._rows):
             self._owned_by_fqdn = self._build_owned_index()
             claimed: dict[str, set[str]] = {}
@@ -667,14 +685,14 @@ class Reconciler:
 
     def _owned_policy_for_fqdn(self, fqdn: str, claimed: set[str]) -> dict[str, Any] | None:
         """A managed policy (owner tag) whose EXACTLY rule targets this FQDN and whose name is not one this server's
-        rows already use -- i.e. our policy under another name. Candidates without targets in the list object are
+        rows already use (`claimed` holds casefolded names) -- i.e. our policy under another name. Candidates without targets in the list object are
         fetched in full only when their description mentions the FQDN."""
         if self._owned_by_fqdn is None:
             with self._lock:
                 if self._owned_by_fqdn is None:
                     self._owned_by_fqdn = self._build_owned_index()
         matches = [m for m in self._owned_by_fqdn.get(fqdn.lower(), [])
-                   if html.unescape(str((m.get("metadata") or {}).get("name") or "")) not in claimed]
+                   if html.unescape(str((m.get("metadata") or {}).get("name") or "")).casefold() not in claimed]
         if len(matches) > 1:
             names = ", ".join(repr((m.get("metadata") or {}).get("name")) for m in matches)
             assert self._result is not None
@@ -965,8 +983,17 @@ class Reconciler:
         if str(ts_type) != expected_type:
             result.warnings.append(f"target set {name!r} exists with type={ts_type} (expected {expected_type})")
         if not secret_id:
-            note = "" if owned else " (unmanaged: no owner marker)"
-            return Outcome("exists", f"{ts_type} -> {server.strong_account}{note}", name)
+            # Dry run with a strong account that is only planned: it does not exist yet, so this set necessarily
+            # points at another secret. Report what apply will find instead of a misleading "exists".
+            summary = (f"points to secret {current_secret or '?'}; strong account {server.strong_account!r} "
+                       "does not exist yet")
+            if server.shares_target_set:
+                summary += f"; re-pointing it moves every server in {name}"
+            if not (self.update and self._writes("targetsets")):
+                return Outcome("drift", f"{summary} (use --update to re-point it once the account is created)", name)
+            if not (owned or self._adopted_target_set(server, sr)):
+                return Outcome("drift", f"{summary}; not managed by this tool -- pass --adopt {name} to take ownership", name)
+            return Outcome("planned", f"would re-point target set {name} to {server.strong_account} after creating the account", name)
         desired = build_target_set_update(server, secret_id, secret_type, self.defaults, current)
         current_sig, desired_sig = target_set_signature(current), target_set_signature(desired)
         keys = ("secret_id", "type", "secret_type", "description", "certificate_validation", "provision_format") if self.drift else ("secret_id",)
@@ -1063,7 +1090,7 @@ class Reconciler:
         create: list[tuple[ServerRow, ServerResult, dict[str, Any]]] = []
         claimed_by_fqdn: dict[str, set[str]] = {}
         for server, sr in self._rows:
-            claimed_by_fqdn.setdefault(server.fqdn, set()).add(sr.policy_name)
+            claimed_by_fqdn.setdefault(server.fqdn, set()).add(sr.policy_name.casefold())
         for server, sr in self._rows:
             if sr.policy.status == "failed":  # duplicate name
                 self._checkpoint_row(server, sr)
@@ -1238,7 +1265,8 @@ class Reconciler:
                 sr.policy = Outcome("unverified", f"policy {policy_id} matches the requested fields but has "
                                                   f"unfinished or unknown status={status or 'unknown'}", policy_id)
                 return
-            ok_status = "exists" if status == "Active" or self.set_policy_status == "Suspended" else "inactive"
+            suspended_requested = self.set_policy_status == "Suspended" or (self.set_policy_status is None and self.suspended_ok)
+            ok_status = "exists" if status == "Active" or (status == "Suspended" and suspended_requested) else "inactive"
             note = "" if owned else " (unmanaged: no owner tag; pass --adopt to take ownership)"
             hint = "" if "targets" in checked else "; add --drift to compare targets"
             full_hint = "; targets checked" if self.drift else ""
@@ -1292,7 +1320,7 @@ class Reconciler:
             sr.policy = Outcome("unverified", f"{detail}{suffix}", policy_id)
         elif self.set_policy_status is not None and read_status != self.set_policy_status:
             sr.policy = Outcome("unverified", f"{detail}; requested status was {self.set_policy_status}", policy_id)
-        elif self.set_policy_status is None and read_status == "Suspended":
+        elif self.set_policy_status is None and read_status == "Suspended" and not self.suspended_ok:
             sr.policy = Outcome("inactive", f"{detail}; fields were updated but the existing suspended state was preserved", policy_id)
         else:
             sr.policy = Outcome("updated", detail, policy_id)

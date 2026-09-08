@@ -88,10 +88,6 @@ class SettingDescriptor:
     def dotted_key(self) -> str:
         return f"{self.section}.{self.key}"
 
-    @property
-    def advanced(self) -> bool:
-        return not self.basic
-
 
 @dataclass(frozen=True)
 class SettingValue:
@@ -443,9 +439,6 @@ class SettingsDocument:
             return (ValidationIssue((), str(exc), "parse"),)
         return ()
 
-    def field_issues(self, section: str, key: str, value: Any) -> tuple[ValidationIssue, ...]:
-        return validate_setting_value(descriptor_for(section, key), value)
-
     def values(self) -> tuple[SettingValue, ...]:
         values: list[SettingValue] = []
         for descriptor in SETTING_DESCRIPTORS:
@@ -570,10 +563,6 @@ def open_settings(path: str | Path, *, create: bool = False) -> SettingsDocument
         config = None
         error = str(exc)
     return SettingsDocument(config_path, document, _digest(data), config, error)
-
-
-def save_settings(settings: SettingsDocument) -> Config:
-    return settings.save()
 
 
 _ENV_ASSIGNMENT = re.compile(r"^(\s*(?:export\s+)?)([A-Za-z_][A-Za-z0-9_]*)(\s*=\s*)(.*?)(\r?\n)?$")

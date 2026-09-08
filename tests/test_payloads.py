@@ -377,3 +377,22 @@ def test_target_set_update_preserves_a_provision_format_it_does_not_manage():
     configured = Defaults(provision_format="<user>-svc")
     assert build_target_set_update(server(), "s", "PCloudAccount", configured, existing)["provision_format"] == "<user>-svc"
     assert "provision_format" not in build_target_set_update(server(), "s", "PCloudAccount", DEFAULTS, {"name": NAME})
+
+
+def test_policy_signature_treats_null_and_empty_echoes_as_unset():
+    """The API returns unset optional fields as null/empty; the tool omits them. Both are the same setting."""
+    desired = {"metadata": {"timeFrame": {}}, "conditions": {"accessWindow": {"daysOfTheWeek": [0, 1]}, "idleTime": 10},
+               "behavior": {"connectAs": {"rdp": {"localEphemeralUser": {"assignGroups": ["Administrators"]}}}}}
+    echoed = {"metadata": {"timeFrame": {"fromTime": None, "toTime": None}},
+              "conditions": {"accessWindow": {"daysOfTheWeek": [1, 0], "fromHour": None, "toHour": ""}, "idleTime": 10,
+                             "accessApproval": None},
+              "behavior": {"connectAs": {"rdp": {"localEphemeralUser": {"assignGroups": ["Administrators"], "assignDomainGroups": []},
+                                                 "domainEphemeralUser": None}, "ssh": None}}}
+    for key in ("time_frame", "conditions", "behavior"):
+        assert policy_signature(desired)[key] == policy_signature(echoed)[key], key
+    changed = json.loads(json.dumps(echoed))
+    changed["conditions"]["accessApproval"] = {"required": True}
+    assert policy_signature(desired)["conditions"] != policy_signature(changed)["conditions"]
+    reconnect = json.loads(json.dumps(echoed))
+    reconnect["behavior"]["connectAs"]["rdp"]["localEphemeralUser"]["enableEphemeralUserReconnect"] = False
+    assert policy_signature(desired)["behavior"] != policy_signature(reconnect)["behavior"]

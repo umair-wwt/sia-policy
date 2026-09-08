@@ -23,3 +23,16 @@ sia = ["config.toml"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
+
+[tool.ruff]
+line-length = 130
+target-version = "py311"
+extend-exclude = ["docs"]
+
+[tool.ruff.lint]
+# F: pyflakes (unused imports/variables, undefined names); E9: syntax/io errors; B: likely bugs.
+select = ["F", "E9", "B"]
+
+[tool.ruff.lint.per-file-ignores]
+# pytest fixtures are imported into test modules and then named as function parameters.
+"tests/*" = ["F811"]

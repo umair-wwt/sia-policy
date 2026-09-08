@@ -430,3 +430,26 @@ def test_pvwa_client_logon_find_add_logoff():
         PVWAClient("https://p", auth_type="radius")
     with pytest.raises(SIAApiError, match="no token"):
         PVWAClient("https://p", session=FakeSession([FakeResponse(200, {})])).logon("u", "p")
+
+
+def test_http_can_disable_the_401_refresh_for_static_tokens():
+    calls = []
+
+    def provider(force=False):
+        calls.append(force)
+        return "tok"
+
+    session = FakeSession([FakeResponse(401, "rejected")])
+    client = HttpClient(provider, session=session, sleep=lambda s: None, refresh_on_401=False)
+    with pytest.raises(SIAApiError) as caught:
+        client.get("https://x/api")
+    assert caught.value.status == 401 and True not in calls and len(session.requests) == 1
+
+
+def test_pvwa_wrong_password_sends_a_single_logon_attempt():
+    """A rejected logon must not be retried: every attempt counts toward the Vault user's lockout threshold."""
+    session = FakeSession([FakeResponse(401, {"ErrorCode": "ITATS004E", "ErrorMessage": "Authentication failure"})])
+    pv = PVWAClient("https://pvwa.corp", session=session, sleep=lambda s: None)
+    with pytest.raises(AuthError, match="HTTP 401"):
+        pv.logon("svc", "wrong-secret")
+    assert [request[:2] for request in session.requests] == [("POST", "https://pvwa.corp/PasswordVault/API/auth/CyberArk/Logon")]

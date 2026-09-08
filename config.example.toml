@@ -97,7 +97,7 @@ password_file = ""
 [http]
 timeout_seconds = 60
 max_retries = 4
-status_polls = 1          # read-backs after creating a policy while it is still "Validating" (1 = one read, 1..10)
+status_polls = 5          # read-backs after creating a policy while it is still "Validating", 2 s apart (1..10)
 max_requests_per_second = 0    # global rate limit shared by all --workers (0 = none); raise --workers only with a limit
 lookup_search_max_rows = 2000  # --lookup auto: read per server (search) up to this many servers, else one filtered list
 # SIA path families. "auto" = detect with read-only calls at every run; pin them once `preflight` has printed them.

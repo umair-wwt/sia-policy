@@ -12,6 +12,20 @@ from typing import Any, Iterator
 from .config import ConfigError, read_dotenv
 from .redact import register_secret
 
+_SECRET_WORDS = ("SECRET", "PASSWORD", "TOKEN")
+_SHELL_SECRET_KEYS = frozenset({"SIA_CLIENT_SECRET", "PVWA_PASSWORD"})
+
+
+def _looks_secret(key: str) -> bool:
+    return any(word in key.upper() for word in _SECRET_WORDS)
+
+
+def _consumed_shell_secret(key: str) -> bool:
+    """Only the exported variables SIA itself reads. Registering every TOKEN/PASSWORD-named value in the
+    shell masked ordinary words: TOKENIZERS_PARALLELISM=false hid every "false" in settings and reports."""
+    name = key.upper()
+    return name in _SHELL_SECRET_KEYS or (name.startswith("SIA_SA_") and name.endswith("_PASSWORD"))
+
 
 def prompt_secret(prompt: str) -> str:
     """Never fall back to echoed password input when terminal controls are unavailable."""
@@ -69,8 +83,11 @@ class Session:
         sources = {key: "file" for key in file_values}
         sources.update({key: "session" for key in self.secrets})
         sources.update({key: "shell" for key in self.shell_env})
-        for key, value in values.items():
-            if any(word in key.upper() for word in ("SECRET", "PASSWORD", "TOKEN")):
+        for key, value in {**file_values, **self.secrets}.items():
+            if _looks_secret(key):
+                register_secret(value)
+        for key, value in self.shell_env.items():
+            if _consumed_shell_secret(key):
                 register_secret(value)
         return values, sources
 

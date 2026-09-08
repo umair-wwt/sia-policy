@@ -333,7 +333,7 @@ def test_password_source_env_then_file_then_prompt(monkeypatch, capsys):
         monkeypatch.delenv(var, raising=False)
     monkeypatch.setattr(sia_onboard, "interactive", lambda: True)
     prompts = []
-    monkeypatch.setattr(sia_onboard.getpass, "getpass", lambda prompt: prompts.append(prompt) or "typed-pw")
+    monkeypatch.setattr("getpass.getpass", lambda prompt: prompts.append(prompt) or "typed-pw")
     get = sia_onboard.make_password_source(allow_prompt=True, file_passwords={"Y": "from-file"}, max_prompts=2)
     assert get(account("X", "SIA_SA_X_PASSWORD")) == "from-env"
     assert get(account("Y", "SIA_SA_Y_PASSWORD")) == "from-file"

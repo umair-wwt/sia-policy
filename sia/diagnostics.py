@@ -12,7 +12,6 @@ import json
 import re
 import socket
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any, Mapping, TextIO
 
 import requests
@@ -556,8 +555,3 @@ def render_diagnostic(diag: Diagnostic, out: TextIO, verbose: bool = False) -> N
         for line in rendered.splitlines():
             print(f"  {line}", file=out)
 
-
-def path_from_exception(exc: BaseException) -> Path | None:
-    """Best-effort local path extraction for callers that need focused help."""
-    filename = getattr(exc, "filename", None)
-    return Path(filename) if filename else None

@@ -35,8 +35,10 @@ class PVWAClient:
         self._token: str | None = None
         self._log = logger or logging.getLogger("sia.pvwa")
         self.cancel_check = cancel_check
+        # The session token cannot be refreshed, so a 401 must surface at once: retrying a rejected logon would
+        # count a second failed attempt against the Vault user's lockout threshold.
         self._http = HttpClient(lambda force=False: self._token or "-", timeout=timeout, max_retries=max_retries,
-                                session=session, logger=self._log, sleep=sleep, verify=verify)
+                                session=session, logger=self._log, sleep=sleep, verify=verify, refresh_on_401=False)
 
     @property
     def base_url(self) -> str:

@@ -4,7 +4,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from sia.config import ConfigError, ValidationIssue, load_config, read_dotenv
+from sia.config import ValidationIssue, load_config, read_dotenv
+from sia.redact import redact
 from sia.runtime import Session
 from sia.settings import open_settings, update_dotenv as real_update_dotenv
 from sia import terminal
@@ -36,7 +37,7 @@ def answers(monkeypatch, values):
         try:
             return next(iterator)
         except StopIteration:
-            raise EOFError
+            raise EOFError from None
     monkeypatch.setattr("builtins.input", read)
 
 
@@ -46,7 +47,7 @@ def terminal_answers(monkeypatch, values):
         try:
             value = next(iterator)
         except StopIteration:
-            raise EOFError
+            raise EOFError from None
         if isinstance(value, BaseException):
             raise value
         return value
@@ -306,6 +307,20 @@ def test_settings_output_masks_credentials_embedded_in_invalid_url(tmp_path, cap
     output = capsys.readouterr().out
     assert "operator" not in output and "private-password" not in output
     assert "https://***@abc1234.id.cyberark.cloud" in output
+
+
+def test_settings_output_does_not_mask_words_from_unrelated_shell_variables(tmp_path, capsys):
+    """Only the credentials SIA reads are secrets; TOKENIZERS_PARALLELISM=false must not hide every "false"."""
+    path = tmp_path / "config.toml"
+    path.write_text(TENANT + REQUIRED)
+    (tmp_path / ".env").write_text("SIA_CLIENT_SECRET=hunter2-secret\nSIA_SA_DMZ_PASSWORD=dmz-secret\n")
+    session = Session(shell_env={"TOKENIZERS_PARALLELISM": "false", "PASSWORD_STORE_DIR": str(tmp_path),
+                                 "PVWA_PASSWORD": "vault-secret", "SIA_SA_WEB_PASSWORD": "web-secret"})
+    terminal.show_settings(args_for(tmp_path), session)
+    output = capsys.readouterr().out
+    assert "target_set_cert_validation = false" in output and str(tmp_path) in output and "***" not in output
+    assert redact("false") == "false"
+    assert redact("hunter2-secret dmz-secret vault-secret web-secret") == "*** *** *** ***"
 
 
 def test_home_help_and_exit_do_not_construct_tenant_context(tmp_path, monkeypatch, capsys):

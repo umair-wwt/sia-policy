@@ -310,6 +310,46 @@ def test_checkpoint_fingerprint_covers_defaults_pinned_directories_and_template_
     assert result.resumed == 0 and any("template" in warning for warning in result.warnings)
 
 
+def test_checkpoint_rows_from_a_lighter_check_are_reconciled_again_by_update(tmp_path):
+    cp = Checkpoint(tmp_path / "cp.jsonl")
+    rec, sia, uap, _ = make(ONE, checkpoint=cp)
+    assert rec.run().failures == 0
+    assert make(ONE, sia=sia, uap=uap, checkpoint=cp, resume=True)[0].run().resumed == 1
+    result = make(ONE, sia=sia, uap=uap, checkpoint=cp, resume=True, update=True)[0].run()
+    assert result.resumed == 0 and any("settings, template" in warning for warning in result.warnings)
+    assert result.servers[0].policy.status == "exists" and "targets checked" in result.servers[0].policy.detail
+
+
+def test_full_policy_prefetch_fans_out_over_workers(monkeypatch):
+    rec, sia, uap, _ = make()
+    assert rec.run().failures == 0
+    uap.partial_list = True
+    rec = make(sia=sia, uap=uap, drift=True, workers=4)[0]
+    batches = []
+    original = rec._parallel
+
+    def recording(items, fn):
+        batches.append(len(items))
+        return original(items, fn)
+
+    monkeypatch.setattr(rec, "_parallel", recording)
+    before = len(uap.calls)
+    result = rec.run()
+    assert all(sr.policy.status == "exists" for sr in result.servers)
+    reads = [call for call in uap.calls[before:] if call[0] == "get_policy"]
+    assert batches == [3] and len(reads) == 3          # one fan-out batch, no second read per policy
+
+
+def test_legacy_secrets_are_listed_once_even_in_search_mode():
+    from sia.clients import SIACapabilities
+
+    sia = FakeSIA(secrets=[{"secret_id": "sec-1", "secret_type": "PCloudAccount", "secret_name": VAULT_SIA_NAME}])
+    sia.capabilities = SIACapabilities(secrets_api="legacy", targetsets_api="legacy", targetsets_list_unfiltered=True, probed=True)
+    result = make(ONE, sia=sia, lookup="search")[0].run()
+    assert result.servers[0].secret.status == "exists"
+    assert calls(sia, "find_secret") == [] and calls(sia, "list_secrets") == [None]
+
+
 def test_progress_is_logged(caplog):
     with caplog.at_level("INFO", logger="sia.reconcile"):
         make(progress_every=1)[0].run()
@@ -495,6 +535,25 @@ def test_target_set_provision_format_setting_updates_then_becomes_noop():
     assert len(calls(sia, "update_target_set")) == update_count
 
 
+def test_plan_reports_an_existing_target_set_as_drift_when_its_account_is_only_planned():
+    """The account does not exist yet, so the set cannot point at it: plan must say what apply will find."""
+    sia = FakeSIA(target_sets=[{"id": WEB01_FQDN, "name": WEB01_FQDN, "type": "Target", "secret_type": "ProvisionerUser",
+                                "secret_id": "old-secret", "description": f"old {MARK}"}])
+    result = make(ONE, sia=sia, dry_run=True)[0].run()
+    sr = result.servers[0]
+    assert sr.secret.status == "planned" and sr.target_set.status == "drift"
+    assert "old-secret" in sr.target_set.detail and "does not exist yet" in sr.target_set.detail
+    assert sr.policy.status == "planned" and result.failures == 0
+    assert make(ONE, sia=sia, dry_run=True, update=True)[0].run().servers[0].target_set.status == "planned"
+    unmanaged = FakeSIA(target_sets=[{"id": WEB01_FQDN, "name": WEB01_FQDN, "type": "Target", "secret_type": "ProvisionerUser",
+                                      "secret_id": "old-secret", "description": "by hand"}])
+    detail = make(ONE, sia=unmanaged, dry_run=True, update=True)[0].run().servers[0].target_set.detail
+    assert f"--adopt {WEB01_FQDN}" in detail
+    result = make(ONE, sia=sia, update=True)[0].run()      # apply agrees: re-pointed once the account exists
+    assert result.servers[0].target_set.status == "updated"
+    assert calls(sia, "update_target_set")[0][1]["secret_id"] == "sec-1"
+
+
 def test_unmanaged_target_set_up_to_date_is_reported():
     sia = FakeSIA(secrets=[{"secret_id": "sec-1", "secret_type": "PCloudAccount", "secret_name": VAULT_SIA_NAME}],
                   target_sets=[{"name": WEB01_FQDN, "type": "Target", "secret_type": "PCloudAccount", "secret_id": "sec-1"}])
@@ -552,6 +611,18 @@ def test_full_policy_drift_includes_schedule_tags_and_connection_behavior():
     assert updated["conditions"]["idleTime"] == DEFAULTS.idle_minutes
     assert "unexpected" not in updated["metadata"]["policyTags"]
     assert updated["behavior"]["connectAs"]["rdp"]["localEphemeralUser"]["enableEphemeralUserReconnect"] is False
+
+
+def test_full_drift_ignores_null_and_empty_fields_echoed_by_the_api():
+    rec, sia, uap, _ = make(ONE)
+    assert rec.run().failures == 0
+    uap.echo_defaults = True
+    result = make(ONE, sia=sia, uap=uap, drift=True)[0].run()
+    assert result.servers[0].policy.status == "exists" and "targets checked" in result.servers[0].policy.detail
+    assert not calls(uap, "update_policy")
+    uap.policies[0]["conditions"]["idleTime"] = 99
+    result = make(ONE, sia=sia, uap=uap, drift=True)[0].run()
+    assert result.servers[0].policy.status == "drift" and "access conditions differ" in result.servers[0].policy.detail
 
 
 @pytest.mark.parametrize("configured", [
@@ -723,6 +794,22 @@ def test_inactive_policy_needs_attention():
     result = make(ONE, sia=sia, uap=uap)[0].run()
     sr = result.servers[0]
     assert sr.policy.status == "inactive" and "status=Suspended" in sr.policy.detail and result.failures == 1 and not sr.ok
+
+
+def test_staged_rollout_with_suspended_default_is_not_flagged_by_later_plans():
+    staged = replace(DEFAULTS, policy_status="Suspended")
+    uap = FakeUAP()
+    uap.create_status = "Suspended"
+    rec, sia, uap, _ = make(ONE, uap=uap, defaults=staged, suspended_ok=True)
+    assert rec.run().servers[0].policy.status == "created"
+    result = make(ONE, sia=sia, uap=uap, defaults=staged, suspended_ok=True)[0].run()
+    sr = result.servers[0]
+    assert sr.policy.status == "exists" and "status=Suspended" in sr.policy.detail and result.failures == 0
+    uap.policies[0]["metadata"]["description"] = "edited in the UI"
+    result = make(ONE, sia=sia, uap=uap, defaults=staged, suspended_ok=True, update=True)[0].run()
+    assert result.servers[0].policy.status == "updated" and uap.policies[0]["metadata"]["status"] == {"status": "Suspended"}
+    # verify does not opt in: users still cannot connect through a suspended policy
+    assert make(ONE, sia=sia, uap=uap, defaults=staged)[0].run().servers[0].policy.status == "inactive"
 
 
 def test_policy_error_status_counts_as_failure_and_validating_is_polled():

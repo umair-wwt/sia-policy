@@ -122,7 +122,7 @@ Details worth knowing:
 
 - `snapshot()` runs once per command; `apply` without `--yes` previews and applies from the same snapshot (no
   second tenant read). A create that then hits a name conflict is reclassified (§3), so a stale preview is safe.
-- Policy creation reads the policy back `status_polls` times (default 1; `[http] status_polls`), 2 s apart while the
+- Policy creation reads the policy back `status_polls` times (default 5; `[http] status_polls`), 2 s apart while the
   status is `Validating`. A failed read-back, missing ID, malformed response, or status that never proves the
   requested final state is `unverified`; it is not counted or checkpointed as success. `Error` is a failure.
 - Group resolution stays single-threaded (the resolver cache is not thread-safe and groups are few); reads,
@@ -269,7 +269,8 @@ same-name policy hidden from the owner-tag listing — is looked up by name and 
 **Checkpoint / resume.** Version 2 records append `{version, key, fingerprint, statuses, refs, at}` only for rows
 whose exact `secret`, `target_set` and `policy` stages are complete and whose non-`n/a` stages have references.
 The fingerprint covers the tenant URLs, all effective object-shaping settings, sanitized template content, account
-mapping and full row input. `--resume` drops only a matching complete record before the snapshot. Older, malformed,
+mapping, full row input and the `update`/`drift` options the row was checked with (a row verified by a lighter
+run is reconciled again by `--update`). `--resume` drops only a matching complete record before the snapshot. Older, malformed,
 incomplete and mismatched records emit a warning and are reconciled. `uncertain`/`unverified` outcomes are never a
 successful record. A checkpoint is a local cache of an earlier verified result, not proof of current tenant state.
 `verify` and `connect-info` never use it.
@@ -544,7 +545,8 @@ directories and atomically publishes `.sia-python.path` only after validation. `
 `--check` before launch and attempts repair once if needed. Avoid moving virtual environments, using activation as
 a prerequisite, or treating successful package installation alone as successful startup.
 
-`.github/workflows/windows.yml` runs the suite and real install/reinstall/launcher checks on native Windows with
+`.github/workflows/ci.yml` lints and runs the suite on Ubuntu, exercises the documented macOS/Linux install path,
+and runs the suite plus real install/reinstall/launcher checks on native Windows with
 PowerShell 5.1/Python 3.11 and PowerShell 7/Python 3.14. It uses temporary source copies and makes no tenant calls.
 Local macOS runs skip Windows-only checks; a newly added workflow still needs a successful hosted run.
 `tests/windows_installer_smoke.ps1` exercises actual installer functions with offline mocks for downloads,

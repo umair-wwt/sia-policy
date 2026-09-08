@@ -470,9 +470,20 @@ def policy_status(policy: dict[str, Any]) -> str:
 
 
 def _normalized(value: Any, key: str = "") -> Any:
-    """Stable nested representation for API fields whose dictionary ordering is irrelevant."""
+    """Stable nested representation for API fields whose dictionary ordering is irrelevant.
+
+    ``null``, empty strings and empty containers are dropped: the API echoes unset optional fields that way
+    (``accessWindow.fromHour``, ``timeFrame.fromTime``, ``connectAs.rdp.domainEphemeralUser`` ...) while the tool
+    simply leaves them out, and both mean the same setting, not drift.
+    """
     if isinstance(value, dict):
-        return tuple(sorted((str(name), _normalized(item, str(name))) for name, item in value.items()))
+        entries = []
+        for name, item in value.items():
+            normalized = _normalized(item, str(name))
+            if normalized is None or normalized == "" or normalized == ():
+                continue
+            entries.append((str(name), normalized))
+        return tuple(sorted(entries))
     if isinstance(value, list):
         items = tuple(_normalized(item) for item in value)
         return tuple(sorted(set(items), key=repr)) if key in ("assignGroups", "daysOfTheWeek") else items

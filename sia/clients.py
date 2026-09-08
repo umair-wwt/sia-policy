@@ -525,10 +525,11 @@ class UAPClient:
                           resource="policy", url=f"{self._base}/api/policies")
 
     def create_policy(self, payload: dict[str, Any]) -> str:
-        body = json_or_error(self._http.post(f"{self._base}/api/policies", json=payload, expected=(200, 201)))
+        resp = self._http.post(f"{self._base}/api/policies", json=payload, expected=(200, 201))
+        body = json_or_error(resp)
         policy_id = (body.get("policyId") or body.get("policy_id")) if isinstance(body, dict) else None
         if not isinstance(policy_id, str) or not policy_id.strip():
-            raise SIAApiError("POST", f"{self._base}/api/policies", 200,
+            raise SIAApiError("POST", resp.url, resp.status_code,
                               f"no policyId in response: {json.dumps(body)[:300]}",
                               uncertain=True, cause="malformed_response")
         return str(policy_id)

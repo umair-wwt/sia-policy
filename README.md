@@ -106,7 +106,9 @@ Use `.venv/bin/sia` again in a new terminal, or activate `.venv` to use the shor
 1. In SIA, choose `/setup`. The bundled starter starts with blank tenant fields, so it cannot
    accidentally connect to an example tenant. Setup explains the defaults, lets you customize them, and shows a
    short summary before saving. When launched from a folder without this file, SIA creates a bundled starter;
-   it never overwrites an existing configuration. You can also edit the generated local file directly:
+   it never overwrites an existing configuration. The starter leaves `strong_account_template` blank, so every
+   row of `servers.csv` has to name its strong account until you switch on the naming convention shown here.
+   You can also edit the generated local file directly:
 
    ```toml
    [tenant]
@@ -119,6 +121,8 @@ Use `.venv/bin/sia` again in a new terminal, or activate `.venv` to use the shor
    from_hour = ""                                       # "" = all day
    to_hour = ""
    target_set_cert_validation = false                   # true once servers have valid WinRM certificates
+   strong_account_template = "ADM-{hostname}"           # name of each server's strong account in SIA; blank = every row must name one
+   strong_account_type = "vault"                        # vault = a reference to the server's local admin in your Vault
    strong_account_safe_template = "SIA-LocalAdmins"     # where the servers' local admin accounts live in the Vault
    strong_account_account_name_template = "{hostname}-Administrator"   # their account name in the Vault
    strong_account_username_template = "Administrator"   # their Windows user name
@@ -301,8 +305,8 @@ Start with one server, test the login as a member of the group, then load the re
 - Work in waves: `--offset 0 --limit 5000`, then `--offset 5000 --limit 5000`, and `verify` after each.
 - Add `--workers 8` and set `max_requests_per_second = 10` in `config.toml`.
 - Interrupted? Run the same `apply` again with `--resume`. Only complete, verified rows from a matching version-2
-  checkpoint are skipped; changed tenant/config/template/input fingerprints and malformed or older records are
-  reconciled again.
+  checkpoint are skipped; changed tenant/config/template/input fingerprints, a different `--update`/`--drift`
+  choice, and malformed or older records are reconciled again.
 
 More in [Large rollouts](docs/OPERATIONS.md#6-large-rollouts).
 

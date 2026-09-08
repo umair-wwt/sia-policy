@@ -1,7 +1,9 @@
 """Thin HTTP layer: one session, bearer auth, structured errors, and a retry policy that cannot duplicate objects.
 
 Retry policy
-  * 401           -> refresh the token once and retry (any method).
+  * 401           -> refresh the token once and retry (any method), unless the client was built with
+                     refresh_on_401=False: a static token (PVWA's session token) cannot be refreshed, and a logon
+                     that was rejected must never be sent a second time.
   * 429           -> retry with backoff (any method: the request was rejected, not processed). With a RateLimiter,
                      every worker pauses for the same interval.
   * 5xx / network -> retry reads only (GET/HEAD/OPTIONS and explicitly marked read-only POST requests). A mutation is
@@ -18,7 +20,7 @@ from typing import Any, Callable, Iterable
 
 import requests
 
-from .redact import redact, sanitize
+from .redact import sanitize
 
 RETRY_STATUSES = frozenset({429, 500, 502, 503, 504})
 RETRY_SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
@@ -121,8 +123,10 @@ class HttpClient:
         limiter: RateLimiter | None = None,
         verify: str | bool = True,
         cancel_check: Callable[[], None] | None = None,
+        refresh_on_401: bool = True,
     ):
         self._token_provider = token_provider
+        self._refresh_on_401 = refresh_on_401
         self._timeout = timeout
         self._max_retries = max_retries
         self._session = session or requests.Session()
@@ -191,7 +195,7 @@ class HttpClient:
             self._log.debug("%s %s -> %s", method, resp.url, resp.status_code)
             if resp.status_code in expected:
                 return resp
-            if resp.status_code == 401 and not refreshed:
+            if resp.status_code == 401 and not refreshed and self._refresh_on_401:
                 refreshed = True
                 self._log.info("401 received, refreshing token and retrying once")
                 self._token_provider(force=True)
@@ -229,9 +233,6 @@ class HttpClient:
 
     def put(self, url: str, **kw) -> requests.Response:
         return self.request("PUT", url, **kw)
-
-    def delete(self, url: str, **kw) -> requests.Response:
-        return self.request("DELETE", url, **kw)
 
 
 def json_or_error(resp: requests.Response, *, mutation: bool | None = None) -> Any:

@@ -20,7 +20,7 @@ def test_starter_requires_real_tenant_settings(tmp_path):
     config = load_config(path)
     assert config.tenant.subdomain == "mytenant"
     assert config.http.verify is True
-    assert config.defaults.target_set_cert_validation is True
+    assert config.defaults.target_set_cert_validation is False
 
 
 def test_existing_config_is_never_changed(tmp_path):

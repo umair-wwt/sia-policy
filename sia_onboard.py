@@ -27,11 +27,9 @@ if __name__ == "__main__":
 import argparse
 from contextlib import redirect_stdout
 from contextvars import ContextVar
-import getpass
 import json
 import logging
 import os
-import sys
 import tempfile
 import traceback
 from collections import Counter
@@ -43,7 +41,7 @@ from sia.auth import AuthError, PlatformTokenProvider, make_identity_token_provi
 from sia.checkpoint import DEFAULT_NAME as CHECKPOINT_NAME
 from sia.checkpoint import Checkpoint
 from sia.clients import IdentityClient, PerAccountTargetSetListingRequired, SIAClient, UAPClient
-from sia.config import Config, ConfigError, load_config, load_password_file, validate
+from sia.config import Config, ConfigError, load_config, load_password_file
 from sia.diagnostics import Diagnostic, diagnose, render_diagnostic, sanitize
 from sia.connect import build_rows, login_suffix, write_connection_outputs
 from sia.http import HttpClient, RateLimiter, SIAApiError
@@ -504,7 +502,7 @@ def cmd_plan_apply(ctx: Context, args: argparse.Namespace, dry_run: bool) -> int
                      lookup=args.lookup, lookup_search_max_rows=ctx.cfg.http.lookup_search_max_rows,
                      checkpoint=checkpoint, resume=args.resume, progress_every=args.progress_every,
                      pvwa=pvwa, pvwa_platform_id=ctx.cfg.pvwa.platform_id, pvwa_cpm_managed=ctx.cfg.pvwa.cpm_managed,
-                     set_policy_status=args.set_policy_status,
+                     set_policy_status=args.set_policy_status, suspended_ok=d.policy_status == "Suspended",
                      reconciliation_context={"tenant": asdict(ctx.cfg.tenant), "pvwa": asdict(ctx.cfg.pvwa)},
                      get_password=make_password_source(allow_prompt=not dry_run, file_passwords=file_passwords))
     result = None

@@ -130,6 +130,7 @@ class FakeUAP:
         self.raise_on_create_policy: SIAApiError | None = None
         self.raise_on_update_policy: SIAApiError | None = None
         self.partial_list = False            # True: list results carry no "targets" (like the real list endpoint)
+        self.echo_defaults = False           # True: GET echoes unset optional fields as null/empty (like the real API)
         self.conflict_on_create: set[str] = set()   # policy names whose creation answers 409
         self._counter = 0
 
@@ -157,8 +158,27 @@ class FakeUAP:
                 copy = json.loads(json.dumps(p))
                 if self.statuses_sequence:
                     copy["metadata"]["status"] = {"status": self.statuses_sequence.pop(0), "statusDescription": "connector unreachable"}
-                return copy
+                return self._with_echoed_defaults(copy) if self.echo_defaults else copy
         raise SIAApiError("GET", f"/api/policies/{policy_id}", 404, "not found")
+
+    @staticmethod
+    def _with_echoed_defaults(policy):
+        """Fields the tool never sends but the API returns as null/empty for an unset value."""
+        policy["metadata"]["timeFrame"] = {"fromTime": None, "toTime": None, **(policy["metadata"].get("timeFrame") or {})}
+        conditions = policy.setdefault("conditions", {})
+        window = conditions.setdefault("accessWindow", {})
+        window.setdefault("fromHour", None)
+        window.setdefault("toHour", None)
+        conditions.setdefault("accessApproval", None)
+        connect_as = policy.setdefault("behavior", {}).setdefault("connectAs", {})
+        rdp = connect_as.get("rdp")
+        if isinstance(rdp, dict):
+            rdp.setdefault("domainEphemeralUser", None)
+            for profile in rdp.values():
+                if isinstance(profile, dict):
+                    profile.setdefault("assignDomainGroups", [])
+        connect_as.setdefault("ssh", None)
+        return policy
 
     def find_policy_by_name(self, name):
         self.calls.append(("find_policy_by_name", name))

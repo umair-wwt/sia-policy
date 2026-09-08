@@ -193,10 +193,10 @@ def print_summary(result: RunResult, out: TextIO | None = None, *, max_rows: int
                  _cell(sr.secret), _cell(sr.target_set), _cell(sr.policy))
                 for sr in servers]
         widths = [max(len(h), *(len(r[i]) for r in rows)) if rows else len(h) for i, h in enumerate(headers)]
-        line = "  ".join(f"{h:<{w}}" for h, w in zip(headers, widths))
+        line = "  ".join(f"{h:<{w}}" for h, w in zip(headers, widths, strict=True))
         print(f"\nServers:\n  {line}\n  {'-' * len(line)}", file=out)
         for r in rows:
-            print("  " + "  ".join(f"{c:<{w}}" for c, w in zip(r, widths)), file=out)
+            print("  " + "  ".join(f"{c:<{w}}" for c, w in zip(r, widths, strict=True)), file=out)
         if hidden:
             print(f"  ... {hidden} row(s) with nothing to report not shown (see the CSV report)", file=out)
         details = []
@@ -378,10 +378,10 @@ def print_verify(result: RunResult, out: TextIO | None = None, *, max_rows: int 
     if shown:
         headers = ("Server", "Policy", "Strong account", "Secret", "Target set", "Policy", "Verdict")
         widths = [max(len(h), *(len(r[i]) for r in shown)) for i, h in enumerate(headers)]
-        line = "  ".join(f"{h:<{w}}" for h, w in zip(headers, widths))
+        line = "  ".join(f"{h:<{w}}" for h, w in zip(headers, widths, strict=True))
         print(f"  {line}\n  {'-' * len(line)}", file=out)
         for row in shown[:max_rows]:
-            print("  " + "  ".join(f"{c:<{w}}" for c, w in zip(row[:7], widths)), file=out)
+            print("  " + "  ".join(f"{c:<{w}}" for c, w in zip(row[:7], widths, strict=True)), file=out)
         if len(shown) > max_rows:
             print(f"  ... {len(shown) - max_rows} more (see the CSV)", file=out)
     if problems:

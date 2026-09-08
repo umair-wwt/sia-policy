@@ -567,3 +567,19 @@ def test_dns_total_length_and_template_operators_are_rejected(tmp_path):
     make_inputs(tmp_path, "web01.corp.example.com,SA1,G\n", "SA1,existing,,,,,\n")
     with pytest.raises(InputError, match="format specifications are not supported"):
         load_inputs(tmp_path, policy_name_template="{hostname:>20}")
+
+
+def test_shipped_sample_input_loads_with_the_example_configuration():
+    """README, config.example.toml and input/ must stay in step: the example derives ADM-<hostname> accounts."""
+    from sia.config import load_config
+
+    defaults = load_config(ROOT / "config.example.toml").defaults
+    loaded = load_inputs(ROOT / "input", strong_account_template=defaults.strong_account_spec or "",
+                         ssh_username_default=defaults.ssh_username, policy_name_template=defaults.policy_name_template,
+                         group_template=defaults.group_template, target_set_scope=defaults.target_set_scope)
+    accounts = {server.strong_account for server in loaded.servers if not server.is_ssh}
+    assert accounts == {"ADM-web01", "ADM-web02", "SA-dmz-localadmin", "SA-corp-domain"}
+    assert loaded.strong_accounts["ADM-web01"].type == "vault"
+    # The bundled starter leaves strong_account_template blank: rows must then name their account.
+    with pytest.raises(InputError, match="strong_account is required"):
+        load_inputs(ROOT / "input")

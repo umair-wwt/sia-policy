@@ -31,7 +31,7 @@ def local_checks(args, session, *, load_config: Callable, load_inputs: Callable)
     try:
         cfg = load_config(args)
         record("Configuration", "passed", str(Path(args.config).resolve()))
-    except (Exception,) as exc:
+    except Exception as exc:
         record("Configuration", "failed", str(exc), exc)
     try:
         env_path = Path(args.env)

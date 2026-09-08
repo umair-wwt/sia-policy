@@ -152,7 +152,7 @@ class AuthConfig:
 class HttpConfig:
     timeout_seconds: int = 60
     max_retries: int = 4
-    status_polls: int = 1                      # GETs after creating a policy while it is still "Validating" (1..10)
+    status_polls: int = 5                      # GETs after creating a policy while it is still "Validating" (1..10)
     max_requests_per_second: float = 0.0       # global rate limit shared by all workers; 0 = off
     lookup_search_max_rows: int = 2000         # --lookup auto: search per server up to this many servers, else list
     secrets_api: str = "auto"                  # auto | public (/api/secrets/public/v1+v2) | legacy (/api/secrets)
@@ -338,7 +338,7 @@ def _validate_https_url(label: str, value: str, *, allow_empty: bool = False) ->
         raise ConfigError(f"{label} must not contain whitespace or control characters")
     try:
         parsed = urlsplit(value)
-        parsed.port
+        _ = parsed.port     # a malformed port raises ValueError here
     except ValueError as exc:
         raise ConfigError(f"{label} is not a valid URL: {exc}") from exc
     suggestion = suggest_https_base_url(value)
@@ -750,23 +750,25 @@ def load_dotenv(path: str | Path, *, override: bool = False) -> dict[str, str]:
     return loaded
 
 
+_PERMISSION_WARNINGS_SHOWN: set[str] = set()
+
+
 def _warn_if_readable_by_others(path: Path) -> None:
+    """Warn once per file per process: the terminal home re-reads credentials on every status refresh."""
+    key = os.path.normcase(str(path.resolve()))
+    if key in _PERMISSION_WARNINGS_SHOWN:
+        return
     if windows_acl_supported():
         status = inspect_credential_permissions(path)
         if status.secure is not True:
+            _PERMISSION_WARNINGS_SHOWN.add(key)
             logging.getLogger("sia.config").warning("%s: %s", path, status.message)
         return
     mode = path.stat().st_mode
     if mode & (stat.S_IRWXG | stat.S_IRWXO):
+        _PERMISSION_WARNINGS_SHOWN.add(key)
         logging.getLogger("sia.config").warning(
             "%s is readable by other users (mode %o); run: chmod 600 %s", path, stat.S_IMODE(mode), path)
-
-
-def require_env(name: str) -> str:
-    value = os.environ.get(name, "")
-    if not value:
-        raise ConfigError(f"environment variable {name} is not set (put it in .env or export it)")
-    return value
 
 
 def load_password_file(path: str | Path) -> dict[str, str]:

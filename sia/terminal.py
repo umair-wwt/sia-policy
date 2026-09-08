@@ -1,7 +1,6 @@
 """Guided terminal workspace. Tenant work uses the regular CLI dispatcher."""
 from __future__ import annotations
 
-import getpass
 import hashlib
 import json
 import os
@@ -291,7 +290,7 @@ def rebase_with_recovery(doc) -> tuple:
             if action == "retry":
                 continue
             if action == "home":
-                raise Cancelled
+                raise Cancelled from None
             note("Choose retry or home.")
 
 
@@ -379,7 +378,7 @@ def credentials(args, session, *, service_pair: bool = False) -> None:
     keys = ("SIA_CLIENT_ID", "SIA_CLIENT_SECRET", "PVWA_USER", "PVWA_PASSWORD")
     labels = ("SIA service user", "SIA service-user password", "Vault user (optional)", "Vault password (optional)")
     options = {"sia": ("Set up SIA sign-in", "Enter the service user and its password together")}
-    for number, (key, label) in enumerate(zip(keys, labels), 1):
+    for number, (key, label) in enumerate(zip(keys, labels, strict=True), 1):
         shadow = "; saved file value overridden" if key in file_values and sources.get(key) != "file" else ""
         options[str(number)] = (label, f"{'Set' if values.get(key) else 'Missing'} · {sources.get(key, 'none')}{shadow}")
     options["5"] = ("Another account password", "Use the password variable from your account mapping")

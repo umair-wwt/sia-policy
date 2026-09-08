@@ -225,6 +225,45 @@ def test_source_change_during_install_does_not_switch_pointer(installer, monkeyp
     assert pointer.read_text(encoding="utf-8").strip() == str(installer._absolute(old_python))
 
 
+def test_successful_install_prunes_superseded_runtimes(installer, monkeypatch, tmp_path):
+    root = make_project(tmp_path)
+    stale = root / ".sia-runtime" / "envs" / "20240101-000000-stale"
+    installer.python_in(stale).parent.mkdir(parents=True)
+    installer.python_in(stale).write_bytes(b"")
+    (root / ".venv" / "Scripts").mkdir(parents=True)      # a project venv is never the installer's to remove
+    monkeypatch.setattr(installer, "compatible_python", lambda _python: True)
+    monkeypatch.setattr(installer, "select_existing", lambda *_args: None)
+
+    def create(_base, env):
+        python = installer.python_in(env)
+        python.parent.mkdir(parents=True)
+        python.write_bytes(b"")
+
+    monkeypatch.setattr(installer, "_create_venv", create)
+    monkeypatch.setattr(installer, "_install_project", lambda *_args: None)
+    monkeypatch.setattr(installer, "validate_environment", lambda *_args, **_kwargs: True)
+    python, pointer, reused = installer.install(Path(sys.executable), root)
+    assert not reused and not stale.exists() and (root / ".venv").is_dir()
+    assert [path.name for path in (root / ".sia-runtime" / "envs").iterdir()] == [python.parent.parent.name]
+    assert pointer.read_text(encoding="utf-8").strip() == str(installer._absolute(python))
+
+
+def test_reusing_a_runtime_prunes_the_others(installer, monkeypatch, tmp_path):
+    root = make_project(tmp_path)
+    runtime = root / ".sia-runtime"
+    current, stale = runtime / "envs" / "current", runtime / "envs" / "stale"
+    for env in (current, stale):
+        installer.python_in(env).parent.mkdir(parents=True)
+        installer.python_in(env).write_bytes(b"")
+    installer.atomic_write_pointer(root / installer.POINTER_NAME, installer.python_in(current))
+    monkeypatch.setattr(installer, "compatible_python", lambda _python: True)
+    monkeypatch.setattr(installer, "validate_environment", lambda candidate, *_args, **_kwargs: candidate == current)
+    monkeypatch.setattr(installer, "_create_venv", lambda *_args: pytest.fail("should reuse"))
+    selected, _, reused = installer.install(Path(sys.executable), root)
+    assert reused and selected == installer.python_in(current)
+    assert current.is_dir() and not stale.exists()
+
+
 def test_reuses_verified_project_venv_without_installing(installer, monkeypatch, tmp_path):
     root = make_project(tmp_path)
     env = root / ".venv"

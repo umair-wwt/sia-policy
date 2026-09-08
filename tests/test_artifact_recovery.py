@@ -171,3 +171,48 @@ def test_generated_rdp_suffix_cannot_collide_with_another_row(tmp_path):
     assert first.read_text() == "previous"
     assert len(set(written)) == 2 and all(path.is_file() for path in written)
     assert [row.rdp_file for row in rows] == [str(path) for path in written]
+
+
+def test_exclusive_publish_falls_back_when_hard_links_are_unsupported(tmp_path, monkeypatch):
+    def no_links(source, target):
+        raise OSError(errno.EPERM, "Operation not permitted")   # exFAT, FAT32, some network shares
+
+    monkeypatch.setattr(artifacts.os, "link", no_links)
+    json_path, csv_path = write_reports(result_with([("created", "created")]), tmp_path / "reports")
+    assert json_path.is_file() and csv_path.read_text().startswith("fqdn,")
+    assert not list((tmp_path / "reports").glob(".*.tmp"))
+    again, _ = write_reports(result_with([("created", "created")]), tmp_path / "reports")
+    assert again != json_path and json_path.stat().st_size > 0          # a generated name is never reused
+    csv, rdp = tmp_path / "connections.csv", tmp_path / "web.rdp"
+    written, files = write_connection_outputs([connection(rdp)], csv, generated=True, generated_rdp=True)
+    assert written.is_file() and files == [rdp] and rdp.read_text().startswith("full address:s:web.example.com")
+
+
+def test_exclusive_fallback_never_replaces_an_existing_output(tmp_path, monkeypatch):
+    monkeypatch.setattr(artifacts.os, "link", lambda source, target: (_ for _ in ()).throw(OSError(errno.EPERM, "no links")))
+    destination = tmp_path / "result.json"
+    destination.write_text("other process")
+    with pytest.raises(artifacts.ArtifactWriteError) as caught:
+        artifacts.write_artifacts([(destination, b"mine")], exclusive=(destination,))
+    assert isinstance(caught.value.cause, FileExistsError) and caught.value.completed_paths == ()
+    assert destination.read_text() == "other process" and not list(tmp_path.glob(".*.tmp"))
+
+
+def test_interrupted_fallback_copy_leaves_no_partial_output(tmp_path, monkeypatch):
+    monkeypatch.setattr(artifacts.os, "link", lambda source, target: (_ for _ in ()).throw(OSError(errno.EPERM, "no links")))
+    original = artifacts.os.fsync
+    calls = 0
+
+    def interrupt_publish(fd):
+        nonlocal calls
+        calls += 1
+        if calls == 2:      # the first fsync stages the temporary file; the second publishes the copy
+            raise KeyboardInterrupt
+        return original(fd)
+
+    monkeypatch.setattr(artifacts.os, "fsync", interrupt_publish)
+    destination = tmp_path / "result.json"
+    with pytest.raises(artifacts.ArtifactWriteError) as caught:
+        artifacts.write_artifacts([(destination, b"complete")], exclusive=(destination,))
+    assert caught.value.interrupted and caught.value.completed_paths == ()
+    assert not destination.exists() and not list(tmp_path.glob(".*.tmp"))

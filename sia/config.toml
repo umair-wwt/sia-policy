@@ -20,14 +20,18 @@ days_of_week = [0, 1, 2, 3, 4, 5, 6]   # Sunday = 0; Saturday = 6
 from_hour = ""                         # Empty start and end = all day
 to_hour = ""                           # Otherwise use 24-hour times such as "17:00"
 
-# Require a trusted certificate on Windows targets using WinRM over HTTPS.
-target_set_cert_validation = true
+# Validate the certificate Windows targets present over WinRM (HTTPS). Set it to true once every server has a
+# trusted certificate; most environments start with false.
+target_set_cert_validation = false
 max_session_hours = 2
 idle_minutes = 10
 assign_local_groups = ["Administrators"]
 enable_reconnect = false
 
-# Leave blank when server/group/account mappings are provided in the input CSV files.
+# Leave blank when server/group/account mappings are provided in the input CSV files. With a blank
+# strong_account_template every servers.csv row must name its strong account (or its domain must be listed in
+# domains.csv). To derive one per server instead, set for example strong_account_template = "ADM-{hostname}",
+# strong_account_type = "vault" and the safe/account-name templates documented in config.example.toml.
 group_template = ""
 strong_account_template = ""
 strong_account_type = "existing"

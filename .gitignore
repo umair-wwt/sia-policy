@@ -19,3 +19,6 @@ reports/
 out/
 .sia-checkpoint.jsonl
 input/.sia-checkpoint.jsonl
+
+# lint cache
+.ruff_cache/

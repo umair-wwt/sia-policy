@@ -263,9 +263,10 @@ The programme this tool was built for has ~70,000 servers and up to two policies
   `--offset 5000 --limit 5000`, … (rows of one server always travel together). Run `verify` after each wave.
 - **Resume completed work.** `apply` records complete, verified rows in `<input>/.sia-checkpoint.jsonl`
   (`--checkpoint FILE` to move it). Version 2 fingerprints the tenant identity, effective object settings, template
-  content, account mapping and row input. With `--resume`, only a complete record whose version and fingerprint
-  still match is skipped without a request. Older, malformed, incomplete, uncertain and unverified records, or
-  rows affected by a setting/template/input change, are reconciled again with an explanatory warning. A checkpoint
+  content, account mapping, row input and the `--update`/`--drift` choice the row was checked with. With `--resume`,
+  only a complete record whose version and fingerprint still match is skipped without a request. Older, malformed,
+  incomplete, uncertain and unverified records, or rows affected by a setting/template/input/option change, are
+  reconciled again with an explanatory warning. A checkpoint
   proves only what an earlier tool run verified; it is not current live-tenant evidence.
 - **Lookups scale with the wave.** `--lookup search` (default up to 2,000 servers per run) reads the objects of
   the servers in the wave, one request per server in parallel; `--lookup list` (default above that) reads one
