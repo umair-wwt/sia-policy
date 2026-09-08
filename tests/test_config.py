@@ -302,7 +302,7 @@ def test_ca_bundle_and_verify(tmp_path):
     with pytest.raises(ConfigError, match="does not exist"):
         load_config(make(tmp_path, other_sections='[http]\nca_bundle = "/no/such/bundle.pem"\n'))
     with pytest.raises(ConfigError, match="verify = false; pick one"):
-        load_config(make(tmp_path, other_sections=f'[http]\nca_bundle = "{bundle}"\nverify = false\n'))
+        load_config(make(tmp_path, other_sections=f'[http]\nca_bundle = "{bundle.as_posix()}"\nverify = false\n'))
 
 
 def test_policy_status(tmp_path):
