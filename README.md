@@ -138,6 +138,13 @@ Use `.venv/bin/sia` again in a new terminal, or activate `.venv` to use the shor
    SIA_CLIENT_SECRET=its-password
    ```
 
+   Paste the secret unquoted and it is stored exactly as typed, backslashes included — a
+   password like `p@ss\word` needs no escaping. Quote it only when it starts or ends with a
+   space or contains ` #`; quotes delimit rather than escape, so a backslash is never doubled
+   and only a doubled quote is special (`"it""s"` is `it"s`). Save `.env` as UTF-8 —
+   PowerShell's `>`, `Out-File` and `Set-Content` write UTF-16 unless given
+   `-Encoding utf8`. Entering the credential under Settings > Credentials avoids all of this.
+
    Exported environment variables take precedence over session and `.env` values. `sia settings --show` reports
    whether each credential is set and which source wins, without printing its value. Windows saves automatically
    protect `.env` with a private file ACL. If that protection cannot be established before saving, the terminal home

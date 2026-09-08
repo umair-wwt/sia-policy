@@ -9,15 +9,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterator
 
-from .config import ConfigError, read_dotenv
+from .config import ConfigError, looks_like_credential, read_dotenv
 from .redact import register_secret
 
-_SECRET_WORDS = ("SECRET", "PASSWORD", "TOKEN")
 _SHELL_SECRET_KEYS = frozenset({"SIA_CLIENT_SECRET", "PVWA_PASSWORD"})
-
-
-def _looks_secret(key: str) -> bool:
-    return any(word in key.upper() for word in _SECRET_WORDS)
 
 
 def _consumed_shell_secret(key: str) -> bool:
@@ -84,7 +79,7 @@ class Session:
         sources.update({key: "session" for key in self.secrets})
         sources.update({key: "shell" for key in self.shell_env})
         for key, value in {**file_values, **self.secrets}.items():
-            if _looks_secret(key):
+            if looks_like_credential(key):
                 register_secret(value)
         for key, value in self.shell_env.items():
             if _consumed_shell_secret(key):

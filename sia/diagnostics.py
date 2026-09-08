@@ -131,7 +131,10 @@ HELP_CATALOGUE: dict[str, dict[str, Any]] = {
     "SIA-AUTH-REJECTED": {
         "summary": "CyberArk rejected the supplied identity credentials.",
         "actions": ("Confirm the tenant URL, client ID, and client secret.",
-                    "Confirm the service user is enabled and configured as an OAuth confidential client."),
+                    "Confirm the service user is enabled and configured as an OAuth confidential client.",
+                    "Check how the secret is written in .env: quotes are taken literally, so a backslash "
+                    "needs no doubling, and an unquoted value ends at its first ' #'. Re-entering it under "
+                    "Settings > Credentials always stores it exactly as typed."),
         "keywords": ("auth", "401", "credential", "login", "oauth"),
     },
     "SIA-PERMISSION": {

@@ -275,3 +275,91 @@ def test_dotenv_atomic_write_rechecks_digest_immediately_before_replace(tmp_path
     with pytest.raises(SettingsConflictError, match="while the replacement file was being staged"):
         update_dotenv(path, {"ONE": "draft"}, expected_digest=digest)
     assert path.read_text(encoding="utf-8") == "ONE=external\n"
+
+
+# Values whose serialized form must read back byte-identically. A credential is arbitrary text, so
+# backslashes, both quote characters, `#`, edge whitespace and `=` all have to survive the round trip.
+ENV_ROUND_TRIP = [
+    r"p@ss\word", r"DOMAIN\svc_sia", r"C:\Users\svc", r"abc\tdef", "abc\\", "\\",
+    'a"b', "a'b", """a'b"c""", '"quoted-looking"', "'quoted-looking'",
+    'secret # with "quotes"', "a  #  b", "#hash", "}brace", "]brack",
+    "p@ss word", " lead", "trail ", "\xa0nbsp", "nbsp\xa0", "\u3000ideographic",
+    "a=b", "=x", "export FOO=bar", "plain", "café", "日本", "[1,2]", "{x", "", "''", '""',
+]
+
+
+@pytest.mark.parametrize("value", ENV_ROUND_TRIP)
+def test_update_dotenv_round_trips_every_credential_shape(tmp_path, value):
+    path = tmp_path / ".env"
+    update_dotenv(path, {"SIA_CLIENT_SECRET": value})
+    text = path.read_text(encoding="utf-8")
+    assert len(text.splitlines()) == 1, "the value tore its line"
+    assert read_dotenv(path)["SIA_CLIENT_SECRET"] == value
+
+
+def test_update_dotenv_stores_a_backslash_secret_verbatim(tmp_path):
+    """The reported bug: a stored secret must not need -- or show -- any escaping."""
+    path = tmp_path / ".env"
+    update_dotenv(path, {"SIA_CLIENT_SECRET": r"p@ss\word", "PVWA_USER": r"ACME\svc_sia"})
+    assert path.read_text(encoding="utf-8") == "SIA_CLIENT_SECRET=p@ss\\word\nPVWA_USER=ACME\\svc_sia\n"
+
+
+def test_update_dotenv_serializes_predictably(tmp_path):
+    for value, expected in [
+        (r"p@ss\word", "K=p@ss\\word\n"), ("a=b", "K=a=b\n"), ("#x", "K='#x'\n"),
+        ("a b", "K=a b\n"), ('a"b', "K='a\"b'\n"), (" x ", "K=' x '\n"),
+        ('secret # with "quotes"', "K='secret # with \"quotes\"'\n"),
+        ("a'b", 'K="a\'b"\n'), ("""a'b"c""", 'K="a\'b""c"\n'), ("", "K=''\n"),
+    ]:
+        path = tmp_path / f".env-{abs(hash(value))}"
+        update_dotenv(path, {"K": value})
+        assert path.read_text(encoding="utf-8") == expected, value
+
+
+def test_update_dotenv_refuses_values_that_cannot_survive_a_line(tmp_path):
+    path = tmp_path / ".env"
+    # \x85, \u2028 and \u2029 matter because str.splitlines() breaks on them while the JSON
+    # quoting this replaced left them raw, tearing the line on the next read.
+    for value in ("a\tb", "a\x00b", "a\x0bb", "a\x7fb", "a\x85b", "a\u2028b", "a\u2029b", "a\nb"):
+        with pytest.raises(ConfigError, match="one line with no control characters"):
+            update_dotenv(path, {"SIA_CLIENT_SECRET": value})
+    assert not path.exists()
+
+
+def test_update_dotenv_preserves_comments_across_every_quoting_form(tmp_path):
+    for value in (r"p@ss\word", "needs 'quoting'", 'has "both" and \'one\''):
+        path = tmp_path / f".env-{abs(hash(value))}"
+        path.write_text("export SIA_CLIENT_SECRET=old  # keep note\n", encoding="utf-8")
+        update_dotenv(path, {"SIA_CLIENT_SECRET": value})
+        text = path.read_text(encoding="utf-8")
+        assert "# keep note" in text and text.startswith("export SIA_CLIENT_SECRET=")
+        assert read_dotenv(path)["SIA_CLIENT_SECRET"] == value
+
+
+def test_update_dotenv_preserves_crlf_line_endings(tmp_path):
+    path = tmp_path / ".env"
+    path.write_bytes(b"# note\r\nUNKNOWN=keep\r\nSIA_CLIENT_SECRET=old\r\n")
+    update_dotenv(path, {"SIA_CLIENT_SECRET": r"p@ss\word", "ADDED": "x"})
+    data = path.read_bytes()
+    assert data == b"# note\r\nUNKNOWN=keep\r\nSIA_CLIENT_SECRET=p@ss\\word\r\nADDED=x\r\n"
+    assert read_dotenv(path)["SIA_CLIENT_SECRET"] == r"p@ss\word"
+
+
+def test_update_dotenv_saves_despite_an_undecodable_unrelated_line(tmp_path):
+    """One unrepairable line must not lock an operator out of saving a credential."""
+    path = tmp_path / ".env"
+    path.write_text('OTHER="ok" then junk\nSIA_CLIENT_ID=svc\n', encoding="utf-8")
+    with pytest.raises(ConfigError, match="text after the closing"):
+        read_dotenv(path)
+    update_dotenv(path, {"SIA_CLIENT_SECRET": r"p@ss\word"})
+    assert 'OTHER="ok" then junk' in path.read_text(encoding="utf-8")
+    assert read_dotenv(path, strict=False)["SIA_CLIENT_SECRET"] == r"p@ss\word"
+
+
+def test_update_dotenv_repairs_a_notepad_byte_order_mark_without_duplicating_keys(tmp_path):
+    path = tmp_path / ".env"
+    path.write_bytes("\ufeffSIA_CLIENT_ID=svc\n".encode("utf-8"))
+    assert read_dotenv(path) == {"SIA_CLIENT_ID": "svc"}
+    update_dotenv(path, {"SIA_CLIENT_ID": "svc2"})
+    assert path.read_bytes() == b"SIA_CLIENT_ID=svc2\n"
+    assert read_dotenv(path) == {"SIA_CLIENT_ID": "svc2"}

@@ -7,9 +7,29 @@ import sys
 from pathlib import Path
 from typing import Callable
 
-from .config import ConfigError
+from .config import ConfigError, decode_text_file, looks_like_credential
 from .diagnostics import diagnose, render_diagnostic
 from .windows_security import inspect_credential_permissions, windows_acl_supported
+
+
+def _reinterpreted_credential_lines(env_path: Path) -> list[str]:
+    """Credential lines whose stored form no longer means what an older SIA release stored.
+
+    Quoted values are now literal, so a backslash written for an older release is part of the
+    value. Naming the line lets an operator re-enter that one credential instead of guessing
+    which of them the tenant is rejecting. Values are never read or reported.
+    """
+    findings: list[str] = []
+    for lineno, line in enumerate(decode_text_file(env_path, "credentials file").splitlines(), start=1):
+        stripped = line.strip()
+        key, _, value = stripped.partition("=")
+        key = key.removeprefix("export ").strip()
+        if stripped.startswith("#") or not looks_like_credential(key):
+            continue
+        if value.strip()[:1] in ("\"", "'") and "\\" in value:
+            findings.append(f"line {lineno}: {key} is quoted and contains a backslash, which is now part of "
+                            f"the value; re-enter it under Settings > Credentials if it was saved before this release")
+    return findings
 
 
 def local_checks(args, session, *, load_config: Callable, load_inputs: Callable) -> tuple[list[dict], object | None]:
@@ -48,6 +68,11 @@ def local_checks(args, session, *, load_config: Callable, load_inputs: Callable)
             for key in ("PVWA_USER", "PVWA_PASSWORD"):
                 present = bool(values.get(key))
                 record(key, "passed" if present else "warning", f"set ({sources.get(key)})" if present else "missing; needed for configured PVWA operations")
+        if env_path.is_file():
+            reinterpreted = _reinterpreted_credential_lines(env_path)
+            record("Credential file quoting", "warning" if reinterpreted else "passed",
+                   "; ".join(reinterpreted) if reinterpreted else
+                   "Stored values need no escaping; each reads back exactly as written")
         if env_path.exists():
             if windows_acl_supported():
                 permission = inspect_credential_permissions(env_path)

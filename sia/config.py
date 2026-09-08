@@ -1,9 +1,9 @@
 """Configuration loading: config.toml (non-secret) + .env (secrets) + validation."""
 from __future__ import annotations
 
+import codecs
 import csv
 import ipaddress
-import json
 import logging
 import math
 import os
@@ -634,53 +634,141 @@ def parse_config(text: str, source_path: str | Path = "config.toml") -> Config:
     return cfg
 
 
+# UTF-32's BOMs start with UTF-16's, so the wider prefix has to be tested first.
+_BYTE_ORDER_MARKS = (
+    (codecs.BOM_UTF32_LE, "UTF-32"), (codecs.BOM_UTF32_BE, "UTF-32"),
+    (codecs.BOM_UTF16_LE, "UTF-16"), (codecs.BOM_UTF16_BE, "UTF-16"),
+)
+
+
+def decode_text_bytes(data: bytes, path: Path, label: str) -> str:
+    """Decode one project text file as UTF-8, absorbing a byte-order mark.
+
+    Ordinary Windows editing produces both shapes this has to survive: Notepad writes UTF-8
+    with a BOM, and PowerShell 5.1's ``>``, ``Out-File`` and ``Set-Content`` write UTF-16 by
+    default.  ``utf-8-sig`` absorbs a UTF-8 BOM; UTF-16 cannot be decoded as UTF-8 at all, so
+    it is reported with the command that rewrites it rather than as a decoding failure.
+
+    Callers that also digest the file keep hashing the raw bytes; only the parsed text changes.
+    """
+    for mark, encoding in _BYTE_ORDER_MARKS:
+        if data.startswith(mark):
+            raise ConfigError(
+                f"{path}: this {label} is {encoding} text and SIA reads UTF-8. PowerShell's >, Out-File and "
+                f"Set-Content write {encoding} unless told otherwise; rewrite the file with "
+                f"Set-Content -Encoding utf8, or in Notepad use File > Save as with encoding UTF-8."
+            )
+    try:
+        return data.decode("utf-8-sig")
+    except UnicodeDecodeError as exc:
+        raise ConfigError(f"{path}: {label} must be UTF-8 text: {exc}") from exc
+
+
+def decode_text_file(path: Path, label: str) -> str:
+    """Read and decode one project text file; see :func:`decode_text_bytes`."""
+    try:
+        data = path.read_bytes()
+    except OSError as exc:
+        raise ConfigError(f"cannot read {label} {path}: {exc}") from exc
+    return decode_text_bytes(data, path, label)
+
+
 def load_config(path: str | Path) -> Config:
     path = Path(path).expanduser()
     if not path.is_file():
         raise ConfigError(f"config file not found: {path} (copy config.example.toml to config.toml)")
-    try:
-        text = path.read_text(encoding="utf-8")
-    except UnicodeDecodeError as exc:
-        raise ConfigError(f"{path}: configuration must be UTF-8 text: {exc}") from exc
-    except OSError as exc:
-        raise ConfigError(f"cannot read config file {path}: {exc}") from exc
-    return parse_config(text, path)
+    return parse_config(decode_text_file(path, "configuration"), path)
 
 
-_ENV_LINE = re.compile(r"^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$")
+_ENV_LINE = re.compile(r"^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=(\s*)(.*)$")
+_SECRET_WORDS = ("SECRET", "PASSWORD", "TOKEN")
+# The only sequences the JSON-quoting writer this replaced could emit for a printable value.
+_LEGACY_ESCAPE = re.compile(r"\\[\\\"']")
 
 
-def _parse_env_value(path: Path, lineno: int, raw: str) -> str:
+def looks_like_credential(key: str) -> bool:
+    """Whether an environment variable name reads as a credential.
+
+    A naming heuristic, not a security boundary: `password_env` in strong_accounts.csv is
+    operator-chosen, so this can only be used to decide how loudly to explain something.
+    """
+    return any(word in key.upper() for word in _SECRET_WORDS)
+
+
+def scan_quoted_value(value: str) -> tuple[str, int] | None:
+    """Decode a leading quoted literal as ``(text, index after its closing quote)``.
+
+    Quoting delimits a value; it does not escape anything inside it.  A backslash is always
+    literal, which is what a pasted credential needs: `DOMAIN\\user` and `C:\\path` mean
+    themselves.  Only the quote character is special, and doubling it writes one literal
+    quote -- the convention `_powershell_literal` already emits and `_split_windows_command_line`
+    already accepts.  Returns None when the closing quote is absent.
+    """
+    quote = value[0]
+    parts: list[str] = []
+    index = 1
+    while index < len(value):
+        if value[index] == quote:
+            if value[index + 1:index + 2] == quote:
+                parts.append(quote)
+                index += 2
+                continue
+            return "".join(parts), index + 1
+        parts.append(value[index])
+        index += 1
+    return None
+
+
+def _parse_env_value(path: Path, lineno: int, key: str, raw: str, *, strict: bool = True) -> str:
     value = raw.strip()
     if not value:
         return ""
-    if value[0] == '"':
-        decoder = json.JSONDecoder()
-        try:
-            decoded, end = decoder.raw_decode(value)
-        except (json.JSONDecodeError, ValueError) as exc:
-            raise ConfigError(f"{path}:{lineno}: invalid double-quoted value: {exc}") from exc
-        if not isinstance(decoded, str):
-            raise ConfigError(f"{path}:{lineno}: expected a quoted string value")
+    if value[0] in "\"'":
+        quote = value[0]
+        kind = "double" if quote == '"' else "single"
+        scanned = scan_quoted_value(value)
+        if scanned is None:
+            if not strict:
+                return value
+            raise ConfigError(
+                f"{path}:{lineno}: {key} has an unterminated {kind}-quoted value. Add the closing {quote}, "
+                f"or remove both quotes -- an unquoted value runs literally to the end of the line."
+            )
+        text, end = scanned
         remainder = value[end:].strip()
         if remainder and not remainder.startswith("#"):
-            raise ConfigError(f"{path}:{lineno}: unexpected text after quoted value")
-        return decoded
-    if value[0] == "'":
-        end = value.find("'", 1)
-        if end < 0:
-            raise ConfigError(f"{path}:{lineno}: unterminated single-quoted value")
-        remainder = value[end + 1:].strip()
-        if remainder and not remainder.startswith("#"):
-            raise ConfigError(f"{path}:{lineno}: unexpected text after quoted value")
-        return value[1:end]
+            if not strict:
+                return value
+            raise ConfigError(
+                f"{path}:{lineno}: {key} has text after the closing {quote} of its {kind}-quoted value. "
+                f"Put one {quote} before and after the whole value, and write {quote * 2} for a literal "
+                f"{quote} inside it. A backslash needs no doubling."
+            )
+        if _LEGACY_ESCAPE.search(value[:end]):
+            _warn_once(path, lineno, key, "legacy-escape",
+                       f"{key} contains a backslash before a quote or another backslash. Quoted values are now "
+                       f"taken literally, so that backslash is part of the value; SIA releases before this one "
+                       f"read \\\\ as one backslash. If this credential was saved by an older release, re-enter "
+                       f"it under Settings > Credentials so the file matches what the tenant expects.")
+        return text
     if value[0] in "}]":
         raise ConfigError(f"{path}:{lineno}: malformed value")
-    return value.split(" #", 1)[0].rstrip()
+    text = value.split(" #", 1)[0].rstrip()
+    if looks_like_credential(key) and text != value:
+        _warn_once(path, lineno, key, "bare-trim",
+                   f"{key} is unquoted, so everything from its first ' #' onwards was read as a comment. "
+                   f"If those characters belong to the credential, wrap the whole value in single quotes.")
+    return text
 
 
-def read_dotenv(path: str | Path) -> dict[str, str]:
-    """Read a .env file without changing ``os.environ``. Missing files return an empty mapping."""
+def read_dotenv(path: str | Path, *, strict: bool = True) -> dict[str, str]:
+    """Read a .env file without changing ``os.environ``. Missing files return an empty mapping.
+
+    ``strict=False`` keeps the line-syntax and duplicate-key checks but hands back the raw text
+    of a value it cannot decode instead of raising.  That is what :func:`update_dotenv` needs:
+    it never looks at the decoded values, so one unrepairable line elsewhere in the file must
+    not be able to block saving a credential.
+    """
     path = Path(path)
     loaded: dict[str, str] = {}
     first_lines: dict[str, int] = {}
@@ -701,12 +789,7 @@ def read_dotenv(path: str | Path) -> dict[str, str]:
     if not stat.S_ISREG(path_stat.st_mode):
         raise ConfigError(f"credentials path {path} must be a regular file")
     _warn_if_readable_by_others(path)
-    try:
-        lines = path.read_text(encoding="utf-8").splitlines()
-    except UnicodeDecodeError as exc:
-        raise ConfigError(f"{path}: credentials file must be UTF-8 text: {exc}") from exc
-    except OSError as exc:
-        raise ConfigError(f"cannot read credentials file {path}: {exc}") from exc
+    lines = decode_text_file(path, "credentials file").splitlines()
     for lineno, line in enumerate(lines, start=1):
         stripped = line.strip()
         if not stripped or stripped.startswith("#"):
@@ -717,7 +800,14 @@ def read_dotenv(path: str | Path) -> dict[str, str]:
         key = match.group(1)
         if key in loaded:
             raise ConfigError(f"{path}:{lineno}: duplicate key {key!r} (first set on line {first_lines[key]})")
-        value = _parse_env_value(path, lineno, match.group(2))
+        value = _parse_env_value(path, lineno, key, match.group(3), strict=strict)
+        # An unquoted value loses the whitespace around it to `line.strip()` above. Quotes are
+        # what preserve it, so say so rather than letting a padded credential fail silently.
+        if (looks_like_credential(key) and match.group(3)[:1] not in "\"'"
+                and (match.group(2) or line != line.rstrip())):
+            _warn_once(path, lineno, key, "bare-space",
+                       f"{key} is unquoted, so the spaces around its value were removed. If that whitespace "
+                       f"belongs to the credential, wrap the whole value in single quotes.")
         loaded[key] = value
         first_lines[key] = lineno
     return loaded
@@ -751,6 +841,20 @@ def load_dotenv(path: str | Path, *, override: bool = False) -> dict[str, str]:
 
 
 _PERMISSION_WARNINGS_SHOWN: set[str] = set()
+_VALUE_WARNINGS_SHOWN: set[tuple[str, str, str]] = set()
+
+
+def _warn_once(path: Path, lineno: int, key: str, kind: str, message: str) -> None:
+    """Explain one lossy or newly reinterpreted .env value, at most once per process.
+
+    The terminal home re-reads credentials on every status refresh, so an unsuppressed warning
+    would either scroll away or bury the screen. Never include the value itself.
+    """
+    marker = (os.path.normcase(str(path)), key, kind)
+    if marker in _VALUE_WARNINGS_SHOWN:
+        return
+    _VALUE_WARNINGS_SHOWN.add(marker)
+    logging.getLogger("sia.config").warning("%s:%d: %s", path, lineno, message)
 
 
 def _warn_if_readable_by_others(path: Path) -> None:

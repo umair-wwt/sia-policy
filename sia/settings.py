@@ -40,8 +40,11 @@ from .config import (
     TARGET_SET_SCOPES,
     TenantConfig,
     ValidationIssue,
+    decode_text_bytes,
+    decode_text_file,
     parse_config,
     read_dotenv,
+    scan_quoted_value,
     validate_field,
 )
 from .windows_security import (
@@ -481,8 +484,8 @@ class SettingsDocument:
             return ()
         if data:
             try:
-                latest = tomlkit.parse(data.decode("utf-8"))
-            except (UnicodeDecodeError, TOMLKitError) as exc:
+                latest = tomlkit.parse(decode_text_bytes(data, self.path, "configuration"))
+            except TOMLKitError as exc:
                 raise ConfigError(f"{self.path}: invalid TOML: {exc}") from exc
         else:
             latest = tomlkit.document()
@@ -553,8 +556,8 @@ def open_settings(path: str | Path, *, create: bool = False) -> SettingsDocument
     except OSError as exc:
         raise ConfigError(f"cannot read config file {config_path}: {exc}") from exc
     try:
-        document = tomlkit.parse(data.decode("utf-8"))
-    except (UnicodeDecodeError, TOMLKitError) as exc:
+        document = tomlkit.parse(decode_text_bytes(data, config_path, "configuration"))
+    except TOMLKitError as exc:
         raise ConfigError(f"{config_path}: invalid TOML: {exc}") from exc
     try:
         config = parse_config(tomlkit.dumps(document), config_path)
@@ -570,22 +573,56 @@ _EXPECTED_UNSET = object()
 
 
 def _inline_comment(raw_value: str) -> str:
+    """The trailing comment on the line being rewritten, so re-saving never drops the operator's note."""
     value = raw_value.rstrip()
     if not value:
         return ""
-    if value[0] == '"':
-        try:
-            _, end = json.JSONDecoder().raw_decode(value)
-        except (json.JSONDecodeError, ValueError):
-            return ""
-        rest = value[end:].strip()
-        return f"  {rest}" if rest.startswith("#") else ""
-    if value[0] == "'":
-        end = value.find("'", 1)
-        rest = value[end + 1:].strip() if end >= 0 else ""
-        return f"  {rest}" if rest.startswith("#") else ""
+    if value[0] in "\"'":
+        scanned = scan_quoted_value(value)
+        # A value SIA cannot delimit is one it must not interpret either; fall through to the
+        # unquoted scan rather than silently discarding whatever the operator wrote after it.
+        if scanned is not None:
+            rest = value[scanned[1]:].strip()
+            return f"  {rest}" if rest.startswith("#") else ""
     index = value.find(" #")
     return f"  {value[index + 1:].strip()}" if index >= 0 else ""
+
+
+# Anything `str.splitlines()` breaks on would tear the value across two .env lines. Listing the
+# characters by hand has already gone wrong once: json.dumps escaped the C0 set but left U+0085,
+# U+2028 and U+2029 raw, so asking splitlines() itself is the only durable test.
+_ENV_CONTROL = re.compile(r"[\x00-\x1f\x7f]")
+
+
+def _render_env_value(value: str) -> str:
+    """Serialize one .env value so that reading it back returns exactly this string.
+
+    Quoting only delimits, so the form is chosen for legibility: bare wherever that survives the
+    reader, then single quotes, then double quotes with the quote character doubled. A pasted
+    secret containing a backslash is therefore stored verbatim -- an operator who opens the file
+    sees their own credential and has nothing to "correct".
+    """
+    if _ENV_CONTROL.search(value) or (value and value.splitlines() != [value]):
+        raise ConfigError("a credential must be one line with no control characters")
+    bare_unsafe = ('"', "'", " #")
+    if (value and value == value.strip() and value[0] not in "\"'}]#"
+            and not any(item in value for item in bare_unsafe)):
+        return value
+    if "'" not in value:
+        return f"'{value}'"
+    return '"' + value.replace('"', '""') + '"'
+
+
+def storable_env_value(value: str) -> bool:
+    """Whether :func:`update_dotenv` can store this value, for refusing it at the prompt instead.
+
+    Defined by asking the serializer, so what a prompt accepts and what a save accepts cannot drift.
+    """
+    try:
+        _render_env_value(value)
+    except ConfigError:
+        return False
+    return True
 
 
 def update_dotenv(path: str | Path, updates: Mapping[str, str | None], *,
@@ -594,6 +631,9 @@ def update_dotenv(path: str | Path, updates: Mapping[str, str | None], *,
 
     ``None`` removes a key.  The file is always owner-only on POSIX.  Pass an expected digest when editing a
     previously displayed file to prevent overwriting an external edit.
+
+    Only the lines being changed are rewritten, and a rewritten line keeps the line endings already
+    in the file. A leading UTF-8 byte-order mark is dropped, which repairs a file saved from Notepad.
     """
     env_path = Path(path).expanduser().resolve()
     for key, value in updates.items():
@@ -601,18 +641,21 @@ def update_dotenv(path: str | Path, updates: Mapping[str, str | None], *,
             raise ConfigError(f"invalid environment variable name {key!r}")
         if value is not None and not isinstance(value, str):
             raise ConfigError(f"environment variable {key} must be text")
+    rendered_values = {key: _render_env_value(value) for key, value in updates.items() if value is not None}
     current = _current_digest(env_path)
     if expected_digest is not _EXPECTED_UNSET and current != expected_digest:
         raise SettingsConflictError(
             f"{env_path} changed after it was opened; reopen settings so the newer edits are not overwritten"
         )
-    # Validate existing syntax and reject duplicate keys before deciding which line to replace.
-    read_dotenv(env_path)
-    original = env_path.read_text(encoding="utf-8") if env_path.is_file() else ""
+    # Check line syntax and duplicate keys before deciding which line to replace. Values are never
+    # read here, so a value elsewhere in the file that no longer decodes must not block this save --
+    # rewriting its key is how an operator repairs it.
+    read_dotenv(env_path, strict=False)
+    original = decode_text_file(env_path, "credentials file") if env_path.is_file() else ""
     lines = original.splitlines(keepends=True)
     remaining = dict(updates)
     rendered: list[str] = []
-    newline = "\r\n" if "\r\n" in original else "\n"
+    newline = "\r\n" if any(line.endswith("\r\n") for line in lines) else "\n"
     for line in lines:
         match = _ENV_ASSIGNMENT.match(line)
         if not match or match.group(2) not in remaining:
@@ -624,13 +667,13 @@ def update_dotenv(path: str | Path, updates: Mapping[str, str | None], *,
             continue
         ending = match.group(5) or newline
         comment = _inline_comment(match.group(4))
-        rendered.append(f"{match.group(1)}{key}{match.group(3)}{json.dumps(value, ensure_ascii=False)}{comment}{ending}")
+        rendered.append(f"{match.group(1)}{key}{match.group(3)}{rendered_values[key]}{comment}{ending}")
     if remaining:
         if rendered and not rendered[-1].endswith(("\n", "\r")):
             rendered[-1] += newline
         for key, value in remaining.items():
             if value is not None:
-                rendered.append(f"{key}={json.dumps(value, ensure_ascii=False)}{newline}")
+                rendered.append(f"{key}={rendered_values[key]}{newline}")
     data = "".join(rendered).encode("utf-8")
     _atomic_write(env_path, data, mode=0o600, expected_digest=current)
     return _digest(data)

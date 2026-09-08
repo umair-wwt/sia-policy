@@ -320,7 +320,10 @@ do next**. The message distinguishes known causes from suggestions; `-v` adds sa
 
 | What you see | What it means | What to do |
 |---|---|---|
-| `platform token request failed (HTTP 400/401)` | Sign-in failed. | Check `identity_url`; the service user must have **Is OAuth confidential client** ticked; check the password. |
+| `platform token request failed (HTTP 400/401)` | Sign-in failed. | Check `identity_url`; the service user must have **Is OAuth confidential client** ticked; check the password. If the secret was hand-typed into `.env`, see the two rows below. |
+| Sign-in keeps failing with a secret you know is correct | A hand-edited `.env` value lost characters. An unquoted value ends at its first ` #` and loses surrounding spaces; `sia doctor` warns when either happened. | Wrap the whole value in single quotes, or re-enter it under Settings > Credentials, which stores it exactly as typed. |
+| `SIA_CLIENT_SECRET is quoted and contains a backslash` from `sia doctor` | Quoted values are taken literally, so a backslash doubled for an SIA release before 2026 is now part of the secret. | Remove the doubling, or re-enter the credential under Settings > Credentials. |
+| `expected KEY=VALUE` on line 1 of `.env`, or `invalid TOML` on line 1 | The file starts with an unexpected byte-order mark. | A UTF-8 mark from Notepad is accepted; the message names the fix for UTF-16, which PowerShell's `>`, `Out-File` and `Set-Content` write unless given `-Encoding utf8`. |
 | `HTTP 403` on `Secrets`, `Targets` or `Policies` in preflight | The service user is not an SIA administrator. | Add it to the `DpaAdmin` role. |
 | `Settings: not verified (HTTP 403 …)` | The user may read SIA objects but not tenant settings. | Optional check; ignore or add the settings role. |
 | `SIA API:  FAILED …` | Neither SIA path family answered. | Run with `-v`, send the log to the maintainer; pin `[http] secrets_api` / `targetsets_api` once known. |

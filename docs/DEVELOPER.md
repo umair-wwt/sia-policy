@@ -359,8 +359,19 @@ checkpoint, reports, connection CSV and `.rdp` files never contain secrets.
 - Defaults changed for this programme: `policy_name_template = "{fqdn}"`, `max_session_hours = 2`.
 - `read_dotenv()` is non-mutating, rejects duplicate keys/malformed quoting, and returns file values for explicit
   source resolution. `load_dotenv()` retains compatibility without overriding exported variables. The terminal
-  keeps a session overlay, and `settings.update_dotenv()` preserves unrelated lines/comments, atomically writes
-  safely quoted values, rejects external-edit races, and applies mode 0600 on POSIX.
+  keeps a session overlay, and `settings.update_dotenv()` preserves unrelated lines/comments and line endings,
+  atomically writes values, rejects external-edit races, and applies mode 0600 on POSIX.
+- `.env` quoting delimits and never escapes: a backslash is always literal, and only a doubled quote is special
+  (`""` inside `"…"` is one `"`), the convention `_powershell_literal` already emits. `_render_env_value()` picks
+  the most legible representable form — bare, then single-quoted, then double-quoted — so a pasted secret is
+  stored verbatim; it refuses control characters and anything `str.splitlines()` would break on, and
+  `storable_env_value()` exposes that same rule so a prompt cannot accept what a save would reject. Values that a
+  pre-2026 release stored with `\\` are now read literally and warned about once, naming the key and line.
+  `read_dotenv(strict=False)` keeps the syntax and duplicate-key checks but returns undecodable values verbatim;
+  `update_dotenv()` uses it so one unrepairable line cannot block saving a credential.
+- `decode_text_bytes()` / `decode_text_file()` read every `config.toml` and `.env` as `utf-8-sig`, so a Notepad
+  byte-order mark parses, and report a UTF-16/UTF-32 BOM with the PowerShell command that rewrites the file.
+  Callers that detect external edits keep digesting the raw bytes; only the parsed text changes.
 - `settings.SETTING_DESCRIPTORS` covers every dataclass field. `open_settings()` can open syntactically valid but
   semantically invalid TOML for repair; save validates, previews a diff, detects outside edits and atomically
   replaces the file while preserving TOML comments.

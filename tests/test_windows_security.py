@@ -48,7 +48,7 @@ def test_windows_update_protects_existing_and_staged_files_before_replace(tmp_pa
 
     settings.update_dotenv(destination, {"ONE": "new"})
     assert events == ["protected temp created", "existing protected", "destination verified"]
-    assert destination.read_text(encoding="utf-8") == 'ONE="new"\n'
+    assert destination.read_text(encoding="utf-8") == "ONE=new\n"
 
 
 def test_windows_protection_failure_does_not_publish_new_credentials(tmp_path, monkeypatch):
@@ -95,7 +95,7 @@ def test_post_replace_verification_failure_is_marked_published(tmp_path, monkeyp
     with pytest.raises(WindowsCredentialProtectionError) as caught:
         settings.update_dotenv(destination, {"ONE": "new"})
     assert caught.value.published is True
-    assert destination.read_text(encoding="utf-8") == 'ONE="new"\n'
+    assert destination.read_text(encoding="utf-8") == "ONE=new\n"
 
 
 @pytest.mark.skipif(os.name == "nt", reason="non-Windows result")

@@ -21,7 +21,6 @@ from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
 import requests
-from requests.auth import HTTPBasicAuth
 
 from .redact import redact, register_secret
 
@@ -162,13 +161,24 @@ class ServiceUserOIDCTokenProvider(_CachingTokenProvider):
         super().__init__(identity_url, client_id, client_secret, **kw)
         self._app = application
 
+    def _basic_auth(self) -> str:
+        """Basic credentials encoded as UTF-8.
+
+        RFC 7617 fixes no charset, and `requests.auth.HTTPBasicAuth` picks latin-1, which raises
+        UnicodeEncodeError for a secret containing a curly apostrophe or any non-Latin-1 character --
+        a credential the default platform_token flow accepts, because a form body is UTF-8.
+        """
+        pair = f"{self._client_id}:{self._client_secret}".encode("utf-8")
+        return "Basic " + base64.b64encode(pair).decode("ascii")
+
     def _fetch(self) -> tuple[str, float]:
         token_url = f"{self._identity_url}/Oauth2/Token/{self._app}"
         self._log.info("Requesting service-user access token from %s", token_url)
         try:
-            resp = self._session.post(token_url, auth=HTTPBasicAuth(self._client_id, self._client_secret),
+            resp = self._session.post(token_url,
                                       data={"grant_type": "client_credentials", "scope": "api"},
-                                      headers=dict(_HEADERS), timeout=self._timeout)
+                                      headers={"Authorization": self._basic_auth(), **_HEADERS},
+                                      timeout=self._timeout)
         except requests.RequestException as exc:
             raise AuthError(f"could not reach {token_url}: {exc.__class__.__name__}: {exc}",
                             operation="service-user token request", cause=exc) from exc

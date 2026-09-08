@@ -639,3 +639,28 @@ def test_home_confirms_exit_when_a_draft_is_pending(tmp_path, monkeypatch, capsy
     answers(monkeypatch, ["/exit", "no", "/exit", "yes"])
     assert terminal.home(args_for(tmp_path), session, lambda argv: 0) == 0
     assert "Exit cancelled" in capsys.readouterr().out
+
+
+def test_credentials_store_a_backslash_secret_verbatim(tmp_path, monkeypatch, capsys):
+    """End to end through the screen an operator actually uses: paste in, file out, read back."""
+    path = tmp_path / ".env"
+    session = Session(shell_env={})
+    answers(monkeypatch, ["service-user", "2", "yes"])
+    monkeypatch.setattr("getpass.getpass", lambda prompt="": r"p@ss\word")
+    terminal.credentials(args_for(tmp_path), session, service_pair=True)
+    assert r"p@ss\word" not in capsys.readouterr().out
+    assert path.read_text(encoding="utf-8") == "SIA_CLIENT_ID=service-user\nSIA_CLIENT_SECRET=p@ss\\word\n"
+    assert read_dotenv(path)["SIA_CLIENT_SECRET"] == r"p@ss\word"
+
+
+def test_credentials_reprompt_for_a_secret_that_cannot_be_stored(tmp_path, monkeypatch, capsys):
+    path = tmp_path / ".env"
+    session = Session(shell_env={})
+    answers(monkeypatch, ["service-user", "2", "yes"])
+    entered = iter(["tab\there", "line break", "usable-secret"])
+    monkeypatch.setattr("getpass.getpass", lambda prompt="": next(entered))
+    terminal.credentials(args_for(tmp_path), session, service_pair=True)
+    output = capsys.readouterr().out
+    assert output.count("no control characters") == 2
+    assert "tab\there" not in output
+    assert read_dotenv(path)["SIA_CLIENT_SECRET"] == "usable-secret"

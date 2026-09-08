@@ -11,7 +11,14 @@ from difflib import unified_diff
 from pathlib import Path, PureWindowsPath
 from typing import Any, Callable
 
-from .config import ConfigError, load_config, read_dotenv, suggest_https_base_url, validate_dns_name
+from .config import (
+    ConfigError,
+    decode_text_file,
+    load_config,
+    read_dotenv,
+    suggest_https_base_url,
+    validate_dns_name,
+)
 from .diagnostics import diagnose, render_diagnostic, sanitize
 from .help import help_text
 from .redact import register_secret
@@ -22,6 +29,7 @@ from .settings import (
     open_settings,
     parse_setting_value,
     setting_descriptors,
+    storable_env_value,
     update_dotenv,
     validate_setting_value,
 )
@@ -300,7 +308,7 @@ def save_document(doc) -> bool:
         raise ConfigError("\n".join(issue.message for issue in issues))
     doc.validate()
     preview = doc.preview()
-    before = doc.path.read_text(encoding="utf-8") if doc.path.is_file() else ""
+    before = decode_text_file(doc.path, "configuration") if doc.path.is_file() else ""
     changes = "".join(unified_diff(
         before.splitlines(keepends=True), preview.splitlines(keepends=True),
         fromfile=f"{doc.path} (current)", tofile=f"{doc.path} (proposed)",
@@ -396,8 +404,8 @@ def credentials(args, session, *, service_pair: bool = False) -> None:
             if not user:
                 note("Credentials unchanged.")
                 return
-            if any(char in user for char in ("\n", "\r", "\x00")):
-                note("The service user must be one line with no null characters.", tone="warning")
+            if not storable_env_value(user):
+                note("The service user must be one line with no control characters.", tone="warning")
                 continue
             note("Step 2 of 2 · service-user password. Nothing you type is displayed.")
             while True:
@@ -405,8 +413,9 @@ def credentials(args, session, *, service_pair: bool = False) -> None:
                 if not password:
                     note("No password entered. Returning to the service-user step; neither value has been retained.")
                     break
-                if any(char in password for char in ("\n", "\r", "\x00")):
-                    note("A password must be one line with no null characters. Please enter it again.", tone="warning")
+                if not storable_env_value(password):
+                    note("A password must be one line with no control characters. Please enter it again.",
+                         tone="warning")
                     continue
                 break
             if password:
@@ -431,8 +440,9 @@ def credentials(args, session, *, service_pair: bool = False) -> None:
             if not value:
                 print("Credential unchanged.")
                 return
-            if any(char in value for char in ("\n", "\r", "\x00")):
-                note("A credential must be one line with no null characters. Please enter it again.", tone="warning")
+            if not storable_env_value(value):
+                note("A credential must be one line with no control characters. Please enter it again.",
+                     tone="warning")
                 continue
             break
         updates[key] = value

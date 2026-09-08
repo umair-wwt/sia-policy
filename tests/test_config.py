@@ -1,3 +1,4 @@
+import codecs
 import os
 from pathlib import Path
 
@@ -382,10 +383,10 @@ def test_dotenv_rejects_duplicates_and_bad_quotes(tmp_path):
     with pytest.raises(ConfigError, match="duplicate key 'KEY'.*line 1"):
         read_dotenv(env)
     env.write_text('KEY="unterminated\n', encoding="utf-8")
-    with pytest.raises(ConfigError, match="invalid double-quoted"):
+    with pytest.raises(ConfigError, match="unterminated double-quoted"):
         read_dotenv(env)
     env.write_text("KEY='ok' unexpected\n", encoding="utf-8")
-    with pytest.raises(ConfigError, match="unexpected text"):
+    with pytest.raises(ConfigError, match="text after the closing"):
         read_dotenv(env)
 
 
@@ -478,3 +479,92 @@ def test_non_finite_numbers_and_overlong_dns_names_are_rejected(tmp_path):
         f'identity_url = "https://abc1234.id.cyberark.cloud"\nroot_domain = "{overlong}"'), encoding="utf-8")
     with pytest.raises(ConfigError, match="root_domain"):
         load_config(path)
+
+
+def test_dotenv_treats_quotes_as_literal_so_a_backslash_needs_no_escaping(tmp_path):
+    """The reported bug: quoting a credential must not reinterpret its backslashes."""
+    env = tmp_path / ".env"
+    for form in ('SIA_CLIENT_SECRET={}', "SIA_CLIENT_SECRET='{}'", 'SIA_CLIENT_SECRET="{}"'):
+        for value in (r"p@ss\word", r"DOMAIN\svc", r"C:\Users\svc", r"abc\tdef", r"a\new", "abc\\"):
+            env.write_text(form.format(value) + "\n", encoding="utf-8")
+            assert read_dotenv(env)["SIA_CLIENT_SECRET"] == value, form.format(value)
+
+
+def test_dotenv_doubled_quote_is_the_only_escape(tmp_path):
+    env = tmp_path / ".env"
+    for line, expected in [
+        ('K="he said ""hi"""', 'he said "hi"'), ("K='it''s'", "it's"),
+        ('K="a\'b"', "a'b"), ("K='a\"b'", 'a"b'), ('K=""', ""), ("K=''", ""),
+        ('K="  padded  "', "  padded  "), ('K="v" # note', "v"),
+    ]:
+        env.write_text(line + "\n", encoding="utf-8")
+        assert read_dotenv(env)["K"] == expected, line
+
+
+def test_dotenv_warns_once_when_a_legacy_escape_is_now_literal(tmp_path, caplog):
+    env = tmp_path / ".env"
+    env.write_text('SIA_CLIENT_SECRET="abc\\\\def"\n', encoding="utf-8")
+    with caplog.at_level("WARNING", logger="sia.config"):
+        assert read_dotenv(env)["SIA_CLIENT_SECRET"] == r"abc\\def"
+    assert "SIA_CLIENT_SECRET" in caplog.text and "Settings > Credentials" in caplog.text
+    assert r"abc\\def" not in caplog.text
+    caplog.clear()
+    with caplog.at_level("WARNING", logger="sia.config"):
+        read_dotenv(env)
+    assert "Settings > Credentials" not in caplog.text
+
+
+def test_dotenv_warns_when_an_unquoted_credential_loses_characters(tmp_path, caplog):
+    truncated = tmp_path / "truncated.env"
+    truncated.write_text("SIA_CLIENT_SECRET=abc #def\n", encoding="utf-8")
+    with caplog.at_level("WARNING", logger="sia.config"):
+        assert read_dotenv(truncated)["SIA_CLIENT_SECRET"] == "abc"
+    assert "read as a comment" in caplog.text and "abc #def" not in caplog.text
+
+    caplog.clear()
+    padded = tmp_path / "padded.env"
+    padded.write_text("SIA_CLIENT_SECRET=  abc  \n", encoding="utf-8")
+    with caplog.at_level("WARNING", logger="sia.config"):
+        assert read_dotenv(padded)["SIA_CLIENT_SECRET"] == "abc"
+    assert "spaces around its value were removed" in caplog.text
+
+    caplog.clear()
+    quoted = tmp_path / "quoted.env"
+    quoted.write_text("SIA_CLIENT_SECRET='  abc  '\n", encoding="utf-8")
+    with caplog.at_level("WARNING", logger="sia.config"):
+        assert read_dotenv(quoted)["SIA_CLIENT_SECRET"] == "  abc  "
+    assert "spaces around" not in caplog.text
+
+
+def test_dotenv_relaxed_mode_keeps_syntax_checks_but_tolerates_undecodable_values(tmp_path):
+    env = tmp_path / ".env"
+    env.write_text('OTHER="ok" then junk\nKEY=fine\n', encoding="utf-8")
+    assert read_dotenv(env, strict=False)["KEY"] == "fine"
+    env.write_text('KEY="unterminated\n', encoding="utf-8")
+    assert read_dotenv(env, strict=False)["KEY"] == '"unterminated'
+    env.write_text("KEY=1\nKEY=2\n", encoding="utf-8")
+    with pytest.raises(ConfigError, match="duplicate key"):
+        read_dotenv(env, strict=False)
+    env.write_text("not a pair\n", encoding="utf-8")
+    with pytest.raises(ConfigError, match="KEY=VALUE"):
+        read_dotenv(env, strict=False)
+
+
+def test_dotenv_and_config_accept_a_notepad_byte_order_mark(tmp_path):
+    env = tmp_path / ".env"
+    env.write_bytes("\ufeffSIA_CLIENT_ID=svc@acme\nSIA_CLIENT_SECRET=pw\n".encode("utf-8"))
+    assert read_dotenv(env) == {"SIA_CLIENT_ID": "svc@acme", "SIA_CLIENT_SECRET": "pw"}
+    config = tmp_path / "config.toml"
+    config.write_bytes(("\ufeff" + TENANT + "\n[defaults]\n" + REQUIRED_DEFAULTS).encode("utf-8"))
+    assert load_config(config).tenant.subdomain == "acme"
+
+
+def test_dotenv_and_config_name_the_fix_for_powershell_utf16(tmp_path):
+    env = tmp_path / ".env"
+    env.write_bytes("SIA_CLIENT_ID=svc\n".encode("utf-16"))
+    with pytest.raises(ConfigError, match="UTF-16 text and SIA reads UTF-8.*Set-Content -Encoding utf8"):
+        read_dotenv(env)
+    config = tmp_path / "config.toml"
+    config.write_bytes(codecs.BOM_UTF16_BE + (TENANT + "\n[defaults]\n" + REQUIRED_DEFAULTS).encode("utf-16-be"))
+    with pytest.raises(ConfigError, match="UTF-16 text and SIA reads UTF-8"):
+        load_config(config)

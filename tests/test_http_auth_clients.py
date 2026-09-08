@@ -70,7 +70,8 @@ def test_service_user_oidc_flow():
     m1, u1, kw1 = session.requests[0]
     assert (m1, u1) == ("POST", "https://abc.id.cyberark.cloud/Oauth2/Token/__idaptive_cybr_user_oidc")
     assert kw1["data"] == {"grant_type": "client_credentials", "scope": "api"}
-    assert isinstance(kw1["auth"], requests.auth.HTTPBasicAuth) and kw1["auth"].username == "svc@acme"
+    assert "auth" not in kw1
+    assert kw1["headers"]["Authorization"] == "Basic " + base64.b64encode(b"svc@acme:pw-1234").decode("ascii")
     m2, u2, kw2 = session.requests[1]
     assert (m2, u2) == ("GET", "https://abc.id.cyberark.cloud/OAuth2/Authorize/__idaptive_cybr_user_oidc")
     assert kw2["allow_redirects"] is False and kw2["headers"]["Authorization"] == "Bearer access-1234"
@@ -453,3 +454,19 @@ def test_pvwa_wrong_password_sends_a_single_logon_attempt():
     with pytest.raises(AuthError, match="HTTP 401"):
         pv.logon("svc", "wrong-secret")
     assert [request[:2] for request in session.requests] == [("POST", "https://pvwa.corp/PasswordVault/API/auth/CyberArk/Logon")]
+
+
+def test_service_user_oidc_accepts_a_non_latin1_secret():
+    """HTTPBasicAuth encodes latin-1, so these secrets used to raise UnicodeEncodeError here
+    while working on the platform_token flow, whose form body is UTF-8."""
+    id_token = make_jwt({"exp": 5000})
+    secret = "pw-über—1234"
+    session = FakeSession([
+        FakeResponse(200, {"access_token": "access-1234"}),
+        FakeResponse(302, "", {"Location": f"https://cyberark.cloud/redirect#id_token={id_token}"}),
+    ])
+    provider = ServiceUserOIDCTokenProvider("https://abc.id.cyberark.cloud", "svc@acme", secret,
+                                            session=session, clock=lambda: 1000.0)
+    assert provider() == id_token
+    header = session.requests[0][2]["headers"]["Authorization"]
+    assert base64.b64decode(header.removeprefix("Basic ")).decode("utf-8") == f"svc@acme:{secret}"

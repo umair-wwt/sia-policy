@@ -118,6 +118,19 @@ session and explains that they were not saved. If replacement completed but fina
 message explicitly says that the destination changed and its protection could not be confirmed. Run `/doctor` to
 check the actual file permissions. Closing SIA discards session credentials.
 
+### Hand-editing `.env` on Windows
+
+`/setup` and `/settings` store a credential exactly as typed, so nothing below applies to them. If you do edit the
+file by hand:
+
+- Paste the secret unquoted. Backslashes are literal — `SIA_CLIENT_SECRET=p@ss\word` is the password `p@ss\word`,
+  and a Vault user is `PVWA_USER=ACME\svc_sia`. Nothing is ever doubled.
+- Quote the value only when it starts or ends with a space, or contains ` #` (which otherwise begins a comment).
+  Quotes delimit and do not escape; the one special sequence inside them is a doubled quote, which writes one.
+- Save as UTF-8. PowerShell's `>`, `Out-File` and `Set-Content` write UTF-16 unless you pass `-Encoding utf8`, and
+  SIA reads UTF-8; a UTF-16 file is reported with the command that rewrites it. A Notepad byte-order mark is fine.
+- `/doctor` reports any credential line whose quoting no longer means what an older SIA release stored.
+
 A manually copied `.env` inherits its destination folder's permissions; run `/doctor` to check it. Windows
 [`chmod` does not set a private ACL](https://docs.python.org/3/library/os.html#os.chmod), so a POSIX-style mode check
 is not used as proof of protection. Network filesystems may not support the required ACL operations.

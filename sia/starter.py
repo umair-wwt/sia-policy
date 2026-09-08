@@ -6,7 +6,7 @@ import tomllib
 from importlib.resources import files
 from pathlib import Path
 
-from .config import ConfigError
+from .config import ConfigError, decode_text_file
 
 
 def ensure_starter_config(path: str | Path) -> bool:
@@ -56,9 +56,8 @@ def missing_tenant_fields(path: str | Path) -> tuple[str, ...]:
     """
     destination = Path(path)
     try:
-        with destination.open("rb") as stream:
-            document = tomllib.load(stream)
-    except (OSError, tomllib.TOMLDecodeError) as exc:
+        document = tomllib.loads(decode_text_file(destination, "configuration"))
+    except tomllib.TOMLDecodeError as exc:
         raise ConfigError(f"Could not read configuration at {destination}: {exc}") from exc
     tenant = document.get("tenant", {})
     if not isinstance(tenant, dict):
