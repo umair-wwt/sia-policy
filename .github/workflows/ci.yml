@@ -65,6 +65,11 @@ jobs:
             os: windows-2025
             python: "3.14"
             shell: pwsh
+    # A step's `shell` cannot use expressions; the job default can, so the matrix still selects
+    # Windows PowerShell 5.1 or PowerShell 7 for every step below.
+    defaults:
+      run:
+        shell: ${{ matrix.shell }}
 
     steps:
       - name: Check out the trusted source
@@ -78,7 +83,6 @@ jobs:
           python-version: ${{ matrix.python }}
 
       - name: Install test dependencies
-        shell: ${{ matrix.shell }}
         run: |
           python -m pip install --disable-pip-version-check --upgrade pip
           if ($LASTEXITCODE -ne 0) { throw "pip could not update itself." }
@@ -88,18 +92,15 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "The SIA package could not be installed for testing." }
 
       - name: Run the complete test suite
-        shell: ${{ matrix.shell }}
         env:
           PYTHONUTF8: "1"
           PYTHONIOENCODING: utf-8
         run: python -m pytest
 
       - name: Verify PowerShell bootstrap decisions offline
-        shell: ${{ matrix.shell }}
         run: .\tests\windows_installer_smoke.ps1
 
       - name: Exercise native install and fallback launchers
-        shell: ${{ matrix.shell }}
         env:
           PYTHONUTF8: "1"
           PYTHONIOENCODING: utf-8
