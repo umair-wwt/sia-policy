@@ -107,8 +107,9 @@ def test_other_sections(tmp_path):
         load_config(make(tmp_path, other_sections='[auth]\nidentity_auth = "bogus"\n'))
     with pytest.raises(ConfigError, match="oidc_application"):
         load_config(make(tmp_path, other_sections='[auth]\noidc_application = ""\n'))
-    cfg = load_config(make(tmp_path, other_sections='[auth]\nidentity_auth = "service_user_oidc"\npassword_file = "/secure/pw.csv"\n'))
-    assert cfg.auth.identity_auth == "service_user_oidc" and cfg.auth.password_file == "/secure/pw.csv"
+    secure = tmp_path / "secure" / "pw.csv"     # an absolute path on every platform; TOML basic strings want forward slashes
+    cfg = load_config(make(tmp_path, other_sections=f'[auth]\nidentity_auth = "service_user_oidc"\npassword_file = "{secure.as_posix()}"\n'))
+    assert cfg.auth.identity_auth == "service_user_oidc" and cfg.auth.password_file == str(secure)
     with pytest.raises(ConfigError, match="status_polls"):
         load_config(make(tmp_path, other_sections="[http]\nstatus_polls = 0\n"))
     with pytest.raises(ConfigError, match="max_requests_per_second"):
@@ -296,7 +297,7 @@ def test_ca_bundle_and_verify(tmp_path):
     bundle = tmp_path / "corp-ca.pem"
     bundle.write_text("-----BEGIN CERTIFICATE-----\n", encoding="utf-8")
     assert load_config(make(tmp_path)).http.tls_verify is True                    # default: certifi
-    assert load_config(make(tmp_path, other_sections=f'[http]\nca_bundle = "{bundle}"\n')).http.tls_verify == str(bundle)
+    assert load_config(make(tmp_path, other_sections=f'[http]\nca_bundle = "{bundle.as_posix()}"\n')).http.tls_verify == str(bundle)
     assert load_config(make(tmp_path, other_sections="[http]\nverify = false\n")).http.tls_verify is False
     with pytest.raises(ConfigError, match="does not exist"):
         load_config(make(tmp_path, other_sections='[http]\nca_bundle = "/no/such/bundle.pem"\n'))

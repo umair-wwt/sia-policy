@@ -16,6 +16,10 @@ def ensure_starter_config(path: str | Path) -> bool:
     when creation is appropriate; merely importing this module never writes files.
     """
     destination = Path(path)
+    if destination.is_symlink():
+        # POSIX refuses O_EXCL through a symlink, but Windows follows it and would create the
+        # link's target. A symlinked configuration, dangling or not, is the operator's to manage.
+        return False
     created_stat = None
     try:
         # Exclusive creation also protects against another process creating the
