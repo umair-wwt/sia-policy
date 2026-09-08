@@ -176,6 +176,9 @@ $WingetFailure = @(Install-PythonWithWinget)
 Assert-Equal 1 $WingetFailure.Count "failed WinGet must return one pipeline value"
 Assert-True ($WingetFailure[0] -is [bool]) "failed WinGet result must remain Boolean"
 Assert-True (-not $WingetFailure[0]) "nonzero WinGet exit code must report failure"
+# The fake WinGet left $LASTEXITCODE = 9. GitHub's PowerShell step wrapper ends with
+# `exit $LASTEXITCODE`, so a stale native exit code would fail a passing smoke test.
+$global:LASTEXITCODE = 0
 
 # Discovery gives the caller's explicit Python first priority, then falls back
 # to the project's conventional .venv without reaching external discovery.
@@ -215,3 +218,4 @@ finally {
 }
 
 Write-Host "Windows installer PowerShell smoke checks passed."
+exit 0
