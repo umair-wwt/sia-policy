@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 
 from sia.config import (ConfigError, ConfigValidationError, env_var_for_password, load_config, load_dotenv,
-                        load_password_file, read_dotenv, resolve_env, suggest_https_base_url)
+                        load_password_file, read_dotenv, resolve_env, suggest_https_base_url, toml_error_hint)
 from sia.redact import redact
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -304,6 +304,32 @@ def test_ca_bundle_and_verify(tmp_path):
         load_config(make(tmp_path, other_sections='[http]\nca_bundle = "/no/such/bundle.pem"\n'))
     with pytest.raises(ConfigError, match="verify = false; pick one"):
         load_config(make(tmp_path, other_sections=f'[http]\nca_bundle = "{bundle.as_posix()}"\nverify = false\n'))
+
+
+def test_windows_path_in_a_quoted_value_explains_itself(tmp_path):
+    """Pasting C:\\certs\\ca.pem into a double-quoted TOML value is the usual Windows first attempt."""
+    with pytest.raises(ConfigError, match="forward slashes") as caught:
+        load_config(make(tmp_path, other_sections='[http]\nca_bundle = "C:\\certs\\corp-root.pem"\n'))
+    assert "invalid TOML" in str(caught.value)
+    # a single-quoted (literal) Windows path parses, so the hint must not fire for it
+    cfg_text = "[http]\nca_bundle = 'C:\\certs\\corp-root.pem'\n"
+    assert toml_error_hint(cfg_text) == ""
+    # and a valid config never triggers the hint either
+    assert toml_error_hint('[http]\nca_bundle = "C:/certs/corp-root.pem"\n') == ""
+
+
+def test_trust_source_precedence(tmp_path):
+    """Explicit settings win: verify = false, then ca_bundle, then the system trust store."""
+    bundle = tmp_path / "corp-ca.pem"
+    bundle.write_text("-----BEGIN CERTIFICATE-----\n", encoding="utf-8")
+    assert load_config(make(tmp_path)).http.system_trust is True                  # on by default
+    assert load_config(make(tmp_path)).http.trust_source == "system"
+    assert load_config(make(tmp_path, other_sections="[http]\nsystem_trust = false\n")).http.trust_source == "certifi"
+    # a bundle is an explicit choice, so it wins over the system store without an error
+    both = load_config(make(tmp_path, other_sections=f'[http]\nca_bundle = "{bundle.as_posix()}"\nsystem_trust = true\n'))
+    assert both.http.trust_source == "ca_bundle" and both.http.tls_verify == str(bundle)
+    off = load_config(make(tmp_path, other_sections="[http]\nverify = false\nsystem_trust = true\n"))
+    assert off.http.trust_source == "disabled" and off.http.tls_verify is False
 
 
 def test_policy_status(tmp_path):

@@ -3,3 +3,4 @@ tomlkit>=0.13,<1
 tzdata>=2025.1
 prompt-toolkit>=3.0.51,<4
 rich>=13.9,<15
+truststore>=0.9,<1

@@ -53,6 +53,7 @@ from sia.redact import RedactingFilter, redact, register_secret
 from sia.report import exit_code, print_summary, print_verify, result_dict, write_reports, write_verify_csv
 from sia.resolve import PrincipalResolver, pick
 from sia.runtime import Session, prompt_secret
+from sia.trust import apply_trust_policy, describe_trust
 
 EXIT_OK, EXIT_FAILURES, EXIT_USAGE = 0, 1, 2
 PAM_REQUIRED_FIELDS = (("pvwa_base_url", "pvwaBaseUrl"), ("connector_pool_id", "connectorPoolId"),
@@ -94,7 +95,9 @@ class Context:
         self.client_id = client_id
         secret = resolve_client_secret()
         timeout = cfg.http.timeout_seconds
-        verify = cfg.http.tls_verify
+        # Before any session is built: truststore patches ssl.SSLContext process-wide.
+        verify, self.trust_source = apply_trust_policy(cfg.http, log)
+        self.verify = verify
         if verify is False:
             log.warning("TLS verification is OFF ([http] verify = false): traffic to the tenant is not authenticated")
         self.limiter = RateLimiter(cfg.http.max_requests_per_second) if cfg.http.max_requests_per_second > 0 else None
@@ -124,7 +127,7 @@ class Context:
             if not user or not password:
                 raise ConfigError("[pvwa] is configured but PVWA_USER / PVWA_PASSWORD are not set (put them in .env)")
             client = PVWAClient(self.cfg.pvwa.base_url, auth_type=self.cfg.pvwa.auth_type,
-                                timeout=self.cfg.http.timeout_seconds, verify=self.cfg.http.tls_verify)
+                                timeout=self.cfg.http.timeout_seconds, verify=self.verify)
             client.logon(user, password)
             self._pvwa = client
         return self._pvwa
@@ -143,6 +146,10 @@ def add_global_flags(parser: argparse.ArgumentParser, *, root: bool = False) -> 
     parser.add_argument("--report-dir", default=default("reports"), help="report directory (default: ./reports)")
     parser.add_argument("-v", "--verbose", action="store_true", default=default(False), help="sanitized technical details")
     parser.add_argument("--ca-bundle", metavar="FILE", default=default(None), help="trusted CA file/directory; overrides configuration")
+    parser.add_argument("--system-trust", dest="system_trust", action="store_true", default=default(None),
+                        help="verify TLS against the operating system trust store (default)")
+    parser.add_argument("--no-system-trust", dest="system_trust", action="store_false", default=default(None),
+                        help="verify TLS against certifi instead of the operating system trust store")
     parser.add_argument("--json", action="store_true", default=default(False), help="machine-readable result on stdout; messages on stderr")
 
 
@@ -227,14 +234,7 @@ def cmd_preflight(ctx: Context, checks: list[dict] | None = None, *, verbose: bo
     ok = True
     t = ctx.cfg.tenant
     print(f"Tenant:   {t.subdomain}  SIA={t.dpa_url}  UAP={t.uap_url}  Identity={t.identity_url}")
-    tls = ctx.cfg.http.tls_verify
-    if tls is True:
-        trust = "certifi (default trust store)"
-    elif tls is False:
-        trust = "VERIFICATION OFF -- traffic to the tenant is not authenticated"
-    else:
-        trust = f"CA bundle {tls}"
-    print(f"TLS:      {trust}")
+    print(f"TLS:      {describe_trust(ctx.cfg.http, getattr(ctx, 'trust_source', None))}")
     try:
         token = ctx.token()
         claims = ctx.token.claims
@@ -745,13 +745,18 @@ class OfflineContext:
 
 
 def read_config(args: argparse.Namespace) -> Config:
-    if args.ca_bundle:
-        from sia.settings import open_settings
-        document = open_settings(args.config)
-        document.set("http", "ca_bundle", str(Path(args.ca_bundle).resolve()))
+    ca_bundle = getattr(args, "ca_bundle", None)
+    system_trust = getattr(args, "system_trust", None)
+    if not ca_bundle and system_trust is None:
+        return load_config(args.config)
+    from sia.settings import open_settings
+    document = open_settings(args.config)
+    if ca_bundle:
+        document.set("http", "ca_bundle", str(Path(ca_bundle).resolve()))
         document.set("http", "verify", True)
-        return document.validate()
-    return load_config(args.config)
+    if system_trust is not None:
+        document.set("http", "system_trust", system_trust)
+    return document.validate()
 
 
 def emit_failure(exc: BaseException, args, session: Session, *, code: int | None = None) -> int:
@@ -841,6 +846,8 @@ def execute(args: argparse.Namespace, session: Session) -> int:
                 shared = ["--config", args.config, "--env", args.env, "--report-dir", args.report_dir]
                 if args.ca_bundle:
                     shared += ["--ca-bundle", args.ca_bundle]
+                if args.system_trust is not None:
+                    shared.append("--system-trust" if args.system_trust else "--no-system-trust")
                 if args.verbose:
                     shared.append("--verbose")
                 def run(argv: list[str]) -> int:

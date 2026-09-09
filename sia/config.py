@@ -159,6 +159,8 @@ class HttpConfig:
     targetsets_api: str = "auto"               # auto | legacy (/api/targetsets) | discovery (/api/discovery/targetsets)
     ca_bundle: str = ""                        # PEM file/dir of trusted CAs (TLS-inspecting proxies); "" = certifi
     verify: bool = True                        # never set false outside a lab: it disables TLS verification entirely
+    system_trust: bool = True                  # verify against the OS trust store, so a corporate root already
+                                               # installed on the machine is honoured without exporting a bundle
 
     @property
     def tls_verify(self) -> str | bool:
@@ -166,6 +168,15 @@ class HttpConfig:
         if not self.verify:
             return False
         return self.ca_bundle or True
+
+    @property
+    def trust_source(self) -> str:
+        """Which trust store the settings select, before checking whether truststore is installed."""
+        if not self.verify:
+            return "disabled"
+        if self.ca_bundle:
+            return "ca_bundle"
+        return "system" if self.system_trust else "certifi"
 
 
 @dataclass(frozen=True)
@@ -558,13 +569,27 @@ def validate_field(section: str, key: str, value: Any) -> tuple[ValidationIssue,
                  if issue.keys == (pair,) and issue.code != "filesystem")
 
 
+# A double-quoted TOML value containing a backslash: the usual cause of an "invalid TOML" report on
+# Windows, because a path pasted from Explorer turns \U, \c, \o and friends into invalid escapes.
+_BACKSLASH_IN_BASIC_STRING = re.compile(r'=\s*"[^"\n]*\\')
+
+
+def toml_error_hint(text: str) -> str:
+    """An explanation to append to an invalid-TOML message when a Windows path is the likely cause."""
+    if not _BACKSLASH_IN_BASIC_STRING.search(text):
+        return ""
+    return (". A double-quoted value treats a backslash as an escape character, so a Windows path "
+            'needs forward slashes ("C:/certs/corp-root.pem"), doubled backslashes '
+            '("C:\\\\certs\\\\corp-root.pem"), or single quotes (\'C:\\certs\\corp-root.pem\')')
+
+
 def parse_config(text: str, source_path: str | Path = "config.toml") -> Config:
     """Parse and validate TOML text. Relative file settings resolve beside ``source_path``."""
     path = Path(source_path).expanduser().resolve()
     try:
         raw = tomllib.loads(text)
     except tomllib.TOMLDecodeError as exc:
-        raise ConfigError(f"{path}: invalid TOML: {exc}") from exc
+        raise ConfigError(f"{path}: invalid TOML: {exc}{toml_error_hint(text)}") from exc
     structural: list[ValidationIssue] = []
     unknown = sorted(set(raw) - set(SECTIONS))
     for name in unknown:

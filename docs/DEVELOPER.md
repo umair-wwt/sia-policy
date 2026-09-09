@@ -18,7 +18,9 @@ This document is for people who maintain or extend the tool. Operators should re
 
 ## 1. Architecture
 
-Python 3.11+ with `requests`, `tomlkit`, `tzdata`, `prompt-toolkit` and `rich`. The tenant is the source of truth and the CSVs are
+Python 3.11+ with `requests`, `tomlkit`, `tzdata`, `prompt-toolkit` and `rich`, plus `truststore` for verifying TLS against the
+operating system trust store (recommended, not required: without it `sia/trust.py` falls back to certifi and `[http] ca_bundle`
+remains the way through a TLS-inspecting proxy). The tenant is the source of truth and the CSVs are
 the desired state; local state is configuration, optional credentials/reports, and a resumable checkpoint with no
 secrets. Units of
 work: one strong account per referenced account, one target set per distinct *target-set name*, one access policy

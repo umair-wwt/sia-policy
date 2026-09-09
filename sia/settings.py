@@ -45,6 +45,7 @@ from .config import (
     parse_config,
     read_dotenv,
     scan_quoted_value,
+    toml_error_hint,
     validate_field,
 )
 from .windows_security import (
@@ -162,6 +163,7 @@ _LABELS = {
     "pvwa": "PVWA",
     "base_url": "PVWA base URL",
     "ca_bundle": "Custom CA bundle",
+    "system_trust": "Use system trust store",
     "cpm_managed": "CPM manages passwords",
     "oidc_application": "OIDC application",
 }
@@ -206,6 +208,8 @@ _HELP: dict[tuple[str, str], str] = {
     ("http", "secrets_api"): "Strong-account API family. Auto detects it with read-only requests.",
     ("http", "targetsets_api"): "Target-set API family. Auto detects it with read-only requests.",
     ("http", "ca_bundle"): "Trusted corporate CA file or directory. Relative paths resolve beside this configuration file.",
+    ("http", "system_trust"): "Verify against the trust store this computer already uses, so a corporate root "
+                              "installed by IT is honoured. A custom CA bundle takes precedence when both are set.",
     ("http", "verify"): "Verify HTTPS certificates. Disable only in a controlled lab.",
     ("connect", "login_suffix"): "Text after @ in Identity login names; blank derives it from the client ID.",
     ("connect", "gateway_host"): "RDP gateway host; blank uses the tenant default.",
@@ -483,10 +487,11 @@ class SettingsDocument:
             self._refresh_validation()
             return ()
         if data:
+            text = decode_text_bytes(data, self.path, "configuration")
             try:
-                latest = tomlkit.parse(decode_text_bytes(data, self.path, "configuration"))
+                latest = tomlkit.parse(text)
             except TOMLKitError as exc:
-                raise ConfigError(f"{self.path}: invalid TOML: {exc}") from exc
+                raise ConfigError(f"{self.path}: invalid TOML: {exc}{toml_error_hint(text)}") from exc
         else:
             latest = tomlkit.document()
         base = self.base_document or tomlkit.document()
@@ -555,10 +560,11 @@ def open_settings(path: str | Path, *, create: bool = False) -> SettingsDocument
         data = config_path.read_bytes()
     except OSError as exc:
         raise ConfigError(f"cannot read config file {config_path}: {exc}") from exc
+    text = decode_text_bytes(data, config_path, "configuration")
     try:
-        document = tomlkit.parse(decode_text_bytes(data, config_path, "configuration"))
+        document = tomlkit.parse(text)
     except TOMLKitError as exc:
-        raise ConfigError(f"{config_path}: invalid TOML: {exc}") from exc
+        raise ConfigError(f"{config_path}: invalid TOML: {exc}{toml_error_hint(text)}") from exc
     try:
         config = parse_config(tomlkit.dumps(document), config_path)
         error = None

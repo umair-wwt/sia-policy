@@ -103,10 +103,17 @@ lookup_search_max_rows = 2000  # --lookup auto: read per server (search) up to t
 # SIA path families. "auto" = detect with read-only calls at every run; pin them once `preflight` has printed them.
 secrets_api = "auto"           # auto | public (/api/secrets/public/v1 + v2) | legacy (/api/secrets)
 targetsets_api = "auto"        # auto | legacy (/api/targetsets) | discovery (/api/discovery/targetsets)
-# TLS. Behind a proxy that re-signs certificates, export its root CA and point ca_bundle at the PEM file
+# TLS. Behind a proxy that re-signs certificates (Netskope, Zscaler, and similar), its root CA is
+# usually already installed on the computer, so system_trust alone is normally enough. If it is not,
+# export the proxy's root CA and point ca_bundle at the PEM file; ca_bundle wins when both are set
 # (--ca-bundle FILE does the same for one run; the REQUESTS_CA_BUNDLE environment variable also works).
-# A relative ca_bundle path is resolved beside this config.toml file.
-ca_bundle = ""                 # "" = the built-in trust store (certifi)
+# A relative ca_bundle path is resolved beside this config.toml file. On Windows write the path with forward
+# slashes ("C:/certs/corp-root.pem") or single quotes: a double-quoted TOML value reads \ as an escape character.
+# Prefer system_trust on Windows -- the certificate store fetches public roots on demand, so an exported PEM can be
+# missing roots the machine has not needed yet. Setting ca_bundle stops the system store being consulted, so an
+# explicitly pinned bundle is never quietly widened by whatever else the computer trusts.
+system_trust = true            # verify against this computer's own trust store; false = certifi only
+ca_bundle = ""                 # "" = system_trust, or the built-in trust store (certifi)
 verify = true                  # false disables certificate verification entirely -- lab use only
 
 [connect]

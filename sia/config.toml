@@ -44,7 +44,8 @@ password_file = ""    # Optional password CSV kept outside this repository
 [http]
 timeout_seconds = 60
 verify = true
-ca_bundle = ""        # Optional trusted proxy CA file, relative to this config file
+system_trust = true   # Verify against this computer's own trust store (corporate roots included)
+ca_bundle = ""        # Optional trusted proxy CA file, relative to this config file; wins over system_trust
 
 [connect]
 login_suffix = ""     # Empty = derive from the service user's login

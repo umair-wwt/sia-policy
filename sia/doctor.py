@@ -9,6 +9,7 @@ from typing import Callable
 
 from .config import ConfigError, decode_text_file, looks_like_credential
 from .diagnostics import diagnose, render_diagnostic
+from .trust import describe_trust
 from .windows_security import inspect_credential_permissions, windows_acl_supported
 
 
@@ -47,12 +48,23 @@ def local_checks(args, session, *, load_config: Callable, load_inputs: Callable)
             record(package, "passed", importlib.metadata.version(package))
         except importlib.metadata.PackageNotFoundError as exc:
             record(package, "failed", "Missing dependency; run python -m pip install .", exc)
+    # Recommended, not required: without it verification falls back to certifi and [http] ca_bundle
+    # remains the way through a TLS-inspecting proxy.
+    try:
+        record("truststore", "passed", importlib.metadata.version("truststore"))
+    except importlib.metadata.PackageNotFoundError:
+        record("truststore", "warning",
+               "not installed; TLS verifies against certifi. Install it to use this computer's own "
+               "trust store, or set [http] ca_bundle for a TLS-inspecting proxy")
     cfg = None
     try:
         cfg = load_config(args)
         record("Configuration", "passed", str(Path(args.config).resolve()))
     except Exception as exc:
         record("Configuration", "failed", str(exc), exc)
+    if cfg is not None:
+        source = cfg.http.trust_source
+        record("TLS trust", "warning" if source == "disabled" else "passed", describe_trust(cfg.http))
     try:
         env_path = Path(args.env)
         if env_path.exists() and not env_path.is_file():

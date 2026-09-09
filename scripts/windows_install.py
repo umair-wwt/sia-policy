@@ -329,11 +329,18 @@ def _install_project(env: Path, root: Path) -> None:
     ]
     wheelhouse = _wheelhouse(root)
     attempts = []
+    # A TLS-inspecting proxy (Netskope, Zscaler, and similar) re-signs PyPI, and pip verifies against
+    # its own bundled CA list rather than the Windows certificate store that already holds the
+    # corporate root. The download then fails before truststore can ever be installed, so every
+    # network attempt is retried asking pip to use this computer's certificate store instead.
+    # --use-feature=truststore needs pip 22.2+, which every Python this installer accepts bundles.
     if wheelhouse:
         attempts.append(common + ["--no-index", "--find-links", wheelhouse, root])
         attempts.append(common + ["--find-links", wheelhouse, root])
+        attempts.append(common + ["--find-links", wheelhouse, "--use-feature=truststore", root])
     else:
         attempts.append(common + [root])
+        attempts.append(common + ["--use-feature=truststore", root])
     failures = []
     for command in attempts:
         try:
@@ -349,7 +356,11 @@ def _install_project(env: Path, root: Path) -> None:
         detail = detail[-3500:]
     raise InstallError(
         "SIA's Python packages could not be installed. Check the internet connection or add a complete "
-        "wheelhouse folder beside install.cmd, then run it again.\n" + detail
+        "wheelhouse folder beside install.cmd, then run it again.\n"
+        "If the message above mentions a certificate (CERTIFICATE_VERIFY_FAILED or 'self signed "
+        "certificate in certificate chain'), the network re-signs HTTPS and pip does not trust the "
+        "re-signing root. Ask IT for the proxy root CA as a .pem file and run:\n"
+        "    py -m pip install --cert C:\\path\\to\\corp-root.pem .\n" + detail
     )
 
 

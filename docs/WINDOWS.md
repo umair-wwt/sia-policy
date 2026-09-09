@@ -90,17 +90,76 @@ Copy that folder with the complete project to the offline computer, then use the
 Compatible dependency and build wheels must all be present; installing Python itself still needs a preinstalled or
 separately supplied approved interpreter. A partial wheelhouse automatically falls through to online installation.
 
+Rebuild the wheelhouse after upgrading SIA whenever `requirements.txt` has changed, or the offline install fails with
+a missing dependency. Releases from 2026 onward add `truststore`, which is what lets SIA verify against the Windows
+certificate store on an inspected network; it is a pure-Python `py3-none-any` wheel, so unlike the other
+dependencies it can be downloaded on any platform and still work on Windows.
+
 The downloader uses Windows certificate trust; pip uses its configured trust and index settings. For a corporate
 proxy or private package index, use IT's approved Python/pip configuration. Do not disable TLS checks. The app's
-`[http] ca_bundle` applies to CyberArk traffic, not to the installer. WinGet uses Microsoft's documented
+`[http] ca_bundle` applies to CyberArk traffic, not to the installer — but because pip verifies against its own
+bundled CA list rather than the Windows store, a re-signing proxy can block the download before `truststore` is ever
+installed. Setup therefore retries each network install asking pip to use the Windows certificate store; see
+[TLS inspection on Windows](#tls-inspection-on-windows) if it still fails. WinGet uses Microsoft's documented
 [installation options](https://learn.microsoft.com/en-us/windows/package-manager/winget/install), and the signed
 fallback uses Python's documented [per-user installer options](https://docs.python.org/3/using/windows.html).
+
+## TLS inspection on Windows
+
+Most corporate networks re-sign HTTPS with a private root (Netskope, Zscaler, Palo Alto, and similar). That root is
+normally already in the Windows certificate store, pushed by Group Policy or Intune — but Python does not read that
+store by default, so CyberArk traffic fails with `CERTIFICATE_VERIFY_FAILED` even though Edge and `curl` work.
+
+`[http] system_trust` is on by default and resolves this: SIA verifies through the Windows chain engine, which reads
+the machine and user Trusted Root stores. Confirm which store is active with:
+
+```powershell
+sia doctor
+```
+
+`TLS trust: Windows certificate store` means it is working. `TLS trust: certifi (default trust store)` means the
+`truststore` package is missing — rerun `install.cmd`, or `py -m pip install .` in the project folder.
+
+To check the re-signing root is actually present (replace the pattern with your proxy's name):
+
+```powershell
+Get-ChildItem Cert:\LocalMachine\Root |
+  Where-Object { $_.Subject -match 'Netskope|Zscaler|goskope' } |
+  Format-List Subject, Thumbprint, NotAfter
+```
+
+`certlm.msc` shows the same store in a window. If the root is missing there, that is an IT request, not a SIA setting.
+
+**Prefer `system_trust` over exporting a bundle on Windows.** Windows populates its root store on demand through
+automatic root update, so a PEM exported from it is a point-in-time snapshot that can be missing public roots the
+machine simply has not needed yet. The chain engine fetches them when required; a static file cannot. Only export a
+bundle when `system_trust` cannot be used:
+
+```powershell
+$out = "C:\ProgramData\sia\corp-roots.pem"
+New-Item -ItemType Directory -Force -Path (Split-Path $out) | Out-Null
+Get-ChildItem Cert:\LocalMachine\Root | ForEach-Object {
+  "-----BEGIN CERTIFICATE-----"
+  [Convert]::ToBase64String($_.RawData, 'InsertLineBreaks')
+  "-----END CERTIFICATE-----"
+} | Set-Content -Encoding ascii $out
+```
+
+Then point SIA at it with `sia preflight --ca-bundle C:\ProgramData\sia\corp-roots.pem`, which writes the setting
+correctly escaped. A bundle takes precedence over the Windows store, and SIA stops consulting that store while one is
+set — that is deliberate, so an explicitly pinned bundle is not quietly widened by whatever else the machine trusts.
+
+If you hand-edit `config.toml` instead, remember that a double-quoted TOML value treats `\` as an escape character:
+write `ca_bundle = "C:/ProgramData/sia/corp-roots.pem"`, doubled backslashes, or single quotes.
 
 ## When setup still needs help
 
 | Message or symptom | Next action |
 |---|---|
 | Installer files are missing | Extract the entire ZIP; do not run a launcher from inside the archive. |
+| `CERTIFICATE_VERIFY_FAILED` while installing dependencies | The installer already retries asking pip to use the Windows certificate store. If it still fails, get the proxy root as a `.pem` from IT and run `py -m pip install --cert C:\path\to\corp-root.pem .` in the project folder. |
+| `invalid TOML` right after pasting a Windows path | A double-quoted value treats `\` as an escape. Use forward slashes, doubled backslashes, or single quotes — or set the path with `--ca-bundle`, which escapes it for you. |
+| `sia doctor` reports `TLS trust: certifi` on an inspected network | The `truststore` package is missing. Rerun `install.cmd`, or add `truststore` to the wheelhouse for an offline install. |
 | Project folder is read-only | Copy the complete extracted folder to a writable local folder and open `install.cmd` there. |
 | Python installation or execution is blocked | Give IT the displayed error and request an approved Python 3.11 or newer; rerun the same installer afterward. |
 | Dependency installation fails | Restore download access or supply the complete wheelhouse. The previous selected runtime and user data are preserved. |
