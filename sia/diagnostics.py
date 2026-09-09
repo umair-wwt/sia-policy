@@ -11,6 +11,7 @@ import errno
 import json
 import re
 import socket
+import ssl
 from dataclasses import dataclass, field
 from typing import Any, Mapping, TextIO
 
@@ -310,7 +311,9 @@ def _network_code(exc: BaseException) -> str | None:
     text = " ".join(f"{item.__class__.__name__}: {item}" for item in chain).lower()
     if any(isinstance(item, requests.exceptions.ProxyError) for item in chain) or "proxyerror" in text:
         return "SIA-PROXY"
-    if any(isinstance(item, requests.exceptions.SSLError) for item in chain) or any(
+    # isinstance first and ssl.SSLError included: on Windows the verification message comes from
+    # FormatMessageW and is localised, so the phrase list below cannot be relied on there.
+    if any(isinstance(item, (requests.exceptions.SSLError, ssl.SSLError)) for item in chain) or any(
             phrase in text for phrase in ("certificate verify failed", "sslerror", "tlsv")):
         return "SIA-TLS"
     if any(isinstance(item, (requests.exceptions.Timeout, TimeoutError)) for item in chain) or "timed out" in text:
@@ -322,6 +325,33 @@ def _network_code(exc: BaseException) -> str | None:
         return "SIA-NETWORK"
     if any(isinstance(item, requests.exceptions.RequestException) for item in chain):
         return "SIA-NETWORK"
+    return None
+
+
+# Network failures that are OSError subclasses and must never be read as local filesystem errors.
+# ssl.SSLError is the dangerous one: OpenSSL sets errno = SSL_ERROR_SSL = 1, which is numerically
+# identical to errno.EPERM, so a TLS failure otherwise classifies as SIA-LOCAL-PERMISSION and hands
+# the operator file-permission advice for a certificate problem. requests.RequestException subclasses
+# OSError too, and socket.gaierror carries unrelated EAI_* codes in the same errno field.
+_NETWORK_OSERROR = (ssl.SSLError, socket.gaierror, socket.herror, requests.exceptions.RequestException,
+                    ConnectionError, TimeoutError)
+
+
+def _local_error(exc: BaseException) -> OSError | None:
+    """The first genuine local filesystem error in the chain, or None.
+
+    Filesystem failures are identified by the OSError subclass Python already maps them to, not by
+    errno: EACCES and EPERM always arrive as PermissionError, so testing errno adds only false
+    positives. ENOSPC is the exception -- it has no dedicated subclass -- so SIA-DISK-FULL still
+    needs the errno test.
+    """
+    for item in _chain(exc):
+        if not isinstance(item, OSError) or isinstance(item, _NETWORK_OSERROR):
+            continue
+        if isinstance(item, (FileNotFoundError, PermissionError)):
+            return item
+        if getattr(item, "errno", None) == errno.ENOSPC:
+            return item
     return None
 
 
@@ -401,10 +431,7 @@ def diagnose(
     name = exc.__class__.__name__
     module = exc.__class__.__module__
     state = _mutation_state(exc, mutation_state)
-    local_error = next((item for item in _chain(exc)
-                        if isinstance(item, OSError) and (
-                            isinstance(item, (FileNotFoundError, PermissionError))
-                            or getattr(item, "errno", None) in {errno.EACCES, errno.EPERM, errno.ENOSPC})), None)
+    local_error = _local_error(exc)
     actions_override: tuple[str, ...] | None = None
 
     is_auth = name == "AuthError" and module.startswith("sia")
@@ -415,8 +442,7 @@ def diagnose(
     if isinstance(local_error, FileNotFoundError):
         code = "SIA-FILE-NOT-FOUND"
         message = f"Required file not found: {sanitize(str(exc))}"
-    elif isinstance(local_error, PermissionError) or (
-            local_error is not None and getattr(local_error, "errno", None) in {errno.EACCES, errno.EPERM}):
+    elif isinstance(local_error, PermissionError):
         code = "SIA-LOCAL-PERMISSION"
         message = f"Local access was denied: {sanitize(str(exc))}"
     elif local_error is not None and getattr(local_error, "errno", None) == errno.ENOSPC:

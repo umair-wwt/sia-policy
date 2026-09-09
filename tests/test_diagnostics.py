@@ -1,10 +1,12 @@
 import io
 import errno
 import socket
+import ssl
 
 import pytest
 import requests
 
+from sia.auth import AuthError
 from sia.checkpoint import CheckpointWriteError
 from sia.config import ConfigError
 from sia.diagnostics import (Diagnostic, diagnose, get_diagnostic_help, render_diagnostic,
@@ -67,6 +69,61 @@ def test_nested_dns_cause_is_detected():
     high = requests.exceptions.ConnectionError("connection failed")
     high.__cause__ = low
     assert diagnose(high).code == "SIA-DNS"
+
+
+def test_tls_errno_does_not_read_as_a_local_permission_failure():
+    """OpenSSL sets errno = SSL_ERROR_SSL = 1 on ssl.SSLError, colliding with errno.EPERM.
+
+    ssl.SSLError also subclasses OSError, so a probe for local filesystem failures matches a
+    certificate error unless it excludes network exceptions. That misreported every TLS failure as
+    SIA-LOCAL-PERMISSION and offered file-permission advice for a certificate problem.
+    """
+    low = ssl.SSLCertVerificationError(
+        1, "[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: self-signed certificate in certificate chain")
+    assert low.errno == errno.EPERM and isinstance(low, OSError)  # pin the collision this guards
+    high = requests.exceptions.SSLError(f"Max retries exceeded with url: /oauth2/platformtoken (Caused by {low!r})")
+    high.__cause__ = low
+    diag = diagnose(high, stage="Authentication")
+    assert diag.code == "SIA-TLS"
+    assert "ca_bundle" in " ".join(diag.actions)
+
+
+def test_tls_failure_under_auth_error_reaches_the_tls_code():
+    """The shape urllib3 actually produces: AuthError -> requests SSLError -> SSLCertVerificationError."""
+    low = ssl.SSLCertVerificationError(1, "[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed")
+    high = requests.exceptions.SSLError("HTTPSConnectionPool(host='abc.id.cyberark.cloud', port=443)")
+    high.__cause__ = low
+    auth = AuthError("could not reach https://abc.id.cyberark.cloud/oauth2/platformtoken: SSLError",
+                     operation="platform token request", cause=high)
+    assert diagnose(auth, stage="Authentication").code == "SIA-TLS"
+
+
+def test_tls_is_classified_without_relying_on_the_message_text():
+    """Windows builds its verification message with FormatMessageW, so the text is localised.
+
+    truststore raises a bare ssl.SSLCertVerificationError carrying that message, so classification
+    has to rest on the exception type rather than on English phrases.
+    """
+    localised = ssl.SSLCertVerificationError(
+        "Die Zertifikatkette wurde von einer nicht vertrauenswuerdigen Stammzertifizierungsstelle ausgestellt.")
+    assert diagnose(localised).code == "SIA-TLS"
+    wrapped = requests.exceptions.SSLError("HTTPSConnectionPool(host='x', port=443)")
+    wrapped.__cause__ = localised
+    assert diagnose(wrapped).code == "SIA-TLS"
+    auth = AuthError("could not reach the tenant", operation="platform token request", cause=wrapped)
+    assert diagnose(auth, stage="Authentication").code == "SIA-TLS"
+
+
+def test_network_oserrors_do_not_shadow_genuine_filesystem_failures(tmp_path):
+    """A real EPERM/EACCES still classifies locally; only network OSErrors are excluded."""
+    assert diagnose(PermissionError(errno.EPERM, "Operation not permitted", str(tmp_path))).code == "SIA-LOCAL-PERMISSION"
+    assert diagnose(PermissionError(errno.EACCES, "denied", str(tmp_path))).code == "SIA-LOCAL-PERMISSION"
+    assert diagnose(OSError(errno.ENOSPC, "No space left on device", str(tmp_path))).code == "SIA-DISK-FULL"
+    # a filesystem failure reached through a network exception's context is still local
+    denied = PermissionError(errno.EACCES, "denied", str(tmp_path / "corp-ca.pem"))
+    wrapper = requests.exceptions.SSLError("could not load CA bundle")
+    wrapper.__cause__ = denied
+    assert diagnose(wrapper).code == "SIA-LOCAL-PERMISSION"
 
 
 def test_local_config_input_and_os_diagnostics(tmp_path):
