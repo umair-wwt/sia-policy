@@ -207,7 +207,10 @@ HELP_CATALOGUE: dict[str, dict[str, Any]] = {
     "SIA-DISCOVERY-INCOMPLETE": {
         "summary": "The service did not return a complete inventory; discovery stopped.",
         "actions": ("No missing-object decisions can be made from this partial inventory.",
-                    "Check the endpoint and pagination details with --verbose, then run plan again after the service is corrected."),
+                    "Run again with --verbose: the detail line names the endpoint and which check stopped the walk.",
+                    "A repeated or cycled continuation token is a service-side fault worth reporting with that "
+                    "detail. Pinning [http] secrets_api or targetsets_api to one family avoids the paginated "
+                    "endpoint in the meantime."),
         "keywords": ("pagination", "inventory", "incomplete", "cycle", "page"),
     },
     "SIA-AMBIGUOUS": {

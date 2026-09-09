@@ -97,13 +97,47 @@ def test_token_pagination_cycles_nonprogress_and_caps_are_errors():
         SIAClient(client, "https://x", secrets_api="public", targetsets_api="legacy").list_secrets()
     assert caught.value.cause == "incomplete_pagination"
 
-    client, _ = http_with([FakeResponse(200, {"target_sets": [], "b64_last_evaluated_key": "more"})])
+    # A repeated non-empty page is real duplication, even though the cursor changed.
+    client, _ = http_with([
+        FakeResponse(200, {"target_sets": [{"name": "a.corp", "type": "Target"}], "b64_last_evaluated_key": "k1"}),
+        FakeResponse(200, {"target_sets": [{"name": "a.corp", "type": "Target"}], "b64_last_evaluated_key": "k2"}),
+    ])
     with pytest.raises(SIAApiError, match="made no progress"):
         SIAClient(client, "https://x", secrets_api="legacy", targetsets_api="legacy").list_target_sets()
 
     client, _ = http_with([FakeResponse(200, {"results": [policy("A", "p1")], "nextToken": "more"})])
     with pytest.raises(SIAApiError, match="1-page safety limit"):
         UAPClient(client, "https://u").list_policies(max_pages=1)
+
+
+def test_an_empty_page_with_a_fresh_cursor_keeps_paging():
+    """A scan filtered server-side applies its filter after the page limit, so a page can hold zero
+    matching items while the cursor still advances. Treating that as a stall stopped discovery
+    outright on a tenant whose first strong-account page filtered to nothing.
+
+    Two consecutive empty pages are included on purpose: every empty page shares one signature, so
+    recording it would make the second empty page look like a duplicate of the first.
+    """
+    client, _ = http_with([
+        FakeResponse(200, {"secrets": [], "b64_last_evaluated_key": "cursor1"}),
+        FakeResponse(200, {"secrets": [], "b64_last_evaluated_key": "cursor2"}),
+        FakeResponse(200, {"secrets": [{"secret_id": "s1", "secret_name": "A"}]}),
+    ])
+    found = SIAClient(client, "https://x", secrets_api="public", targetsets_api="legacy").list_secrets()
+    assert [s["secret_id"] for s in found] == ["s1"]
+
+    client, _ = http_with([
+        FakeResponse(200, {"target_sets": [], "b64_last_evaluated_key": "k1"}),
+        FakeResponse(200, {"target_sets": [{"name": "a.corp", "type": "Target"}]}),
+    ])
+    found = SIAClient(client, "https://x", secrets_api="legacy", targetsets_api="legacy").list_target_sets()
+    assert [t["name"] for t in found] == ["a.corp"]
+
+    client, _ = http_with([
+        FakeResponse(200, {"results": [], "nextToken": "more"}),
+        FakeResponse(200, {"results": [policy("A", "p1")]}),
+    ])
+    assert len(UAPClient(client, "https://u").list_policies()) == 1
 
 
 def test_offset_and_identity_pagination_caps_are_errors():

@@ -99,6 +99,22 @@ def _page_signature(items: list[dict[str, Any]]) -> str:
     return json.dumps(items, sort_keys=True, separators=(",", ":"), default=str)
 
 
+def _repeated_page(page: list[dict[str, Any]], signature: str, seen_pages: set[str]) -> bool:
+    """Whether a page that arrived with a continuation token duplicates one already collected.
+
+    An empty page is never duplication. These endpoints hand out DynamoDB-style
+    ``b64LastEvaluatedKey`` cursors (and UAP ``nextToken``), and a scan filtered server-side applies
+    its filter *after* the page limit, so a page can legitimately hold zero matching items while the
+    cursor still advances -- the caller has to keep paging until the token is absent. Treating an
+    empty page as a stall stopped discovery on tenants whose first page filtered to nothing.
+
+    Progress is still guaranteed: a cycled token is the real infinite-loop guard, a repeated
+    non-empty page is real duplication, and ``max_pages`` bounds the walk either way. Empty
+    signatures are deliberately not recorded, because every empty page shares one.
+    """
+    return bool(page) and signature in seen_pages
+
+
 def _pagination_error(method: str, url: str, detail: str) -> SIAApiError:
     return SIAApiError(method, url, 200, detail, cause="incomplete_pagination",
                        mutation_state="not_applicable")
@@ -302,12 +318,13 @@ class SIAClient:
                 items.extend(page)
                 return _dedupe_by(items, lambda s: s.get("secret_id") or s.get("secretId"))
             signature = _page_signature(page)
-            if not page or signature in seen_pages:
+            if _repeated_page(page, signature, seen_pages):
                 raise _pagination_error("GET", url, "strong-account pagination made no progress")
             if new_key in seen_tokens:
                 raise _pagination_error("GET", url, "strong-account pagination token repeated or cycled")
             items.extend(page)
-            seen_pages.add(signature)
+            if page:
+                seen_pages.add(signature)
             seen_tokens.add(new_key)
             start_key = new_key
         raise _pagination_error("GET", url, f"strong-account pagination exceeded the {max_pages}-page safety limit")
@@ -391,12 +408,13 @@ class SIAClient:
                 items.extend(page)
                 break
             signature = _page_signature(page)
-            if not page or signature in seen_pages:
+            if _repeated_page(page, signature, seen_pages):
                 raise _pagination_error("GET", url, "target-set pagination made no progress")
             if new_key in seen_tokens:
                 raise _pagination_error("GET", url, "target-set pagination token repeated or cycled")
             items.extend(page)
-            seen_pages.add(signature)
+            if page:
+                seen_pages.add(signature)
             seen_tokens.add(new_key)
             start_key = new_key
         else:
@@ -490,12 +508,13 @@ class UAPClient:
                 return _dedupe_by(results, lambda p: (p.get("metadata") or {}).get("policyId")
                                   or (p.get("metadata") or {}).get("policy_id"))
             signature = _page_signature(page)
-            if not page or signature in seen_pages:
+            if _repeated_page(page, signature, seen_pages):
                 raise _pagination_error("GET", url, "policy pagination made no progress")
             if new_token in seen_tokens:
                 raise _pagination_error("GET", url, "policy pagination token repeated or cycled")
             results.extend(page)
-            seen_pages.add(signature)
+            if page:
+                seen_pages.add(signature)
             seen_tokens.add(new_token)
             next_token = new_token
         raise _pagination_error("GET", url, f"policy pagination exceeded the {max_pages}-page safety limit")
