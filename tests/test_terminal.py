@@ -351,10 +351,10 @@ def test_first_launch_has_next_step_without_technical_dump(tmp_path, monkeypatch
 
 
 def test_home_forwards_explicit_command_arguments(tmp_path, monkeypatch):
-    answers(monkeypatch, ["/plan --server web01.example.com --group 'Server Admins' --drift", "/exit"])
+    answers(monkeypatch, ["/plan --server web01.example.com --principal 'Server Admins' --drift", "/exit"])
     called = []
     assert terminal.home(args_for(tmp_path), Session(shell_env={}), lambda argv: called.append(argv) or 0) == 0
-    assert called == [["plan", "--server", "web01.example.com", "--group", "Server Admins", "--drift", "--input", str(tmp_path / "input")]]
+    assert called == [["plan", "--server", "web01.example.com", "--principal", "Server Admins", "--drift", "--input", str(tmp_path / "input")]]
 
 
 def test_settings_search_and_nested_back_keep_pending_edits(tmp_path, monkeypatch):
@@ -542,7 +542,7 @@ def test_workflow_validates_fqdn_and_preserves_windows_path(tmp_path, monkeypatc
     answers(monkeypatch, ["2", "bad host", "web01.example.com", "Server Admins", "no", "no",
                           r"C:\Users\operator\SIA Input", "", "run"])
     argv = terminal.workflow("verify", args)
-    assert argv == ["verify", "--server", "web01.example.com", "--group", "Server Admins",
+    assert argv == ["verify", "--server", "web01.example.com", "--principal", "Server Admins",
                     "--input", r"C:\Users\operator\SIA Input", "--drift"]
     assert "needs attention" in capsys.readouterr().out
 
@@ -551,7 +551,7 @@ def test_workflow_back_revisits_previous_answer_with_its_default(tmp_path, monke
     answers(monkeypatch, ["2", "web01.example.com", "/back", "", "Server Admins", "no", "no", "", "", "run"])
     argv = terminal.workflow("verify", args_for(tmp_path))
     assert argv[argv.index("--server") + 1] == "web01.example.com"
-    assert argv[argv.index("--group") + 1] == "Server Admins"
+    assert argv[argv.index("--principal") + 1] == "Server Admins"
 
 
 def test_workflow_reprompts_for_every_invalid_advanced_choice(tmp_path, monkeypatch, capsys):
@@ -584,23 +584,23 @@ def test_split_command_line_accepts_optional_sia_and_preserves_windows_paths(tex
 
 
 def test_command_parser_round_trips_posix_quotes_and_apostrophes():
-    argv = ["plan", "--group", "O'Brien Admins", "--input", "/tmp/input files"]
+    argv = ["plan", "--principal", "O'Brien Admins", "--input", "/tmp/input files"]
     rendered = terminal.command_string(argv, windows=False)
     assert terminal.split_command_line(rendered, windows=False) == argv
 
 
 def test_command_parser_round_trips_windows_quotes_and_backslashes(monkeypatch):
-    argv = ["plan", "--group", "Server Admins", "--input", r"C:\SIA Input\folder\\"]
+    argv = ["plan", "--principal", "Server Admins", "--input", r"C:\SIA Input\folder\\"]
     rendered = __import__("subprocess").list2cmdline(["sia", *argv])
     assert terminal.split_command_line(rendered, windows=True) == argv
 
 
 def test_powershell_command_display_quotes_every_argument_without_interpolation():
-    argv = ["plan", "--group", "O'Brien $env:USER; & whoami `ignored`", "--input",
+    argv = ["plan", "--principal", "O'Brien $env:USER; & whoami `ignored`", "--input",
             r"C:\SIA Input\folder\\"]
     rendered = terminal.command_string(argv, windows=True)
     assert rendered == (
-        "sia 'plan' '--group' 'O''Brien $env:USER; & whoami `ignored`' "
+        "sia 'plan' '--principal' 'O''Brien $env:USER; & whoami `ignored`' "
         "'--input' 'C:\\SIA Input\\folder\\\\'"
     )
     assert terminal.split_command_line(rendered, windows=True) == argv
@@ -616,9 +616,9 @@ def test_windows_command_parser_rejects_unmatched_quotes(text):
 
 
 def test_windows_command_parser_treats_shell_syntax_as_literal_data():
-    text = "sia 'plan' '--group' '$env:USER; $(whoami) & calc.exe | ignored `still-data`'"
+    text = "sia 'plan' '--principal' '$env:USER; $(whoami) & calc.exe | ignored `still-data`'"
     assert terminal.split_command_line(text, windows=True) == [
-        "plan", "--group", "$env:USER; $(whoami) & calc.exe | ignored `still-data`",
+        "plan", "--principal", "$env:USER; $(whoami) & calc.exe | ignored `still-data`",
     ]
 
 

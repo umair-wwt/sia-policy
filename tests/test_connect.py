@@ -83,7 +83,7 @@ def test_programmatic_connection_config_is_validated_at_use_boundary():
 def test_build_rows_rejects_cli_connection_injection_even_for_ssh_only(tmp_path, user, network):
     servers = tmp_path / "servers.csv"
     servers.write_text(
-        "fqdn,protocol,group,strong_account,domain_joined,ssh_username\n"
+        "fqdn,protocol,principal,strong_account,domain_joined,ssh_username\n"
         "linux.good.example,ssh,SIA-Linux,,,admin\n",
         encoding="utf-8",
     )
@@ -107,7 +107,7 @@ def test_build_rows_and_files(tmp_path):
     assert rows[0].rdp_file.endswith("web01-web01.corp.example.com.rdp") and rows[1].rdp_file.endswith("web01-web01.corp.example.com-ops.rdp")
     assert rows[2].rdp_file.endswith("web02.rdp") and rows[3].rdp_username.endswith("/d local")
     assert rows[5].protocol == "ssh" and rows[5].rdp_username == "" and rows[5].rdp_file == "" and rows[5].strong_account == "-"
-    assert rows[0].groups == "SIA-Web-Admins" and rows[0].gateway_host == "acme.rdp.cyberark.cloud" and rows[0].as_list()[0] == "web01.corp.example.com"
+    assert rows[0].principals == "SIA-Web-Admins" and rows[0].gateway_host == "acme.rdp.cyberark.cloud" and rows[0].as_list()[0] == "web01.corp.example.com"
     path = write_connect_csv(rows, tmp_path / "out" / "connect.csv")
     header = path.read_text(encoding="utf-8").splitlines()[0]
     assert header == ",".join(CONNECT_COLUMNS)

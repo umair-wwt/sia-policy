@@ -20,9 +20,9 @@ if __name__ == "__main__":
     try:
         import requests  # noqa: F401 - give direct-script users an actionable installation error
         import tomlkit  # noqa: F401
-    except ModuleNotFoundError:
+    except ImportError as exc:
         from sia.bootstrap import main as bootstrap_main
-        sys.exit(bootstrap_main())
+        sys.exit(bootstrap_main(dependency_error=exc))
 
 import argparse
 from contextlib import redirect_stdout
@@ -41,7 +41,7 @@ from sia.auth import AuthError, PlatformTokenProvider, make_identity_token_provi
 from sia.checkpoint import DEFAULT_NAME as CHECKPOINT_NAME
 from sia.checkpoint import Checkpoint
 from sia.clients import IdentityClient, PerAccountTargetSetListingRequired, SIAClient, UAPClient
-from sia.config import Config, ConfigError, load_config, load_password_file
+from sia.config import PRINCIPAL_RENAME_HINT, Config, ConfigError, load_config, load_password_file
 from sia.diagnostics import Diagnostic, diagnose, render_diagnostic, sanitize
 from sia.connect import build_rows, login_suffix, write_connection_outputs
 from sia.http import HttpClient, RateLimiter, SIAApiError
@@ -166,8 +166,10 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--input", default="input", help="directory with servers.csv[, domains.csv, strong_accounts.csv, groups.csv]")
         p.add_argument("--server", action="append", default=[], metavar="FQDN",
                        help="onboard this server instead of reading servers.csv (repeatable); the other CSVs are still read")
-        p.add_argument("--group", action="append", default=[], metavar="NAME",
-                       help="--server only: Identity group that may connect (repeatable); omit to use group_template")
+        p.add_argument("--principal", action="append", default=[], metavar="NAME",
+                       help="--server only: Identity role (or group, see [defaults] principal_type) that may connect "
+                            "(repeatable); omit to use principal_template")
+        p.add_argument("--group", action="append", default=[], help=argparse.SUPPRESS)   # renamed; rejected with a hint
         p.add_argument("--strong-account", metavar="NAME", help="--server only: override the strong account")
         p.add_argument("--server-domain", metavar="DNS", help="--server only: AD domain, when it differs from the FQDN's")
         p.add_argument("--workgroup", action="store_true", help="--server only: the target is not domain-joined")
@@ -403,24 +405,26 @@ def make_password_source(allow_prompt: bool, file_passwords: dict[str, str] | No
     return get_password
 
 
-SERVER_ONLY_FLAGS = (("group", "--group"), ("strong_account", "--strong-account"), ("server_domain", "--server-domain"),
+SERVER_ONLY_FLAGS = (("principal", "--principal"), ("strong_account", "--strong-account"), ("server_domain", "--server-domain"),
                      ("workgroup", "--workgroup"), ("protocol", "--protocol"), ("ssh_username", "--ssh-username"))
 
 
 def check_server_flags(args: argparse.Namespace) -> None:
     """These flags describe the row --server builds. Without --server they would silently do nothing."""
+    if getattr(args, "group", None):
+        raise ConfigError(f"--group was renamed to --principal ({PRINCIPAL_RENAME_HINT})")
     if args.server:
         return
     used = [flag for attr, flag in SERVER_ONLY_FLAGS if getattr(args, attr, None)]
     if used:
         raise ConfigError(f"{', '.join(used)} only apply together with --server; without it the servers and their "
-                          "groups come from servers.csv")
+                          "principals come from servers.csv")
 
 
 def inline_rows(args: argparse.Namespace) -> list[dict[str, str]]:
     """--server FQDN [...] as servers.csv rows, so both paths run through the same validation."""
     shared = {
-        "group": LIST_SEPARATOR.join(args.group),
+        "principal": LIST_SEPARATOR.join(args.principal),
         "strong_account": args.strong_account or "",
         "domain": args.server_domain or "",
         "protocol": args.protocol or "",
@@ -436,8 +440,8 @@ def load_wave(ctx: Context, args: argparse.Namespace) -> Inputs:
     d = ctx.cfg.defaults
     check_server_flags(args)
     common = dict(strong_account_template=d.strong_account_spec or "", ssh_username_default=d.ssh_username,
-                  policy_name_template=d.policy_name_template, group_template=d.group_template,
-                  target_set_scope=d.target_set_scope)
+                  policy_name_template=d.policy_name_template, principal_template=d.principal_template,
+                  principal_type=d.principal_type, target_set_scope=d.target_set_scope)
     if args.server:
         inputs = inline_inputs(args.input, inline_rows(args), **common)
     else:
@@ -447,7 +451,7 @@ def load_wave(ctx: Context, args: argparse.Namespace) -> Inputs:
         if args.offset < 0 or args.limit < 0:
             raise ConfigError("--offset and --limit must be >= 0")
         inputs = inputs.window(args.offset, args.limit or None)
-    log.info("Loaded %d rows for %d servers (%d ssh), %d strong accounts, %d pinned groups%s", len(inputs.servers),
+    log.info("Loaded %d rows for %d servers (%d ssh), %d strong accounts, %d directory pins%s", len(inputs.servers),
              len(inputs.unique_fqdns), sum(1 for s in inputs.servers if s.is_ssh), len(inputs.strong_accounts), len(inputs.groups),
              f" -- wave {args.offset}..{args.offset + len(inputs.unique_fqdns)} of {total} servers" if (args.offset or args.limit) else "")
     for warning in inputs.warnings:
@@ -491,7 +495,7 @@ def cmd_plan_apply(ctx: Context, args: argparse.Namespace, dry_run: bool) -> int
             log.info("checkpoint %s records %d finished row(s); pass --resume to skip them", checkpoint_path, finished)
     if not dry_run:
         _active_checkpoint = checkpoint_path
-    resolver = PrincipalResolver(ctx.identity, inputs.pinned_directory)
+    resolver = PrincipalResolver(ctx.identity, inputs.pinned_directory, principal_type=ctx.cfg.defaults.principal_type)
     needs_vault = ctx.cfg.pvwa.enabled and args.only in ("all", "vault") and any(
         a.type == "vault" for a in inputs.referenced_strong_accounts)
     pvwa = ctx.pvwa_client() if needs_vault else None
@@ -668,7 +672,7 @@ def cmd_plan_apply(ctx: Context, args: argparse.Namespace, dry_run: bool) -> int
 
 def cmd_verify(ctx: Context, args: argparse.Namespace) -> int:
     inputs = load_wave(ctx, args)
-    resolver = PrincipalResolver(ctx.identity, inputs.pinned_directory)
+    resolver = PrincipalResolver(ctx.identity, inputs.pinned_directory, principal_type=ctx.cfg.defaults.principal_type)
     rec = Reconciler(sia=ctx.sia, uap=ctx.uap, resolver=resolver, inputs=inputs, defaults=ctx.cfg.defaults, dry_run=True,
                      drift=bool(args.drift), lookup=args.lookup, lookup_search_max_rows=ctx.cfg.http.lookup_search_max_rows,
                      workers=args.workers, status_polls=1, progress_every=0,
@@ -701,7 +705,7 @@ def cmd_connect_info(ctx: Context, args: argparse.Namespace) -> int:
     policy_names = {(s.fqdn, s.line): policy_name_for(s, d) for s in inputs.servers}
     statuses = None
     if not args.no_tenant:
-        resolver = PrincipalResolver(ctx.identity, inputs.pinned_directory)
+        resolver = PrincipalResolver(ctx.identity, inputs.pinned_directory, principal_type=ctx.cfg.defaults.principal_type)
         rec = Reconciler(sia=ctx.sia, uap=ctx.uap, resolver=resolver, inputs=inputs, defaults=d, dry_run=True, drift=False,
                          lookup=args.lookup, lookup_search_max_rows=ctx.cfg.http.lookup_search_max_rows, workers=args.workers,
                          progress_every=0, get_password=make_password_source(allow_prompt=False))

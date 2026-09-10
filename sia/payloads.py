@@ -225,8 +225,8 @@ def build_fqdn_rule(server: ServerRow) -> dict[str, Any]:
     return {"operator": "EXACTLY", "computernamePattern": server.fqdn, "domain": server.dns_domain}
 
 
-def build_principal(group_row: dict[str, Any]) -> dict[str, Any]:
-    """Identity DirectoryServiceQuery group row -> UAP principal."""
+def build_group_principal(group_row: dict[str, Any]) -> dict[str, Any]:
+    """Identity DirectoryServiceQuery group row -> UAP principal (principal_type = group)."""
     return {
         "id": group_row["InternalName"],
         "name": group_row.get("SystemName") or group_row.get("DisplayName"),
@@ -234,6 +234,24 @@ def build_principal(group_row: dict[str, Any]) -> dict[str, Any]:
         "sourceDirectoryId": group_row["DirectoryServiceUuid"],
         "sourceDirectoryName": group_row["ServiceInstanceLocalized"],
     }
+
+
+def build_role_principal(role_row: dict[str, Any], directory: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Identity DirectoryServiceQuery role row -> UAP principal (principal_type = role, the default).
+
+    The Access Control Policies API marks sourceDirectoryName/sourceDirectoryId optional for ROLE principals (every
+    Identity role lives in the CyberArk Cloud Directory). They are sent when that directory row is known, so the
+    principal reads like one created in the portal, and ignored by policy_signature so a tenant that drops or
+    rewrites them never shows drift.
+    """
+    principal: dict[str, Any] = {"id": role_row["_ID"], "name": role_row["Name"], "type": "ROLE"}
+    if directory:
+        uuid = directory.get("directoryServiceUuid") or directory.get("DirectoryServiceUuid")
+        if uuid:
+            principal["sourceDirectoryId"] = uuid
+            principal["sourceDirectoryName"] = (directory.get("DisplayName") or directory.get("Name")
+                                                or "CyberArk Cloud Directory")
+    return principal
 
 
 def _default_conditions(defaults: Defaults) -> dict[str, Any]:
@@ -490,6 +508,20 @@ def _normalized(value: Any, key: str = "") -> Any:
     return value
 
 
+def _principal_detail(principal: dict[str, Any]) -> tuple[str, str, str, str]:
+    """(id, TYPE, directory id, directory name) as compared for drift.
+
+    The type is upper-cased (tenants echo ``Role`` as readily as ``ROLE``). For ROLE principals the source-directory
+    fields are optional in the Access Control Policies API -- a tenant may omit, echo or rewrite them -- so they are
+    left out of the comparison.
+    """
+    kind = str(principal.get("type") or "").upper()
+    if kind == "ROLE":
+        return (str(principal.get("id") or ""), kind, "", "")
+    return (str(principal.get("id") or ""), kind, str(principal.get("sourceDirectoryId") or ""),
+            str(principal.get("sourceDirectoryName") or ""))
+
+
 def policy_signature(policy: dict[str, Any]) -> dict[str, Any]:
     """Normalized view of every policy field this tool writes.
 
@@ -500,11 +532,7 @@ def policy_signature(policy: dict[str, Any]) -> dict[str, Any]:
     principals = None
     principal_details = None
     if policy.get("principals") is not None:
-        principal_details = sorted(
-            (str(p.get("id") or ""), str(p.get("type") or ""), str(p.get("sourceDirectoryId") or ""),
-             str(p.get("sourceDirectoryName") or ""))
-            for p in policy.get("principals") or []
-        )
+        principal_details = sorted(_principal_detail(p) for p in policy.get("principals") or [])
         principals = [item[0] for item in principal_details]
     rules_block = (policy.get("targets") or {}).get("FQDN/IP") if policy.get("targets") is not None else None
     normalized_rules = None

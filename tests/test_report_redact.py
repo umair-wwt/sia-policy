@@ -156,13 +156,13 @@ def test_inactive_policy_help_does_not_call_the_policy_a_strong_account():
 
 # ------------------------------------------------------------ checkpoint
 def test_checkpoint_roundtrip_and_fingerprint(tmp_path):
-    server = ServerRow(fqdn="a.corp", strong_account="SA", groups=("G",), policy_name=None, assign_groups=None, domain=None,
+    server = ServerRow(fqdn="a.corp", strong_account="SA", principals=("G",), policy_name=None, assign_groups=None, domain=None,
                        description=None, line=2)
     account = StrongAccountRow(name="SA", type="vault", safe="S", account_name="a", username=None, account_domain="local",
                                password_env=None, line=3)
     fp = fingerprint(server, account, "a.corp")
     assert fp == fingerprint(ServerRow(**{**vars(server), "line": 99}), StrongAccountRow(**{**vars(account), "line": 1}), "a.corp")
-    assert fp != fingerprint(ServerRow(**{**vars(server), "groups": ("G", "H")}), account, "a.corp")
+    assert fp != fingerprint(ServerRow(**{**vars(server), "principals": ("G", "H")}), account, "a.corp")
     assert fp != fingerprint(server, None, "a.corp") and fp != fingerprint(server, account, "other")
     cp = Checkpoint(tmp_path / "sub" / "cp.jsonl")
     assert len(cp) == 0 and cp.get(row_key("a.corp", "a.corp"), fp) is None

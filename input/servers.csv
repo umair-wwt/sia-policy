@@ -1,4 +1,4 @@
-fqdn,strong_account,group,policy_name,policy_suffix,assign_groups,domain,description,protocol,ssh_username,domain_joined
+fqdn,strong_account,principal,policy_name,policy_suffix,assign_groups,domain,description,protocol,ssh_username,domain_joined
 web01.corp.example.com,,SIA-Web-Admins,,,,,,,,
 web01.corp.example.com,,SIA-Platform-Ops,,-ops,Remote Desktop Users,,,,,
 web02.corp.example.com,,SIA-Web-Admins,,,,,,,,

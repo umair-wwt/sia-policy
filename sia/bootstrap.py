@@ -5,12 +5,14 @@ import json
 import sys
 
 
-def main() -> int:
+def main(*, dependency_error: ImportError | None = None) -> int:
     problem = ""
     if sys.version_info < (3, 11):
         problem = "SIA needs Python 3.11 or newer. Install a supported Python and recreate the virtual environment."
     if not problem:
         try:
+            if dependency_error is not None:
+                raise dependency_error
             from sia_onboard import main as run
         except ImportError as exc:
             component = exc.name or "an installed dependency"

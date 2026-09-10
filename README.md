@@ -30,7 +30,7 @@ and lets you search by name, such as `timeout`. File prompts complete paths too.
 
 ```mermaid
 flowchart TB
-    G["Identity group<br/>SIA-Web-Admins<br/><i>already in place</i>"]
+    G["Identity role<br/>SIA-Web-Admins<br/><i>already in place</i>"]
     subgraph tool["Created by the tool, per server"]
         direction TB
         P["1. Access policy<br/>web01.corp.example.com<br/>who may connect, RDP with a temporary local user, when"]
@@ -53,9 +53,9 @@ For each Windows server in your list the tool:
    Vault, found by a naming convention you set once (safe `SIA-LocalAdmins`, account `<hostname>-Administrator`);
 2. creates a **target set** pointing at that account: one per server, or one per AD domain when the account is
    shared;
-3. creates the **access policy**: which Identity group may connect, by RDP with a temporary local user, for how long.
+3. creates the **access policy**: which Identity role (or group) may connect, by RDP with a temporary local user, for how long.
 
-Linux servers get only a policy (SIA uses an SSH certificate there). A second group on the same server is just a
+Linux servers get only a policy (SIA uses an SSH certificate there). A second role on the same server is just a
 second row with a `policy_suffix`.
 
 **When a user connects**, they open **Access › Infrastructure** in the portal, search the server, and click
@@ -129,7 +129,8 @@ Use `.venv/bin/sia` again in a new terminal, or activate `.venv` to use the shor
    ```
 
 2. Configure the service user (an Identity user flagged **Is OAuth confidential client**, member of the **Secure
-   Infrastructure Access administrator** role). From the terminal home, credentials can stay in memory for that
+   Infrastructure Access administrator** role, `DpaAdmin` — the SIA administrator role, not one of the Identity
+   roles a policy grants access to). From the terminal home, credentials can stay in memory for that
    home session or be explicitly saved to `.env`. Standalone setup offers explicit `.env` saving. You may instead
    copy `.env.example` to `.env`:
 
@@ -168,10 +169,10 @@ the operations guide), the SIA connectors reach the servers over WinRM (TCP 5985
 
 ## Your list: `input/servers.csv`
 
-One row per policy. Usually that is one row per server; a second group gets a second row.
+One row per policy. Usually that is one row per server; a second role gets a second row.
 
 ```csv
-fqdn,strong_account,group,policy_name,policy_suffix,assign_groups,domain,description,protocol,ssh_username,domain_joined
+fqdn,strong_account,principal,policy_name,policy_suffix,assign_groups,domain,description,protocol,ssh_username,domain_joined
 web01.corp.example.com,,SIA-Web-Admins,,,,,,,,
 web01.corp.example.com,,SIA-Platform-Ops,,-ops,Remote Desktop Users,,,,,
 web02.corp.example.com,,SIA-Web-Admins,,,,,,,,
@@ -181,7 +182,7 @@ app-lnx01.corp.example.com,,SIA-Linux-Admins,,,,,,ssh,ec2-user,
 | Column | Fill in |
 |---|---|
 | `fqdn` | The server name exactly as users will connect to it. **The only required column.** |
-| `group` | The Identity group that may connect (several: `SIA-Web-Admins;SIA-Platform-Ops`). Leave empty to derive it from the server name — see below. |
+| `principal` | The Identity role that may connect (several: `SIA-Web-Admins;SIA-Platform-Ops`); with `principal_type = "group"` in `config.toml` it names an Identity group instead. Leave empty to derive it from the server name — see below. |
 | `policy_suffix` | Only for a second policy on the same server, e.g. `-ops`. |
 | `assign_groups` | Local groups the temporary user joins; empty = `Administrators`. |
 | `protocol`, `ssh_username` | `ssh` and the certificate user name for Linux servers; empty = Windows/RDP. |
@@ -192,25 +193,25 @@ app-lnx01.corp.example.com,,SIA-Linux-Admins,,,,,,ssh,ec2-user,
 Column names must match exactly; every problem is reported with its line number and nothing is touched until
 the files are clean.
 
-## Deriving the group and the strong account
+## Deriving the principal and the strong account
 
-Filling in a group and a strong account per server does not scale past a few hundred rows. Two conventions
+Filling in a principal and a strong account per server does not scale past a few hundred rows. Two conventions
 remove both columns.
 
-**The group comes from the server name.** Set it once in `config.toml`:
+**The principal comes from the server name.** Set it once in `config.toml`:
 
 ```toml
 [defaults]
-group_template = "SIA-{hostname_upper}-RDP"     # server ABC123 -> group SIA-ABC123-RDP
+principal_template = "SIA-{hostname_upper}-RDP"     # server ABC123 -> role SIA-ABC123-RDP
 ```
 
 Templates may use `{hostname}`, `{fqdn}`, `{domain}` and the `{hostname_upper}` / `{hostname_lower}` /
-`{domain_upper}` variants. A `group` typed into a row always wins.
+`{domain_upper}` variants. A `principal` typed into a row always wins.
 
 **The strong account comes from the server's AD domain.** List your domains once in `input/domains.csv`:
 
 ```csv
-domain,strong_account,target_set,target_set_type,group_template,description
+domain,strong_account,target_set,target_set_type,principal_template,description
 corp.example.com,SA-CORP-SIA,,Domain,,
 dmz.example.com,SA-DMZ-SIA,,Domain,SIA-{hostname_upper}-DMZ,
 ```
@@ -221,7 +222,7 @@ dmz.example.com,SA-DMZ-SIA,,Domain,SIA-{hostname_upper}-DMZ,
 | `strong_account` | The domain account already onboarded into SIA. The tool only looks it up — it never creates it. |
 | `target_set` | The target set holding that account; empty = the domain name. |
 | `target_set_type` | `Domain` (every machine in the domain, the default) or `Suffix` (every machine under a DNS suffix). `Target` scopes a set to one machine, so it is only valid together with an explicit `target_set`. |
-| `group_template` | Overrides `[defaults] group_template` for this domain only. |
+| `principal_template` | Overrides `[defaults] principal_template` for this domain only. |
 
 Then `servers.csv` is just a list of names, and `strong_accounts.csv` is only needed for the exceptions:
 
@@ -241,7 +242,19 @@ domain, so it does not need a target set per server. Set `target_set_scope = "au
 each domain gets a single `Domain` target set — 24 objects instead of 24,000. Workgroup servers keep their
 own `Target` set. The default, `server`, keeps one target set per server for everyone.
 
-`groups.csv` is only needed when a group name exists in two directories.
+`groups.csv` (`name,directory`) is only read for group principals (`principal_type = "group"`), when a group name
+exists in two directories. Roles are unique in the tenant and need no pin.
+
+### Migrating from group principals
+
+Policies created by earlier releases name an Identity **group**. After upgrading, `sia plan --input input` lists
+every managed policy as `drift: principals differ (… (GROUP) -> … (ROLE))`; `sia apply --input input --update`
+replaces the group with the role of the same name (create the roles first, or set `principal_template`
+accordingly). To keep the old behaviour, set `principal_type = "group"` in `config.toml`. Old column and key
+names are rejected with a message that names the replacement: `group` → `principal`, `group_template` →
+`principal_template`, `--group` → `--principal`. `groups.csv` is only read for group principals, and the
+`connect-info` CSV column `groups` is now `principals`. Checkpoint rows written before the upgrade are reconciled
+again.
 
 ## Settings and paths
 
@@ -286,9 +299,9 @@ Summary: n/a=1, planned=8
 **`apply`** shows the plan again, asks you to type `yes`, then creates the objects in order (strong accounts,
 target sets, policies) and prints the same table with `created`. Run it again and everything says `exists`.
 Anything that differs from your list is shown as `drift`, never changed silently. Add `--drift` to fetch complete
-policies and compare every managed field the tool writes: descriptions, tags, time frame, time zone, principals and
-directory metadata, entitlement, delegation, conditions, targets, and RDP/SSH behavior including local groups and
-reconnect. Target-set type, account, description, certificate validation and provisioning format are also compared.
+policies and compare every managed field the tool writes: descriptions, tags, time frame, time zone, principals
+(directory metadata for group principals only), entitlement, delegation, conditions, targets, and RDP/SSH behavior
+including local groups and reconnect. Target-set type, account, description, certificate validation and provisioning format are also compared.
 `--update` implies this full comparison.
 
 `policy_status` in TOML is used only when a policy is created. To activate or suspend existing managed policies,
@@ -299,28 +312,31 @@ sia plan  --input input --update --set-policy-status Suspended
 sia apply --input input --update --set-policy-status Suspended
 ```
 
-The status action requires `--update`; normal updates preserve the policy's current status.
+The status action requires `--update`; normal updates preserve an existing `Active` or `Suspended` status.
+When correcting fields on a policy in a platform-managed state such as `Error` or `Validating`, the update requests
+the configured `policy_status`; the plan shows this status change.
 
 **`verify`** prints `PASS`, `MISSING` or `FAIL` per row and is what you hand to whoever signs the change off.
 **`connect-info --rdp-dir out`** writes a CSV with the connection settings per server and one `.rdp` file each.
 
-Start with one server, test the login as a member of the group, then load the real list.
+Start with one server, test the login as a member of the role, then load the real list.
 [What the results mean](docs/OPERATIONS.md#1-what-the-results-mean) explains every status.
 
 ## Big lists
 
 - Work in waves: `--offset 0 --limit 5000`, then `--offset 5000 --limit 5000`, and `verify` after each.
 - Add `--workers 8` and set `max_requests_per_second = 10` in `config.toml`.
-- Interrupted? Run the same `apply` again with `--resume`. Only complete, verified rows from a matching version-2
+- Interrupted? Run the same `apply` again with `--resume`. Only complete, verified rows from a matching version-3
   checkpoint are skipped; changed tenant/config/template/input fingerprints, a different `--update`/`--drift`
-  choice, and malformed or older records are reconciled again.
+  choice, and malformed or older records are reconciled again. Version-2 records are preserved and rechecked
+  because their completion checks did not confirm the saved fields after policy and target-set updates.
 
 More in [Large rollouts](docs/OPERATIONS.md#6-large-rollouts).
 
 ## One server at a time (from a build job)
 
 `--server` replaces `servers.csv` for a single run, so a newly built server can be onboarded from the same
-job that builds it. `domains.csv`, `strong_accounts.csv` and `groups.csv` are still read, so the group and
+job that builds it. `domains.csv`, `strong_accounts.csv` and `groups.csv` are still read, so the principal and
 strong account resolve exactly as they would in a bulk run:
 
 ```bash
@@ -328,7 +344,7 @@ python sia_onboard.py apply --server web09.corp.example.com --yes --json --no-re
 ```
 
 `--json` puts a valid result on stdout for both success and failure (the table and prompts go to stderr) and the
-exit code is `0` success, `1` something needs attention, `2` bad input or configuration. Add `--group NAME` to name the group explicitly,
+exit code is `0` success, `1` something needs attention, `2` bad input or configuration. Add `--principal NAME` to name the role (or group) explicitly,
 `--workgroup` for a server that is not domain-joined.
 
 ## Behind a TLS-inspecting proxy

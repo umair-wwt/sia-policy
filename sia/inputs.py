@@ -1,11 +1,11 @@
-"""CSV inputs: servers.csv (mapping), domains.csv, strong_accounts.csv, groups.csv. Only servers.csv is required;
-validation reports every problem at once.
+"""CSV inputs: servers.csv (mapping), domains.csv, strong_accounts.csv, groups.csv (directory pins for group
+principals). Only servers.csv is required; validation reports every problem at once.
 
-One server may appear on several rows (one access policy each, e.g. one per Identity group): the rows must agree
-on the strong account, domain and protocol, and every row must end up with a distinct policy name.
+One server may appear on several rows (one access policy each, e.g. one per Identity role or group): the rows must
+agree on the strong account, domain and protocol, and every row must end up with a distinct policy name.
 
 Two things a row can leave blank are filled in by convention:
-  * `group`          from domains.csv `group_template`, else [defaults] group_template;
+  * `principal`      from domains.csv `principal_template`, else [defaults] principal_template;
   * `strong_account` from domains.csv for a domain-joined server (its domain's shared account), else the
                      [defaults] strong_account_template (the per-host local administrator).
 Which of those two routes supplied the account also decides how wide the server's target set is -- see
@@ -20,7 +20,7 @@ import string
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
-from .config import ConfigError, StrongAccountTemplate, env_var_for_password
+from .config import PRINCIPAL_RENAME_HINT, PRINCIPAL_TYPES, ConfigError, StrongAccountTemplate, env_var_for_password
 
 FQDN_LABEL = r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
 FQDN_RE = re.compile(rf"^(?:{FQDN_LABEL}\.)+{FQDN_LABEL}$")
@@ -48,7 +48,7 @@ class InputError(Exception):
 class ServerRow:
     fqdn: str
     strong_account: str | None          # None for protocol=ssh (Linux ZSP uses an SSH certificate, no strong account)
-    groups: tuple[str, ...]
+    principals: tuple[str, ...]         # Identity role names, or group names when [defaults] principal_type = "group"
     policy_name: str | None
     assign_groups: tuple[str, ...] | None
     domain: str | None
@@ -115,6 +115,7 @@ class StrongAccountRow:
 
 @dataclass(frozen=True)
 class GroupRow:
+    """groups.csv row: pins a group principal to one directory (principal_type = "group" only)."""
     name: str
     directory: str | None
     line: int
@@ -127,7 +128,7 @@ class DomainRow:
     strong_account: str | None
     target_set: str | None              # None = the domain name itself
     target_set_type: str                # Domain (default) | Suffix | Target
-    group_template: str | None          # overrides [defaults] group_template for servers in this domain
+    principal_template: str | None      # overrides [defaults] principal_template for servers in this domain
     line: int
 
     @property
@@ -165,11 +166,11 @@ class Inputs:
         return [sa for name, sa in self.strong_accounts.items() if name in names]
 
     @property
-    def referenced_groups(self) -> list[str]:
+    def referenced_principals(self) -> list[str]:
         seen: dict[str, None] = {}
         for server in self.servers:
-            for group in server.groups:
-                seen.setdefault(group, None)
+            for principal in server.principals:
+                seen.setdefault(principal, None)
         return list(seen)
 
     @property
@@ -225,8 +226,12 @@ def _valid_dns_name(value: str, *, fqdn: bool = False) -> bool:
 
 
 def read_csv(path: Path, required: tuple[str, ...], optional: tuple[str, ...], *,
-             require_rows: bool = False) -> list[tuple[int, dict[str, str]]]:
-    """Read a CSV with a header row. Returns (line_number, row) pairs; cells stripped; blank rows skipped."""
+             require_rows: bool = False, renamed: dict[str, str] | None = None) -> list[tuple[int, dict[str, str]]]:
+    """Read a CSV with a header row. Returns (line_number, row) pairs; cells stripped; blank rows skipped.
+
+    `renamed` maps column names an earlier release accepted to their current names: such a column is still an
+    error (never silently reinterpreted), but the message says what to rename it to.
+    """
     problems: list[str] = []
     try:
         text = path.read_text(encoding="utf-8-sig")
@@ -252,6 +257,10 @@ def read_csv(path: Path, required: tuple[str, ...], optional: tuple[str, ...], *
             problems.append(f"{path.name}: missing required column(s): {', '.join(missing)}")
         if unknown:
             problems.append(f"{path.name}: unknown column(s): {', '.join(unknown)} (allowed: {', '.join(required + optional)})")
+            for old in unknown:
+                new = (renamed or {}).get(old)
+                if new:
+                    problems.append(f"{path.name}: column {old!r} was renamed to {new!r} ({PRINCIPAL_RENAME_HINT})")
         if problems:
             raise InputError("\n".join(problems))
         rows: list[tuple[int, dict[str, str]]] = []
@@ -276,8 +285,9 @@ def read_csv(path: Path, required: tuple[str, ...], optional: tuple[str, ...], *
 def _render_name(template: str, fqdn: str, domain: str) -> str:
     """Render a name template. Keep the placeholder set in step with config.TEMPLATE_PLACEHOLDERS and payloads.render.
 
-    The *_upper / *_lower variants exist because FQDNs are lower-cased on the way in while Identity group names are
-    often written in upper case; group lookup is case-insensitive either way, but the rendered name should read right.
+    The *_upper / *_lower variants exist because FQDNs are lower-cased on the way in while Identity role and group
+    names are often written in upper case; the lookup is case-insensitive either way, but the rendered name should
+    read right.
     """
     parsed = list(string.Formatter().parse(template))
     for _, field_name, format_spec, conversion in parsed:
@@ -329,36 +339,44 @@ class ParseContext:
     spec: StrongAccountTemplate | None = None
     ssh_username_default: str = ""
     policy_name_template: str = "{fqdn}"
-    group_template: str = ""
+    principal_template: str = ""
+    principal_type: str = "role"
     target_set_scope: str = "server"
     domains: dict[str, DomainRow] = field(default_factory=dict)
     generated_origins: dict[str, str] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if self.principal_type not in PRINCIPAL_TYPES:
+            raise ValueError(f"principal_type must be one of {', '.join(PRINCIPAL_TYPES)}")
 
     def domain_row(self, dns_domain: str) -> DomainRow | None:
         return self.domains.get((dns_domain or "").lower())
 
 
-def _resolve_groups(cell: str | None, fqdn: str, dns_domain: str, entry: DomainRow | None, ctx: ParseContext,
-                    where: str, problems: list[str]) -> tuple[str, ...]:
-    """The `group` cell, else the domain's group_template, else [defaults] group_template."""
-    groups = _split_list(cell)
-    if groups:
-        return groups
-    template = (entry.group_template if entry and entry.group_template else ctx.group_template)
+def _resolve_principals(cell: str | None, fqdn: str, dns_domain: str, entry: DomainRow | None, ctx: ParseContext,
+                        where: str, problems: list[str]) -> tuple[str, ...]:
+    """The `principal` cell, else the domain's principal_template, else [defaults] principal_template.
+
+    Whether a name is looked up as an Identity role or group is decided later by [defaults] principal_type.
+    """
+    principals = _split_list(cell)
+    if principals:
+        return principals
+    template = (entry.principal_template if entry and entry.principal_template else ctx.principal_template)
     if not template:
-        problems.append(f"{where}: group is required (separate several with '{LIST_SEPARATOR}'), or set "
-                        "[defaults] group_template (or a group_template for this domain in domains.csv) to derive it "
-                        "from the server name")
+        problems.append(f"{where}: principal is required (separate several with '{LIST_SEPARATOR}'), or set "
+                        "[defaults] principal_template (or a principal_template for this domain in domains.csv) to "
+                        "derive it from the server name")
         return ()
     try:
         rendered = _render_name(template, fqdn, dns_domain)
     except (KeyError, IndexError, ValueError) as exc:
-        problems.append(f"{where}: group_template {template!r} is invalid: {exc}")
+        problems.append(f"{where}: principal_template {template!r} is invalid: {exc}")
         return ()
-    groups = _split_list(rendered)
-    if not groups:
-        problems.append(f"{where}: group_template {template!r} rendered an empty group name")
-    return groups
+    principals = _split_list(rendered)
+    if not principals:
+        problems.append(f"{where}: principal_template {template!r} rendered an empty principal name")
+    return principals
 
 
 def _resolve_strong_account(cell: str | None, domain_joined: bool, fqdn: str, dns_domain: str,
@@ -464,7 +482,7 @@ def _build_server_row(c: dict[str, str], where: str, line: int, ctx: ParseContex
             problems.append(
                 f"{where}: target_set_type = Target must name this exact server {fqdn!r}, "
                 f"but the resolved target set is {target_set_name!r}")
-    groups = _resolve_groups(c.get("group"), fqdn, dns_domain, entry, ctx, where, problems)
+    principals = _resolve_principals(c.get("principal"), fqdn, dns_domain, entry, ctx, where, problems)
 
     policy_name = c.get("policy_name") or None
     policy_suffix = c.get("policy_suffix") or None
@@ -472,7 +490,7 @@ def _build_server_row(c: dict[str, str], where: str, line: int, ctx: ParseContex
         warnings.append(f"{where}: policy_suffix {policy_suffix!r} ignored because policy_name is set")
         policy_suffix = None
     return ServerRow(
-        fqdn=fqdn, strong_account=strong_account, groups=groups,
+        fqdn=fqdn, strong_account=strong_account, principals=principals,
         policy_name=policy_name, assign_groups=assign_groups,
         domain=domain, description=c.get("description") or None, line=line,
         protocol=protocol, ssh_username=ssh_username, policy_suffix=policy_suffix, domain_joined=domain_joined,
@@ -519,8 +537,9 @@ def _check_row_agreement(row: ServerRow, where: str, first_row: dict[str, Server
 def _parse_servers(path: Path, problems: list[str], warnings: list[str],
                    ctx: ParseContext) -> tuple[list[ServerRow], dict[str, StrongAccountRow]]:
     rows = read_csv(path, ("fqdn",),
-                    ("strong_account", "group", "policy_name", "policy_suffix", "assign_groups", "domain",
-                     "description", "protocol", "ssh_username", "domain_joined"), require_rows=True)
+                    ("strong_account", "principal", "policy_name", "policy_suffix", "assign_groups", "domain",
+                     "description", "protocol", "ssh_username", "domain_joined"), require_rows=True,
+                    renamed={"group": "principal"})
     servers: list[ServerRow] = []
     templated: dict[str, StrongAccountRow] = {}
     first_row: dict[str, ServerRow] = {}
@@ -581,10 +600,11 @@ def _parse_strong_accounts(path: Path, problems: list[str]) -> dict[str, StrongA
 
 
 def _parse_domains(path: Path, problems: list[str]) -> dict[str, DomainRow]:
-    """domains.csv (optional): one row per AD domain -- its shared strong account, target set and group convention."""
+    """domains.csv (optional): one row per AD domain -- its shared strong account, target set and principal convention."""
     if not path.is_file():
         return {}
-    rows = read_csv(path, ("domain",), ("strong_account", "target_set", "target_set_type", "group_template", "description"))
+    rows = read_csv(path, ("domain",), ("strong_account", "target_set", "target_set_type", "principal_template", "description"),
+                    renamed={"group_template": "principal_template"})
     domains: dict[str, DomainRow] = {}
     for line, c in rows:
         where = f"{path.name}:{line}"
@@ -612,22 +632,22 @@ def _parse_domains(path: Path, problems: list[str]) -> dict[str, DomainRow]:
         target_set = (c.get("target_set") or "").lower().rstrip(".") or None
         if target_set and not _valid_dns_name(target_set):
             problems.append(f"{where}: target_set {c['target_set']!r} is not a valid DNS name")
-        group_template = c.get("group_template") or None
-        if group_template:
+        principal_template = c.get("principal_template") or None
+        if principal_template:
             try:
-                _render_name(group_template, f"host.{domain}", domain)
+                _render_name(principal_template, f"host.{domain}", domain)
             except (KeyError, IndexError, ValueError) as exc:
-                problems.append(f"{where}: group_template {group_template!r} is invalid: {exc}")
-                group_template = None
+                problems.append(f"{where}: principal_template {principal_template!r} is invalid: {exc}")
+                principal_template = None
         domains[domain] = DomainRow(
             domain=domain, strong_account=c.get("strong_account") or None, target_set=target_set,
-            target_set_type=TARGET_SET_TYPES[raw_type], group_template=group_template, line=line)
+            target_set_type=TARGET_SET_TYPES[raw_type], principal_template=principal_template, line=line)
     _check_shared_target_sets(path, domains, problems)
     return domains
 
 
-def _check_target_set_accounts(servers: list[ServerRow], origin: str, problems: list[str]) -> None:
-    """Every server sharing a target set must share its strong account -- a target set holds exactly one secret_id.
+def _check_target_set_definitions(servers: list[ServerRow], origin: str, problems: list[str]) -> None:
+    """Every Windows row sharing a target-set name must agree on its type and strong account.
 
     This is the invariant `Reconciler._rows_by_target_set` relies on when it lets the first row of a group decide
     the whole group's account, so it is checked over the rows themselves: a domains.csv `target_set` naming one
@@ -638,7 +658,14 @@ def _check_target_set_accounts(servers: list[ServerRow], origin: str, problems: 
         if server.is_ssh or not server.strong_account:
             continue
         owner = first.setdefault(server.target_set_key.casefold(), server)
-        if owner is not server and owner.strong_account != server.strong_account:
+        if owner is server:
+            continue
+        if owner.target_set_type.casefold() != server.target_set_type.casefold():
+            problems.append(
+                f"{origin}:{server.line}: {server.fqdn} shares target set {server.target_set_key!r} with "
+                f"{owner.fqdn} (line {owner.line}) but uses target_set_type {server.target_set_type!r} instead of "
+                f"{owner.target_set_type!r}; one target-set name cannot have two types")
+        if owner.strong_account.casefold() != server.strong_account.casefold():
             problems.append(
                 f"{origin}:{server.line}: {server.fqdn} shares target set {server.target_set_key!r} with "
                 f"{owner.fqdn} (line {owner.line}) but uses strong account {server.strong_account!r} instead of "
@@ -646,13 +673,18 @@ def _check_target_set_accounts(servers: list[ServerRow], origin: str, problems: 
 
 
 def _check_shared_target_sets(path: Path, domains: dict[str, DomainRow], problems: list[str]) -> None:
-    """Two domains may point at one target set, but only if they also share its strong account -- a target set
-    carries exactly one secret_id, so disagreeing rows would silently fight over it."""
+    """Two domains may point at one target set only when its type and strong account agree."""
     by_set: dict[str, DomainRow] = {}
     for row in domains.values():
         first = by_set.setdefault(row.target_set_name.lower(), row)
-        if (first is not row
-                and (first.strong_account or "").casefold() != (row.strong_account or "").casefold()):
+        if first is row:
+            continue
+        if first.target_set_type.casefold() != row.target_set_type.casefold():
+            problems.append(
+                f"{path.name}:{row.line}: domain {row.domain!r} shares target set {row.target_set_name!r} with "
+                f"{first.domain!r} (line {first.line}) but uses target_set_type {row.target_set_type!r} instead of "
+                f"{first.target_set_type!r}; one target-set name cannot have two types")
+        if (first.strong_account or "").casefold() != (row.strong_account or "").casefold():
             problems.append(
                 f"{path.name}:{row.line}: domain {row.domain!r} shares target set {row.target_set_name!r} with "
                 f"{first.domain!r} (line {first.line}) but names strong account {row.strong_account!r} instead of "
@@ -700,15 +732,17 @@ def _parse_groups(path: Path, problems: list[str]) -> dict[str, GroupRow]:
 
 
 def _parse_context(input_dir: Path, problems: list[str], *, strong_account_template: str | StrongAccountTemplate,
-                   ssh_username_default: str, policy_name_template: str, group_template: str,
-                   target_set_scope: str) -> ParseContext:
+                   ssh_username_default: str, policy_name_template: str, principal_template: str,
+                   principal_type: str, target_set_scope: str) -> ParseContext:
+    if principal_type not in PRINCIPAL_TYPES:
+        raise ValueError(f"principal_type must be one of {', '.join(PRINCIPAL_TYPES)}")
     if isinstance(strong_account_template, StrongAccountTemplate):
         spec: StrongAccountTemplate | None = strong_account_template
     else:
         spec = StrongAccountTemplate(name=strong_account_template) if strong_account_template else None
     return ParseContext(spec=spec, ssh_username_default=ssh_username_default,
-                        policy_name_template=policy_name_template, group_template=group_template,
-                        target_set_scope=target_set_scope,
+                        policy_name_template=policy_name_template, principal_template=principal_template,
+                        principal_type=principal_type, target_set_scope=target_set_scope,
                         domains=_parse_domains(input_dir / "domains.csv", problems))
 
 
@@ -716,7 +750,11 @@ def _finish(servers: list[ServerRow], templated: dict[str, StrongAccountRow], ct
             problems: list[str], warnings: list[str], origin: str) -> Inputs:
     """Merge the account sources, check every referenced account is declared, and raise all problems at once."""
     accounts = _parse_strong_accounts(input_dir / "strong_accounts.csv", problems)
-    groups = _parse_groups(input_dir / "groups.csv", problems)
+    groups_path = input_dir / "groups.csv"
+    groups = _parse_groups(groups_path, problems) if ctx.principal_type == "group" else {}
+    if ctx.principal_type == "role" and groups_path.is_file():
+        warnings.append('groups.csv is only used when [defaults] principal_type = "group"; '
+                        "its directory pins are ignored for Identity roles")
     # Explicit strong_accounts.csv rows win over accounts derived from domains.csv or a template.
     canonical = {name.casefold(): name for name in accounts}
     for source in (_domain_strong_accounts(ctx.domains), templated):
@@ -745,7 +783,7 @@ def _finish(servers: list[ServerRow], templated: dict[str, StrongAccountRow], ct
             problems.append(
                 f"{origin}:{server.line}: strong_account {server.strong_account!r} is not defined in strong_accounts.csv "
                 f"or domains.csv (add a row with type=existing if it already exists in SIA)")
-    _check_target_set_accounts(servers, origin, problems)
+    _check_target_set_definitions(servers, origin, problems)
     if problems:
         raise InputError("\n".join(problems))
     return Inputs(servers=tuple(servers), strong_accounts=accounts, groups=groups, warnings=tuple(warnings),
@@ -753,9 +791,10 @@ def _finish(servers: list[ServerRow], templated: dict[str, StrongAccountRow], ct
 
 
 def load_inputs(input_dir: str | Path, *, strong_account_template: str | StrongAccountTemplate = "",
-                ssh_username_default: str = "", policy_name_template: str = "{fqdn}", group_template: str = "",
-                target_set_scope: str = "server") -> Inputs:
-    """Load and validate the CSVs. Only servers.csv is required; domains, strong_accounts and groups are optional.
+                ssh_username_default: str = "", policy_name_template: str = "{fqdn}", principal_template: str = "",
+                principal_type: str = "role", target_set_scope: str = "server") -> Inputs:
+    """Load and validate the CSVs. Only servers.csv is required; domains, strong_accounts and groups (directory pins
+    for group principals) are optional.
 
     strong_account_template: used when an rdp row leaves strong_account blank and its domain is not in domains.csv.
     A plain string (e.g. "ADM-{hostname}") means "look the rendered name up in SIA as an existing strong account";
@@ -771,26 +810,28 @@ def load_inputs(input_dir: str | Path, *, strong_account_template: str | StrongA
         raise InputError(f"{input_dir / 'servers.csv'}: file not found")
     ctx = _parse_context(input_dir, problems, strong_account_template=strong_account_template,
                          ssh_username_default=ssh_username_default, policy_name_template=policy_name_template,
-                         group_template=group_template, target_set_scope=target_set_scope)
+                         principal_template=principal_template, principal_type=principal_type,
+                         target_set_scope=target_set_scope)
     servers, templated = _parse_servers(input_dir / "servers.csv", problems, warnings, ctx)
     return _finish(servers, templated, ctx, input_dir, problems, warnings, "servers.csv")
 
 
 def inline_inputs(input_dir: str | Path, servers: list[dict[str, str]], *,
                   strong_account_template: str | StrongAccountTemplate = "", ssh_username_default: str = "",
-                  policy_name_template: str = "{fqdn}", group_template: str = "",
-                  target_set_scope: str = "server") -> Inputs:
+                  policy_name_template: str = "{fqdn}", principal_template: str = "",
+                  principal_type: str = "role", target_set_scope: str = "server") -> Inputs:
     """Servers given on the command line (--server) instead of servers.csv, validated by the same code path.
 
-    domains.csv, strong_accounts.csv and groups.csv are still read from `input_dir` when present, so a single-server
-    run from Ansible resolves its group and strong account exactly as a bulk run would.
+    domains.csv and strong_accounts.csv are still read from `input_dir` when present; groups.csv is read in group
+    mode. A single-server run from Ansible therefore resolves its principal and strong account like a bulk run.
     """
     input_dir = Path(input_dir)
     problems: list[str] = []
     warnings: list[str] = []
     ctx = _parse_context(input_dir, problems, strong_account_template=strong_account_template,
                          ssh_username_default=ssh_username_default, policy_name_template=policy_name_template,
-                         group_template=group_template, target_set_scope=target_set_scope)
+                         principal_template=principal_template, principal_type=principal_type,
+                         target_set_scope=target_set_scope)
     rows: list[ServerRow] = []
     templated: dict[str, StrongAccountRow] = {}
     policy_names: dict[str, tuple[str, int]] = {}

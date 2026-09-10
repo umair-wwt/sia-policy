@@ -92,7 +92,7 @@ HELP_CATALOGUE: dict[str, dict[str, Any]] = {
         "summary": "An input CSV or command value is invalid.",
         "actions": ("Correct every file and line listed in the error.",
                     "Run `sia doctor` to validate the inputs before planning."),
-        "keywords": ("input", "csv", "server", "group", "account"),
+        "keywords": ("input", "csv", "server", "principal", "role", "group", "account"),
     },
     "SIA-FILE-NOT-FOUND": {
         "summary": "A required local file could not be found.",
@@ -215,9 +215,10 @@ HELP_CATALOGUE: dict[str, dict[str, Any]] = {
     },
     "SIA-AMBIGUOUS": {
         "summary": "More than one object or conflicting definition matches the requested name.",
-        "actions": ("Resolve the conflicting names or mappings; pin an Identity directory in groups.csv when needed.",
+        "actions": ("Resolve the conflicting names or mappings; pin an Identity directory in groups.csv "
+                    "(group principals only).",
                     "Run plan again before applying changes."),
-        "keywords": ("ambiguous", "duplicate", "name", "directory"),
+        "keywords": ("ambiguous", "duplicate", "name", "directory", "role"),
     },
     "SIA-API": {
         "summary": "The remote API rejected the request.",

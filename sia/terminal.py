@@ -133,7 +133,7 @@ def applicability(section: str, key: str, raw: dict) -> str:
         return f"Controlled by template policy {template!r} when present; CSV group/SSH overrides still apply. Tenant template values are not read in this screen."
     if section == "defaults" and key == "policy_status":
         return "New policies only. Existing status changes require the explicit Activate/Suspend run option."
-    if section == "defaults" and key in ("assign_local_groups", "group_template", "ssh_username"):
+    if section == "defaults" and key in ("assign_local_groups", "principal_template", "ssh_username"):
         return "Used when the CSV row does not supply an override."
     if section == "http" or section == "auth":
         return "Used on the next command."
@@ -561,7 +561,7 @@ SETTING_GROUPS = {
     "tenant": ("Tenant connection", ("tenant",), ()),
     "access": ("Access and sessions", (), ("time_zone", "days_of_week", "from_hour", "to_hour", "max_session_hours", "idle_minutes", "assign_local_groups", "enable_reconnect", "policy_status")),
     "accounts": ("Server accounts", (), ("strong_account_template", "strong_account_type", "strong_account_safe_template", "strong_account_account_name_template", "strong_account_username_template", "strong_account_domain", "target_set_scope", "target_set_cert_validation")),
-    "policies": ("Policy names and groups", (), ("policy_name_template", "description_template", "policy_tags", "owner_tag", "template_policy", "group_template", "provision_format", "ssh_username")),
+    "policies": ("Policy names and principals", (), ("policy_name_template", "description_template", "policy_tags", "owner_tag", "template_policy", "principal_type", "principal_template", "provision_format", "ssh_username")),
     "network": ("Network and certificates", ("http",), ()),
     "sign-in": ("Authentication options", ("auth",), ()),
     "connect": ("Connection exports", ("connect",), ()),
@@ -1045,7 +1045,7 @@ def _workflow_steps(command: str, args, answers: dict[str, Any]) -> list[dict[st
     if answers.get("source") == "2":
         steps.extend([
             {"key": "server", "label": "Server FQDN", "kind": "fqdn"},
-            {"key": "group", "label": "Identity group (empty uses naming convention)", "kind": "text"},
+            {"key": "principal", "label": "Identity role or group that may connect (empty uses naming convention)", "kind": "text"},
             {"key": "ssh", "label": "Is this an SSH/Linux server?", "default": False, "kind": "bool"},
         ])
         if answers.get("ssh") is True:
@@ -1137,8 +1137,8 @@ def _workflow_argv(command: str, answers: dict[str, Any]) -> list[str]:
     argv = [command]
     if answers.get("source") == "2":
         argv += ["--server", answers["server"]]
-        if answers.get("group"):
-            argv += ["--group", answers["group"]]
+        if answers.get("principal"):
+            argv += ["--principal", answers["principal"]]
         if answers.get("ssh"):
             argv += ["--protocol", "ssh", "--ssh-username", answers["ssh_username"]]
         elif answers.get("workgroup"):

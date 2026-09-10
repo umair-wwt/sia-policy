@@ -19,7 +19,9 @@ from typing import Any
 from .inputs import ServerRow, StrongAccountRow
 
 DEFAULT_NAME = ".sia-checkpoint.jsonl"
-CHECKPOINT_VERSION = 2
+# Version 3 requires the stronger principal and post-write verification rules.
+# Older completion records remain on disk but must be reconciled again.
+CHECKPOINT_VERSION = 3
 STAGE_NAMES = frozenset({"secret", "target_set", "policy"})
 DONE_STATUSES = frozenset({"created", "exists", "updated", "n/a"})
 

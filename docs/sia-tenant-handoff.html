@@ -432,7 +432,7 @@
       <div class="rail-title">Sections</div>
       <a href="#s1"><span>01</span><span>Service user</span></a>
       <a href="#s2"><span>02</span><span>Tenant URLs</span></a>
-      <a href="#s3"><span>03</span><span>Identity groups</span></a>
+      <a href="#s3"><span>03</span><span>Identity principals</span></a>
       <a href="#s4"><span>04</span><span>Vault accounts</span></a>
       <a href="#s5"><span>05</span><span>PAM integration</span></a>
       <a href="#s6"><span>06</span><span>Reference policy</span></a>
@@ -483,13 +483,13 @@
                 <td><code>SIA_CLIENT_SECRET</code></td>
               </tr>
               <tr>
-                <td>Identity group names</td>
-                <td>Exact <code>SystemName</code> of each group that may connect</td>
-                <td><code>servers.csv</code> · <code>group</code></td>
+                <td>Identity role names</td>
+                <td>Exact <code>Name</code> of each role that may connect (groups only with <code>principal_type = "group"</code>)</td>
+                <td><code>servers.csv</code> · <code>principal</code></td>
               </tr>
               <tr>
                 <td>Directory per group</td>
-                <td>Only where one name exists in two directories</td>
+                <td>Group principals only, where one name exists in two directories</td>
                 <td><code>groups.csv</code> · <code>directory</code></td>
               </tr>
               <tr>
@@ -551,7 +551,8 @@
           <span class="tick">1.3</span>
           <div class="item-body">
             <p class="lede">Add to the Secure Infrastructure Access administrator role</p>
-            <p class="note">Internally named <code>DpaAdmin</code>. Grants the strong-account, target-set and
+            <p class="note">Internally named <code>DpaAdmin</code> — the SIA administrator role, not one of the Identity
+            roles a policy grants access to. Grants the strong-account, target-set and
             policy permissions below. Without it, authentication succeeds but every read returns HTTP 403.</p>
           </div>
         </div>
@@ -560,7 +561,7 @@
           <span class="tick">1.4</span>
           <div class="item-body">
             <p class="lede">Confirm the user can query directories</p>
-            <p class="note">Group-to-principal resolution calls
+            <p class="note">Principal resolution (role or group name to id) calls
             <code class="path">GET Core/GetDirectoryServices</code> and
             <code class="path">POST UserMgmt/DirectoryServiceQuery</code> on the Identity tenant. This is a
             separate permission from the SIA role and is the most common 403 in practice.</p>
@@ -615,37 +616,41 @@
       <section id="s3">
         <div class="sec-head">
           <span class="sec-num">03</span>
-          <h2>Identity groups</h2>
+          <h2>Identity principals</h2>
           <p class="sec-owner">Owner: Identity administrator</p>
-          <p class="sec-intro">Each generated policy grants access to one Identity group. The groups must exist
-          first — the tool looks them up by name and fails the row if the name does not resolve to exactly one group.</p>
+          <p class="sec-intro">Each generated policy grants access to one Identity <strong>role</strong> (the default) — or
+          to an Identity group when <code>principal_type = "group"</code> is set. The roles must exist first, with their
+          members assigned under Identity › Roles; the tool looks them up by name and fails the row if the name does
+          not resolve to exactly one role.</p>
         </div>
 
         <div class="item">
           <span class="tick">3.1</span>
           <div class="item-body">
-            <p class="lede">Create or confirm each group, and send the exact names</p>
-            <p class="note">Matching is on <code>SystemName</code> or <code>DisplayName</code>, so a near-miss
+            <p class="lede">Create or confirm each role, and send the exact names</p>
+            <p class="note">Matching is on the role <code>Name</code> (for groups: <code>SystemName</code> or
+            <code>DisplayName</code>), so a near-miss
             like <code>SIA_Web_Admins</code> versus <code>SIA-Web-Admins</code> fails. Exact spelling matters more
             than anything else on this page.</p>
           </div>
-          <span class="dest">group</span>
+          <span class="dest">principal</span>
         </div>
 
         <div class="item">
           <span class="tick">3.2</span>
           <div class="item-body">
-            <p class="lede">Flag any name that exists in more than one directory</p>
-            <p class="note">If the same group name lives in both Cloud Directory and AD, the lookup is ambiguous
+            <p class="lede">Groups only: flag any name that exists in more than one directory</p>
+            <p class="note">Roles are unique in the tenant. With <code>principal_type = "group"</code>, if the same group
+            name lives in both Cloud Directory and AD, the lookup is ambiguous
             and the row fails. Tell us the directory to pin for those names — everything else is found by name alone.</p>
           </div>
           <span class="dest">groups.csv</span>
         </div>
 
         <div class="aside">
-          <p>Each group must resolve to a row carrying <code>InternalName</code>,
-          <code>DirectoryServiceUuid</code> and <code>ServiceInstanceLocalized</code> — these become the policy's
-          principal. A group that exists but returns an incomplete row cannot be used.</p>
+          <p>Each role must resolve to a row carrying <code>_ID</code> and <code>Name</code>; each group to a row carrying
+          <code>InternalName</code>, <code>DirectoryServiceUuid</code> and <code>ServiceInstanceLocalized</code> — these
+          become the policy's principal. A role or group that exists but returns an incomplete row cannot be used.</p>
         </div>
       </section>
 
@@ -770,7 +775,8 @@
             <p class="note">We run <code>show-policy</code> against it and check three things: how
             <code>targets.fqdnRules</code> encodes the server (we expect operator <code>EXACTLY</code>, the full
             FQDN in <code>computernamePattern</code>, the DNS domain in <code>domain</code>), what
-            <code>sourceDirectoryId</code> and <code>sourceDirectoryName</code> your principals carry, and which
+            <code>sourceDirectoryId</code> and <code>sourceDirectoryName</code> your principals carry (optional for
+            ROLE principals), and which
             fields the list endpoint returns.</p>
           </div>
         </div>
@@ -909,7 +915,7 @@
           <span class="q-mark">Q3</span>
           <div>
             <p class="lede">What does a user see when two policies match the same user and server?</p>
-            <p>Servers with a second group get a second policy. We want to confirm the portal behaviour before
+            <p>Servers with a second principal get a second policy. We want to confirm the portal behaviour before
             that pattern is used at scale.</p>
           </div>
         </div>

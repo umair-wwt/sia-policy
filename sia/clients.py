@@ -558,7 +558,7 @@ class UAPClient:
 
 
 class IdentityClient:
-    """CyberArk Identity directory lookups used to build policy principals."""
+    """CyberArk Identity directory lookups used to build policy principals (Identity roles or groups)."""
 
     def __init__(self, http: HttpClient, identity_url: str):
         self._http = http
@@ -610,9 +610,40 @@ class IdentityClient:
     def query_groups(self, search: str, directory_uuids: list[str], *,
                      max_pages: int = MAX_LIST_PAGES) -> list[dict[str, Any]]:
         """Rows have InternalName (id), SystemName, DisplayName, DirectoryServiceUuid, ServiceInstanceLocalized, ServiceType."""
+        group_filter = {"_or": [{"DisplayName": {"_like": search}}, {"SystemName": {"_like": search}}]}
+        return self._directory_query(
+            directory_uuids, filter_key="group", filter_value=group_filter, containers=("Group",),
+            label="Identity group",
+            validate_row=lambda row: None if _nonempty(row, "SystemName", "DisplayName") else "needs a group name",
+            identity_of=lambda row: (f"{row.get('InternalName')}\0"
+                                     f"{row.get('DirectoryServiceUuid') or row.get('directoryServiceUuid') or ''}")
+            if row.get("InternalName") else "",
+            max_pages=max_pages,
+        )
+
+    def query_roles(self, search: str, directory_uuids: list[str], *,
+                    max_pages: int = MAX_LIST_PAGES) -> list[dict[str, Any]]:
+        """Rows have _ID (the role id), Name, Description, IsHidden, AdministrativeRights.
+
+        Roles are tenant-scoped objects of the CyberArk Cloud Directory; the filter is the one CyberArk's SDK sends
+        for its role search (case-insensitive substring on Name). The response container is documented as ``Roles``
+        and read by the SDK as ``roles``, so both spellings are accepted.
+        """
+        role_filter = {"Name": {"_like": {"value": search, "ignoreCase": True}}}
+        return self._directory_query(
+            directory_uuids, filter_key="roles", filter_value=role_filter, containers=("roles", "Roles"),
+            label="Identity role",
+            validate_row=lambda row: None if _nonempty(row, "Name") else "needs a role name",
+            identity_of=lambda row: str(row.get("_ID") or ""),
+            max_pages=max_pages,
+        )
+
+    def _directory_query(self, directory_uuids: list[str], *, filter_key: str, filter_value: dict[str, Any],
+                         containers: tuple[str, ...], label: str, validate_row: Any, identity_of: Any,
+                         max_pages: int) -> list[dict[str, Any]]:
+        """One DirectoryServiceQuery walk (page-number based, 200 rows a page) for the object type `filter_key` selects."""
         if max_pages < 1:
             raise ValueError("max_pages must be at least 1")
-        group_filter = {"_or": [{"DisplayName": {"_like": search}}, {"SystemName": {"_like": search}}]}
         rows: list[dict[str, Any]] = []
         seen_pages: set[str] = set()
         page_size = 200
@@ -620,30 +651,20 @@ class IdentityClient:
         for page_number in range(1, max_pages + 1):
             payload = {
                 "directoryServices": directory_uuids,
-                "group": json.dumps(group_filter),
+                filter_key: json.dumps(filter_value),
                 "Args": {"PageNumber": page_number, "PageSize": page_size, "Limit": page_size, "SortBy": "",
                          "Caching": -1, "Direction": "", "Ascending": True},
             }
             response, result = self._identity_result("POST", "UserMgmt/DirectoryServiceQuery", json=payload)
-            group = result.get("Group")
-            if not isinstance(group, dict):
-                raise _malformed(response, "Identity group query Result must contain a Group object")
-            page = self._rows(
-                response,
-                group,
-                "Identity group list",
-                lambda row: None if _nonempty(row, "SystemName", "DisplayName") else "needs a group name",
-            )
+            container = next((result[key] for key in containers if isinstance(result.get(key), dict)), None)
+            if container is None:
+                raise _malformed(response, f"{label} query Result must contain a {containers[0]} object")
+            page = self._rows(response, container, f"{label} list", validate_row)
             signature = _page_signature(page)
             if len(page) == page_size and signature in seen_pages:
-                raise _pagination_error("POST", url, "Identity group pagination repeated a page")
+                raise _pagination_error("POST", url, f"{label} pagination repeated a page")
             rows.extend(page)
             if len(page) < page_size:
-                return _dedupe_by(
-                    rows,
-                    lambda row: (f"{row.get('InternalName')}\0"
-                                 f"{row.get('DirectoryServiceUuid') or row.get('directoryServiceUuid') or ''}")
-                    if row.get("InternalName") else "",
-                )
+                return _dedupe_by(rows, identity_of)
             seen_pages.add(signature)
-        raise _pagination_error("POST", url, f"Identity group pagination exceeded the {max_pages}-page safety limit")
+        raise _pagination_error("POST", url, f"{label} pagination exceeded the {max_pages}-page safety limit")

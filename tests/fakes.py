@@ -14,20 +14,31 @@ AD_UUID = "5F8C4E2A-0000-4000-8000-000000000AD1"
 _TAG_FILTER = re.compile(r"policyTags eq '([^']+)'")
 
 
+SAMPLE_NAMES = ("SIA-Web-Admins", "SIA-Platform-Ops", "SIA-DMZ-Admins", "SIA-Linux-Admins")
+
+
 def group_row(name: str, uuid: str = CDS_UUID, localized: str = "CyberArk Cloud Directory", internal: str | None = None,
               service_type: str = "CDS") -> dict[str, Any]:
     return {"InternalName": internal or f"id-{name}-{uuid[:4]}", "SystemName": name, "DisplayName": name.replace("-", " "),
             "DirectoryServiceUuid": uuid, "ServiceInstanceLocalized": localized, "ServiceType": service_type}
 
 
+def role_row(name: str, role_id: str | None = None, description: str | None = None) -> dict[str, Any]:
+    """A DirectoryServiceQuery role Row: _ID, Name, Description, IsHidden, AdministrativeRights (no directory fields)."""
+    return {"_ID": role_id or f"role-{name}", "Name": name, "Description": description or f"{name} role",
+            "IsHidden": False, "AdministrativeRights": []}
+
+
 class FakeIdentity:
-    def __init__(self, groups: list[dict[str, Any]] | None = None):
+    def __init__(self, groups: list[dict[str, Any]] | None = None, roles: list[dict[str, Any]] | None = None):
         self.directories = [
             {"Service": "CDS", "directoryServiceUuid": CDS_UUID, "DisplayName": "CyberArk Cloud Directory"},
             {"Service": "AdProxy", "directoryServiceUuid": AD_UUID, "DisplayName": "corp.example.com"},
         ]
-        self.groups = groups if groups is not None else [group_row("SIA-Web-Admins"), group_row("SIA-Platform-Ops"), group_row("SIA-DMZ-Admins"), group_row("SIA-Linux-Admins")]
-        self.queries: list[str] = []
+        self.groups = groups if groups is not None else [group_row(name) for name in SAMPLE_NAMES]
+        self.roles = roles if roles is not None else [role_row(name) for name in SAMPLE_NAMES]
+        self.queries: list[str] = []                      # every search, either kind (the resolver caches by name)
+        self.role_directories: list[list[str]] = []       # uuids handed to query_roles: the resolver passes CDS only
 
     def list_directories(self):
         return list(self.directories)
@@ -36,6 +47,12 @@ class FakeIdentity:
         self.queries.append(search)
         needle = search.lower()
         return [g for g in self.groups if needle in g["SystemName"].lower() or needle in g["DisplayName"].lower()]
+
+    def query_roles(self, search: str, directory_uuids: list[str]):
+        self.queries.append(search)
+        self.role_directories.append(list(directory_uuids))
+        needle = search.lower()
+        return [r for r in self.roles if needle in r["Name"].lower()]
 
 
 class FakeSIA:

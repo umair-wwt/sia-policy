@@ -1,5 +1,6 @@
 import csv
 import json
+import logging
 from pathlib import Path
 
 import pytest
@@ -9,7 +10,7 @@ from sia.config import load_config
 from sia.http import SIAApiError
 from sia.inputs import StrongAccountRow
 from sia.redact import register_secret
-from tests.fakes import FakeIdentity, FakePVWA, FakeSIA, FakeUAP, group_row
+from tests.fakes import FakeIdentity, FakePVWA, FakeSIA, FakeUAP, group_row, role_row
 
 ROOT = Path(__file__).resolve().parents[1]
 POLICY_NAMES = ["web01.corp.example.com", "web01.corp.example.com-ops", "web02.corp.example.com", "SIA-RDP-dmz-app01-custom",
@@ -199,7 +200,7 @@ def test_missing_config_is_usage_error(tmp_path, capsys):
 def test_bad_input_is_usage_error(workspace, capsys, tmp_path):
     bad = tmp_path / "bad"
     bad.mkdir()
-    (bad / "servers.csv").write_text("fqdn,strong_account,group\nnot-an-fqdn,SA,G\n", encoding="utf-8")
+    (bad / "servers.csv").write_text("fqdn,strong_account,principal\nnot-an-fqdn,SA,G\n", encoding="utf-8")
     (bad / "strong_accounts.csv").write_text("name,type\nSA,existing\n", encoding="utf-8")
     code = run(workspace, "plan", "--input", str(bad))
     assert code == 2 and "not a valid FQDN" in capsys.readouterr().err
@@ -367,12 +368,12 @@ def _domain_workspace(workspace):
     """A tenant + input directory shaped like the client's: group and strong account derived per domain."""
     cfg = workspace / "config.toml"
     cfg.write_text(cfg.read_text()
-                   .replace('group_template = ""', 'group_template = "SIA-{hostname_upper}-RDP"')
+                   .replace('principal_template = ""', 'principal_template = "SIA-{hostname_upper}-RDP"')
                    .replace('target_set_scope = "server"', 'target_set_scope = "auto"'), encoding="utf-8")
     inp = workspace / "input"
     inp.mkdir()
     (inp / "servers.csv").write_text("fqdn\n", encoding="utf-8")
-    (inp / "domains.csv").write_text("domain,strong_account,target_set,target_set_type,group_template\n"
+    (inp / "domains.csv").write_text("domain,strong_account,target_set,target_set_type,principal_template\n"
                                      "corp.example.com,SA-CORP-SIA,,Domain,\n", encoding="utf-8")
     return inp
 
@@ -381,7 +382,7 @@ def test_apply_single_server_json(workspace, monkeypatch, capsys):
     """The Ansible path: one server, no servers.csv row, machine-readable result on stdout."""
     inp = _domain_workspace(workspace)
     sia = FakeSIA([{"secret_id": "sec-corp", "secret_name": "SA-CORP-SIA", "secret_type": "PCloudAccount"}])
-    shared_context(monkeypatch, sia=sia, identity=FakeIdentity([group_row("SIA-WEB09-RDP")]))
+    shared_context(monkeypatch, sia=sia, identity=FakeIdentity(roles=[role_row("SIA-WEB09-RDP")]))
     code = run(workspace, "apply", "--input", str(inp), "--server", "web09.corp.example.com", "--yes", "--json",
                "--no-report", "--checkpoint", str(workspace / "ckpt.jsonl"))
     out = capsys.readouterr()
@@ -397,11 +398,11 @@ def test_apply_single_server_json(workspace, monkeypatch, capsys):
     assert not (workspace / "reports").exists()      # --no-report
 
 
-def test_single_server_group_override_and_bad_fqdn(workspace, monkeypatch, capsys):
+def test_single_server_principal_override_and_bad_fqdn(workspace, monkeypatch, capsys):
     inp = _domain_workspace(workspace)
     sia = FakeSIA([{"secret_id": "sec-corp", "secret_name": "SA-CORP-SIA", "secret_type": "PCloudAccount"}])
-    shared_context(monkeypatch, sia=sia, identity=FakeIdentity([group_row("Typed-In")]))
-    assert run(workspace, "plan", "--input", str(inp), "--server", "web09.corp.example.com", "--group", "Typed-In") == 0
+    shared_context(monkeypatch, sia=sia, identity=FakeIdentity(roles=[role_row("Typed-In")]))
+    assert run(workspace, "plan", "--input", str(inp), "--server", "web09.corp.example.com", "--principal", "Typed-In") == 0
     out = capsys.readouterr().out
     assert "Typed-In" in out and "shared by every server in corp.example.com" in out
     assert run(workspace, "plan", "--input", str(inp), "--server", "not-an-fqdn") == 2
@@ -423,7 +424,7 @@ def test_apply_json_stdout_stays_parseable_without_yes(workspace, monkeypatch, c
     """The confirmation prompt must not land on stdout: --json promises a parseable document there."""
     inp = _domain_workspace(workspace)
     sia = FakeSIA([{"secret_id": "sec-corp", "secret_name": "SA-CORP-SIA", "secret_type": "PCloudAccount"}])
-    shared_context(monkeypatch, sia=sia, identity=FakeIdentity([group_row("SIA-WEB09-RDP")]))
+    shared_context(monkeypatch, sia=sia, identity=FakeIdentity(roles=[role_row("SIA-WEB09-RDP")]))
     monkeypatch.setattr("builtins.input", lambda prompt="": "no")
     code = run(workspace, "apply", "--input", str(inp), "--server", "web09.corp.example.com", "--json", "--no-report")
     out = capsys.readouterr()
@@ -434,9 +435,48 @@ def test_apply_json_stdout_stays_parseable_without_yes(workspace, monkeypatch, c
 
 
 def test_server_only_flags_without_server_are_rejected(workspace, monkeypatch, capsys):
-    """--group without --server used to be a silent no-op on a command that writes."""
+    """--principal without --server used to be a silent no-op on a command that writes."""
     inp = _domain_workspace(workspace)
     (inp / "servers.csv").write_text("fqdn\nweb01.corp.example.com\n", encoding="utf-8")
     shared_context(monkeypatch)
-    assert run(workspace, "apply", "--input", str(inp), "--group", "SIA-Emergency-Access", "--yes") == 2
-    assert "--group only apply together with --server" in capsys.readouterr().err
+    assert run(workspace, "apply", "--input", str(inp), "--principal", "SIA-Emergency-Access", "--yes") == 2
+    assert "--principal only apply together with --server" in capsys.readouterr().err
+
+
+def test_legacy_group_flag_and_key_are_rejected_with_rename_hints(workspace, monkeypatch, capsys):
+    inp = _domain_workspace(workspace)
+    shared_context(monkeypatch)
+    assert run(workspace, "plan", "--input", str(inp), "--server", "web09.corp.example.com", "--group", "Typed-In") == 2
+    err = capsys.readouterr().err
+    assert "--group was renamed to --principal" in err and 'principal_type = "group"' in err
+    cfg = workspace / "config.toml"
+    cfg.write_text(cfg.read_text().replace('principal_template = "SIA-{hostname_upper}-RDP"',
+                                           'group_template = "SIA-{hostname_upper}-RDP"'), encoding="utf-8")
+    assert run(workspace, "plan", "--input", str(inp), "--server", "web09.corp.example.com") == 2
+    err = capsys.readouterr().err
+    assert "unknown key(s): group_template" in err and "'group_template' was renamed to 'principal_template'" in err
+
+
+def test_group_principals_still_work_when_configured(workspace, monkeypatch, capsys):
+    inp = _domain_workspace(workspace)
+    cfg = workspace / "config.toml"
+    cfg.write_text(cfg.read_text().replace('principal_type = "role"', 'principal_type = "group"'), encoding="utf-8")
+    sia = FakeSIA([{"secret_id": "sec-corp", "secret_name": "SA-CORP-SIA", "secret_type": "PCloudAccount"}])
+    uap = FakeUAP()
+    shared_context(monkeypatch, sia=sia, uap=uap, identity=FakeIdentity(groups=[group_row("Typed-In")], roles=[]))
+    assert run(workspace, "apply", "--input", str(inp), "--server", "web09.corp.example.com", "--principal", "Typed-In",
+               "--yes", "--no-report", "--checkpoint", str(workspace / "ckpt.jsonl")) == 0
+    principal = uap.policies[0]["principals"][0]
+    assert principal["type"] == "GROUP" and principal["id"].startswith("id-Typed-In")
+    assert "Typed-In" in capsys.readouterr().out
+
+
+def test_groups_csv_with_role_principals_warns(workspace, monkeypatch, capsys, caplog):
+    inp = _domain_workspace(workspace)
+    (inp / "groups.csv").write_text("name,directory\nSIA-WEB09-RDP,CyberArk Cloud Directory\n", encoding="utf-8")
+    sia = FakeSIA([{"secret_id": "sec-corp", "secret_name": "SA-CORP-SIA", "secret_type": "PCloudAccount"}])
+    shared_context(monkeypatch, sia=sia, identity=FakeIdentity(roles=[role_row("SIA-WEB09-RDP")]))
+    caplog.set_level(logging.WARNING, logger="sia")
+    assert run(workspace, "plan", "--input", str(inp), "--server", "web09.corp.example.com") == 0
+    captured = capsys.readouterr()
+    assert 'groups.csv is only used when [defaults] principal_type = "group"' in caplog.text + captured.err

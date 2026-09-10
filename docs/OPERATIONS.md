@@ -37,7 +37,7 @@ to the service-user field without storing an incomplete credential pair.
 Known home commands are kept in memory for that session only. Setting values, credential values and arbitrary
 command arguments are not saved in command history. Completion falls back to plain prompts in basic terminals
 (`TERM=dumb`); `NO_COLOR` turns off colors while preserving completion. Explicit command arguments such as
-`/plan --server web01.example.com --group Admins --drift` use the same parser as the standalone CLI.
+`/plan --server web01.example.com --principal Admins --drift` use the same parser as the standalone CLI.
 
 ## Contents
 
@@ -81,6 +81,9 @@ Interrupted or failed runs retain completed object references and distinguish un
 unknown outcomes. Their JSON includes `complete: false`; interruption also sets `interrupted: true`.
 Exit codes: `0` all fine, `1` something needs attention, `2` a file or setting is wrong, `130` interrupted.
 Checkpoints contain only fully completed rows; reports can also show partial rows and uncertain writes.
+Policy creates/updates and target-set updates must read back the intended fields before they count as complete.
+An `Active` policy alone does not confirm that its requested role or group was saved. Reads retry within
+`[http] status_polls`; persistent differences remain `unverified` and are not recorded as completed checkpoints.
 
 ## 2. How a user connects
 
@@ -89,12 +92,12 @@ The tool is not in this path; it only sets up the objects the path relies on.
 ```mermaid
 sequenceDiagram
     autonumber
-    participant U as User (member of SIA-Web-Admins)
+    participant U as User (member of role SIA-Web-Admins)
     participant SIA as SIA (portal / RDP gateway)
     participant C as SIA connector
     participant W as web01.corp.example.com
     U->>SIA: Access › Infrastructure › search "web01" › Connect › RDP (or an RDP client via the gateway)
-    SIA->>SIA: find a policy where the user's group, the FQDN and the time all match
+    SIA->>SIA: find a policy where the user's role (or group), the FQDN and the time all match
     SIA->>SIA: find the target set named web01.corp.example.com → its strong account
     SIA->>C: provision with that strong account (password from the Vault)
     C->>W: WinRM: create a temporary local user, add it to Administrators
@@ -139,10 +142,12 @@ SIA tenants can encode a few details differently, so check the tool's assumption
 2. In the portal, create **one** ZSP policy for **one** server by hand, the way you want the generated ones to look.
 3. Run `python sia_onboard.py show-policy "<its name>"` and `show-policy "<its name>" --from-list`. In the first
    JSON, `targets.fqdnRules` should be `{"operator": "EXACTLY", "computernamePattern": "<fqdn>", "domain": "<dns domain>"}`
-   and the principal's `sourceDirectoryName` / `sourceDirectoryId` should match a directory `preflight` listed.
+   and the principal's `type` should be `ROLE` (`GROUP` when `principal_type = "group"`). For a group principal its
+   `sourceDirectoryName` / `sourceDirectoryId` should match a directory `preflight` listed; for a role those two
+   fields are optional and the tool tolerates either answer.
    The second output shows what the list endpoint returns (a partial object); whether it carries `principals`
    decides how cheap re-runs are (section 6). Send both to the maintainer if anything looks different.
-4. `plan` and `apply` with a one-server CSV, test the RDP login as a group member (watch the temporary user
+4. `plan` and `apply` with a one-server CSV, test the RDP login as a member of the role (watch the temporary user
    appear in *Computer Management › Users* and disappear after logoff), run `verify`, run `apply` again
    (everything must say `exists`).
 
@@ -166,7 +171,7 @@ Both kinds can sit in the same `servers.csv`; `domain_joined = no` sends a row d
 **Per-domain accounts** — `domains.csv`, one row per AD domain:
 
 ```csv
-domain,strong_account,target_set,target_set_type,group_template,description
+domain,strong_account,target_set,target_set_type,principal_template,description
 corp.example.com,SA-CORP-SIA,,Domain,,
 dmz.example.com,SA-DMZ-SIA,,Domain,SIA-{hostname_upper}-DMZ,
 ```
@@ -219,8 +224,10 @@ reference. The Windows account must already exist on the server.
 sensitive and cannot be delegated*, not in *Protected Users*; local accounts need `LocalAccountTokenFilterPolicy = 1`
 (push it with a GPO). The SIA connector must reach the server over WinRM (TCP 5985/5986).
 
-**Groups in two directories.** If the same group name exists in Cloud Directory and in AD, add it to
-`groups.csv` with its directory (`name,directory`); everything else is found by name.
+**Roles, groups and directories.** Policies name an Identity role by default (`principal_type = "role"`); roles are
+unique in the tenant, so nothing needs pinning. With `principal_type = "group"`, if the same group name exists in
+Cloud Directory and in AD, add it to `groups.csv` with its directory (`name,directory`); everything else is found
+by name.
 
 ## 5. Day-to-day changes
 
@@ -230,19 +237,25 @@ sensitive and cannot be delegated*, not in *Protected Users*; local accounts nee
   once; `plan` says so in the detail line. To take over a hand-built one, `--adopt` accepts the target-set name
   (`--adopt corp.example.com`) — that adopts the set only, never the policies of the servers in it, which are
   still adopted by FQDN or policy name.
-- **A second group on a server.** Add a row with the same `fqdn`, the other `group` and a `policy_suffix`
+- **A second principal on a server.** Add a row with the same `fqdn`, the other `principal` and a `policy_suffix`
   (or a `policy_name`). The strong account and target set are shared; only a policy is added.
 - **Changing a server's strong account.** Edit the row (or the template), `plan` shows `drift` on the target set,
   `apply --update` re-points it.
 - **Someone changed a policy in the portal.** `plan` shows `drift` with what differs. Update your list to match,
   or `apply --update` to put the policy back. `--update` only changes objects carrying the tool's tag
   (`sia-policy-automation`). A full policy/target-set comparison needs `--drift` (implied by `--update`) and covers
-  descriptions, tags, time frame/time zone, principals and directory metadata, entitlement, delegation,
+  descriptions, tags, time frame/time zone, principals (directory metadata for group principals), entitlement, delegation,
   conditions, target rules, and RDP/SSH behavior including local groups and reconnect. Target-set account, type,
   description, certificate-validation and provisioning-format changes are also detected.
-- **Activating or suspending policies.** `[defaults] policy_status` is a creation default. It does not alter an
-  existing policy. Preview `plan --update --set-policy-status Active|Suspended`, then use the same flags with
-  `apply`. Without that explicit action, ordinary updates preserve the live status.
+- **Migrating from group principals.** After the switch to roles, every managed policy that still names a group
+  shows `drift: principals differ (… (GROUP) -> … (ROLE))`. Create the roles, then `apply --update` swaps the
+  principals; or set `principal_type = "group"` to keep granting access to groups. Old names (`group`,
+  `group_template`, `--group`) are rejected with the new name in the message, and the `connect-info` CSV column
+  `groups` is now `principals`. See the README, "Migrating from group principals".
+- **Activating or suspending policies.** `[defaults] policy_status` is the creation default. Ordinary updates
+  preserve an existing `Active` or `Suspended` status. Preview `plan --update --set-policy-status Active|Suspended`,
+  then use the same flags with `apply` to change it explicitly. A corrective field update from a platform-managed
+  state such as `Error` or `Validating` requests the configured stable status; the plan includes that change.
 - **Taking over a hand-built object.** It shows as `exists (unmanaged)` or `drift … not managed by this tool`.
   `apply --update --adopt web01.corp.example.com` (FQDN or policy name) lets the tool manage it; `--adopt-all`
   adopts everything matching. Adopting adds the tag.
@@ -262,19 +275,20 @@ The programme this tool was built for has ~70,000 servers and up to two policies
 - **Waves.** One `servers.csv` per wave, or slice one big file: `--offset 0 --limit 5000`, then
   `--offset 5000 --limit 5000`, … (rows of one server always travel together). Run `verify` after each wave.
 - **Resume completed work.** `apply` records complete, verified rows in `<input>/.sia-checkpoint.jsonl`
-  (`--checkpoint FILE` to move it). Version 2 fingerprints the tenant identity, effective object settings, template
+  (`--checkpoint FILE` to move it). Version 3 fingerprints the tenant identity, effective object settings, template
   content, account mapping, row input and the `--update`/`--drift` choice the row was checked with. With `--resume`,
   only a complete record whose version and fingerprint still match is skipped without a request. Older, malformed,
   incomplete, uncertain and unverified records, or rows affected by a setting/template/input/option change, are
   reconciled again with an explanatory warning. A checkpoint
-  proves only what an earlier tool run verified; it is not current live-tenant evidence.
+  proves only what an earlier tool run verified; it is not current live-tenant evidence. Version-2 records are
+  preserved but rechecked because they predate verification of saved policy and target-set update fields.
 - **Lookups scale with the wave.** `--lookup search` (default up to 2,000 servers per run) reads the objects of
   the servers in the wave, one request per server in parallel; `--lookup list` (default above that) reads one
   listing each of strong accounts, target sets and the policies tagged by the tool. A tenant with 70,000
   policies is never read to onboard 500 more.
 - **Cheap re-runs.** The policy list carries only part of each policy. Name and principals are compared from
-  the list; a policy is read in full only with `--drift` / `--update`, so a re-run over 10,000 finished rows costs
-  a few hundred requests.
+  the list when present; missing principals require a full read even without `--drift`. `--drift` / `--update`
+  fetches incomplete policy details to compare all managed settings. Missing principal evidence is `unverified`.
 - **Parallel creation.** `--workers 8` (up to 16). The first object of each stage is always created alone; if it is
   rejected nothing fans out. Target sets go in batches of 50.
 - **Rate limits.** With several workers set `[http] max_requests_per_second` (start with 10): all workers share
@@ -324,25 +338,29 @@ do next**. The message distinguishes known causes from suggestions; `-v` adds sa
 | Sign-in keeps failing with a secret you know is correct | A hand-edited `.env` value lost characters. An unquoted value ends at its first ` #` and loses surrounding spaces; `sia doctor` warns when either happened. | Wrap the whole value in single quotes, or re-enter it under Settings > Credentials, which stores it exactly as typed. |
 | `SIA_CLIENT_SECRET is quoted and contains a backslash` from `sia doctor` | Quoted values are taken literally, so a backslash doubled for an SIA release before 2026 is now part of the secret. | Remove the doubling, or re-enter the credential under Settings > Credentials. |
 | `expected KEY=VALUE` on line 1 of `.env`, or `invalid TOML` on line 1 | The file starts with an unexpected byte-order mark. | A UTF-8 mark from Notepad is accepted; the message names the fix for UTF-16, which PowerShell's `>`, `Out-File` and `Set-Content` write unless given `-Encoding utf8`. |
-| `HTTP 403` on `Secrets`, `Targets` or `Policies` in preflight | The service user is not an SIA administrator. | Add it to the `DpaAdmin` role. |
+| `HTTP 403` on `Secrets`, `Targets` or `Policies` in preflight | The service user is not an SIA administrator. | Add it to the `DpaAdmin` SIA administrator role. |
 | `Settings: not verified (HTTP 403 …)` | The user may read SIA objects but not tenant settings. | Optional check; ignore or add the settings role. |
 | `SIA API:  FAILED …` | Neither SIA path family answered. | Run with `-v`, send the log to the maintainer; pin `[http] secrets_api` / `targetsets_api` once known. |
 | `Targets: OK (… per-account listing will be used)` | This tenant lists target sets per strong account only. | Nothing; the tool adapts. |
-| `Identity: FAILED … 401/403` | Identity rejected the token for group lookups. | Switch `[auth] identity_auth` between `platform_token` and `service_user_oidc`, run `preflight` again. |
+| `Identity: FAILED … 401/403` | Identity rejected the token for role/group lookups. | Switch `[auth] identity_auth` between `platform_token` and `service_user_oidc`, run `preflight` again. |
 | `self_hosted_pam=incomplete` / `not configured` | The PAM Self-Hosted integration is missing pieces. | Complete it in SIA settings (PVWA URL, connector pool, service-user secret, tenant type SELF_HOSTED). |
 | `PVWA: FAILED` / `PVWA_USER / PVWA_PASSWORD are not set` | The `vault` stage cannot log on. | Put the PVWA user's credentials in `.env`, or empty `[pvwa] base_url`. |
 | `servers.csv:7: fqdn 'web01' is not a valid FQDN` | Input problem at line 7. | Fix the file; all problems are listed at once. |
 | `policy name '…' collides with line N` | Two rows would create the same policy. | Same server: add `policy_suffix`. Same host name in two domains: use `{fqdn}` in `policy_name_template`. |
 | `strong_account 'X' conflicts with line N for the same fqdn` | Two rows of one server disagree. | Rows of one server must share strong account, domain, protocol and target set. |
 | `strong_account is required — name it in the row, add '…' to domains.csv …` | No strong account, no domain row, no naming template. | Fill the column, add the domain to `domains.csv`, or set the `strong_account_*` settings. |
-| `group is required …, or set [defaults] group_template …` | No group, and nothing to derive one from. | Fill the column, or set `group_template` (in `config.toml` or per domain in `domains.csv`). |
+| `principal is required …, or set [defaults] principal_template …` | No principal, and nothing to derive one from. | Fill the column, or set `principal_template` (in `config.toml` or per domain in `domains.csv`). |
+| `column 'group' was renamed to 'principal'` / `column 'group_template' was renamed to 'principal_template'` | A CSV from before the switch to roles. | Rename the column; set `principal_type = "group"` to keep using Identity groups. |
+| `[defaults] has unknown key(s): group_template ('group_template' was renamed …)` / `--group was renamed to --principal` | `config.toml` or a script from before the switch to roles. | Rename the key or flag; only the name changed. |
+| `groups.csv is only used when [defaults] principal_type = "group"` (warning) | Directory pins mean nothing for roles. | Delete `groups.csv`, or set `principal_type = "group"` if you meant groups. |
 | `target_set_scope = "domain" but domain '…' has no row in domains.csv` | A domain-joined server whose domain you have not listed. | Add the domain, name a `strong_account` on the row, or use `target_set_scope = "auto"`. |
 | `domain '…' shares target set '…' with '…' but names strong account …` | Two domains point one target set at two accounts. | A target set holds one account: give them separate `target_set` names, or the same `strong_account`. |
 | `protocol=ssh needs ssh_username …` | A Linux row has no certificate user name. | Fill `ssh_username` on the row or in `config.toml`. |
 | `strong_account 'SA-x' is not defined in strong_accounts.csv or domains.csv` | The row refers to an unknown account. | Add the row (`type=existing` if it already exists in SIA), or name it on the domain's row in `domains.csv`. |
 | `no strong account named '…' in SIA (type=existing)` | Nothing in SIA has that exact name. | Check the *Strong accounts* page, or set `strong_account_type = "vault"` so the reference is created. |
 | `Vault account '…' is missing and its current password is not available` | Nothing to onboard it with. | Add the account's name and password to the password file, or onboard it in PVWA. |
-| `group 'X' not found in Identity` / `is ambiguous` | Name mismatch / same name in several directories. | Check the exact name (similar names are listed) / add it to `groups.csv` with its directory. |
+| `role 'X' not found in Identity` / `group 'X' not found in Identity` | Name mismatch; similar names are listed. | Check the exact name of the role (Identity › Roles) or group; `principal_type` decides which kind is looked up. |
+| `group 'X' is ambiguous` / `role 'X' is ambiguous` | Same group name in several directories / two roles with one name. | Add the group to `groups.csv` with its directory / rename one of the roles. |
 | `password not available: …` | A `credentials` account needs a password. | Put it in `.env` or the password file, or run `apply` interactively. |
 | target set `failed: bulk create …` | SIA rejected the target set. | Usually the strong account is inactive or the wrong type. |
 | policy `status=Error` | SIA created the policy but flagged it. | Read the detail; compare with a hand-built policy (`show-policy`). |
@@ -403,7 +421,7 @@ programme wants. That is independent of whether the *strong account* is a domain
 create local ephemeral users on every server it administers, which is exactly what `domains.csv` sets up.
 
 **Can it be called from a build job?** Yes — `apply --server <fqdn> --yes --json --no-report` onboards one server
-without a `servers.csv`, reading `domains.csv` for its group and strong account. Exit code `0` success, `1`
+without a `servers.csv`, reading `domains.csv` for its principal and strong account. Exit code `0` success, `1`
 something needs attention, `2` bad input or configuration; valid JSON is written on stdout for success and failure,
 while human messages and the table use stderr.
 
@@ -422,12 +440,12 @@ own `config.toml`, `.env` and password file.
 | Access policy (Access control policies) | one per `servers.csv` row, named after the server, plus `policy_suffix` for a second one | Who / where / how / when |
 | Ephemeral (temporary) local user | `assign_local_groups` / `assign_groups`; `max_session_hours`, `idle_minutes`, `enable_reconnect` | Created and removed by SIA at connection time |
 | SSH certificate access (Linux ZSP) | `protocol = ssh`, `ssh_username` | Policy only |
-| Principal | the `group` column, or `group_template` applied to the server name | Always a group, never a user; resolved to the Identity group automatically |
-| Directory | `groups.csv` `directory` | Only for ambiguous group names |
+| Principal | the `principal` column, or `principal_template` applied to the server name | An Identity role (the default) or, with `principal_type = "group"`, an Identity group — never a user; resolved to its id automatically |
+| Directory | `groups.csv` `directory` | Group principals only, for a group name that exists in two directories |
 | Connector | – | Must reach Windows servers over WinRM |
 | RD Gateway `<subdomain>.rdp.cyberark.cloud` | `connect-info` output | What RDP clients connect through |
 | Vault account (PVWA) | the `vault` stage, `[pvwa]` | Onboarded only when missing |
-| Service user (Identity) | `SIA_CLIENT_ID` / `SIA_CLIENT_SECRET` | Needs the `DpaAdmin` role |
+| Service user (Identity) | `SIA_CLIENT_ID` / `SIA_CLIENT_SECRET` | Needs the `DpaAdmin` SIA administrator role |
 | Tag `sia-policy-automation` | "managed by the tool" | `--update` only touches tagged objects unless you `--adopt` |
 | Checkpoint | `<input>/.sia-checkpoint.jsonl` | Versioned record of locally verified completed rows; matching `--resume` may skip them, but it is not a live receipt |
 

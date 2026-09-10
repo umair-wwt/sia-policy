@@ -22,7 +22,7 @@ from .artifacts import ArtifactWriteError, available_path, write_artifacts
 GATEWAY_USER = "secureaccess@cyberark"
 GATEWAY_TOKEN = "secureaccess"
 PORTAL_PATH = "/dpa"
-CONNECT_COLUMNS = ("fqdn", "hostname", "policy_name", "groups", "protocol", "strong_account", "secret_status",
+CONNECT_COLUMNS = ("fqdn", "hostname", "policy_name", "principals", "protocol", "strong_account", "secret_status",
                    "target_set_status", "policy_status", "policy_id", "portal_url", "gateway_host", "rdp_username", "rdp_file")
 _UNSAFE_FILENAME = re.compile(r"[^A-Za-z0-9._-]+")
 
@@ -32,7 +32,7 @@ class ConnectRow:
     fqdn: str
     hostname: str
     policy_name: str
-    groups: str
+    principals: str
     protocol: str
     strong_account: str
     secret_status: str
@@ -154,7 +154,7 @@ def build_rows(inputs: Inputs, cfg: Config, policy_names: dict[tuple[str, int], 
         if rdp_dir is not None and not server.is_ssh:
             rdp_file = str(rdp_dir / rdp_file_name(server, policy_name, counts[server.fqdn] > 1))
         rows.append(ConnectRow(
-            fqdn=server.fqdn, hostname=server.hostname, policy_name=policy_name, groups=";".join(server.groups),
+            fqdn=server.fqdn, hostname=server.hostname, policy_name=policy_name, principals=";".join(server.principals),
             protocol=server.protocol, strong_account=server.strong_account or "-", secret_status=secret,
             target_set_status=target_set, policy_status=policy, policy_id=policy_id, portal_url=portal,
             gateway_host=gateway, rdp_username=username, rdp_file=rdp_file))

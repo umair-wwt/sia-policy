@@ -1,12 +1,13 @@
-"""Resolve names from the CSVs into tenant identifiers: Identity groups -> UAP principals, strong accounts -> secret ids."""
+"""Resolve names from the CSVs into tenant identifiers: Identity roles or groups -> UAP principals, strong accounts -> secret ids."""
 from __future__ import annotations
 
 import logging
 from typing import Any, Callable
 
 from .clients import IdentityClient
+from .config import PRINCIPAL_TYPES
 from .inputs import StrongAccountRow
-from .payloads import build_principal
+from .payloads import build_group_principal, build_role_principal
 
 
 class ResolveError(Exception):
@@ -22,15 +23,27 @@ def pick(d: dict[str, Any], *keys: str, default: Any = None) -> Any:
 
 
 class PrincipalResolver:
-    """Looks up Identity groups by name and builds UAP principals. Results are cached per run."""
+    """Looks up Identity roles (principal_type = role, the default) or groups by name and builds UAP principals.
+
+    Results are cached per run. Roles are tenant-scoped objects of the CyberArk Cloud Directory (CDS), so they are
+    queried in that directory alone and need no pin; a group name can exist in several directories, which is what
+    `pinned_directory` (groups.csv) disambiguates.
+    """
 
     def __init__(self, identity: IdentityClient, pinned_directory: Callable[[str], str | None] = lambda _: None,
-                 logger: logging.Logger | None = None):
+                 logger: logging.Logger | None = None, *, principal_type: str = "role"):
+        if principal_type not in PRINCIPAL_TYPES:
+            raise ValueError(f"principal_type must be one of {', '.join(PRINCIPAL_TYPES)}")
         self._identity = identity
+        self._type = principal_type
         self._pinned = pinned_directory
         self._log = logger or logging.getLogger("sia.resolve")
         self._directories: list[dict[str, Any]] | None = None
         self._cache: dict[str, dict[str, Any]] = {}
+
+    @property
+    def principal_type(self) -> str:
+        return self._type
 
     @property
     def directories(self) -> list[dict[str, Any]]:
@@ -62,10 +75,52 @@ class PrincipalResolver:
             return True
         return wanted in self._directory_labels(pick(row, "DirectoryServiceUuid"))
 
-    def resolve(self, group_name: str) -> dict[str, Any]:
-        cache_key = group_name.casefold()
+    def _cds_directories(self) -> list[dict[str, Any]]:
+        """Rows whose Service is CDS -- the CyberArk Cloud Directory, where every Identity role lives."""
+        return [d for d in self.directories if str(pick(d, "Service", "service", default="")).casefold() == "cds"]
+
+    def _cds_directory(self) -> dict[str, Any] | None:
+        cds = self._cds_directories()
+        return cds[0] if cds else None
+
+    def _cds_uuids(self) -> list[str]:
+        rows = self._cds_directories() or self.directories   # nothing labelled CDS: query every directory
+        return [u for u in (pick(d, "directoryServiceUuid", "DirectoryServiceUuid") for d in rows) if u]
+
+    def resolve(self, name: str) -> dict[str, Any]:
+        """The UAP principal for a role or group name, looked up once per run (case-insensitively)."""
+        cache_key = name.casefold()
         if cache_key in self._cache:
             return self._cache[cache_key]
+        principal = self._resolve_role(name) if self._type == "role" else self._resolve_group(name)
+        self._cache[cache_key] = principal
+        return principal
+
+    def _resolve_role(self, role_name: str) -> dict[str, Any]:
+        rows = self._identity.query_roles(role_name, self._cds_uuids())
+        wanted = role_name.casefold()
+        # Identity can repeat the same object in search results: collapse those observations by id, so that a real
+        # duplicate name (two roles, two ids) remains an explicit ambiguity.
+        unique: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            if str(pick(row, "Name", default="")).casefold() == wanted:
+                unique.setdefault(str(pick(row, "_ID", default="")).casefold(), row)
+        exact = list(unique.values())
+        if not exact:
+            near = sorted({str(pick(r, "Name")) for r in rows if pick(r, "Name")})
+            hint = f"; similar names: {', '.join(near[:8])}" if near else ""
+            raise ResolveError(f"role {role_name!r} not found in Identity{hint}")
+        if len(exact) > 1:
+            # Never say "not found" here: reconcile._snapshot_principals treats that phrase as a per-row miss and
+            # anything else as a reason to stop before the first write.
+            ids = ", ".join(sorted(str(pick(r, "_ID") or "<no id>") for r in exact))
+            raise ResolveError(f"role {role_name!r} is ambiguous ({len(exact)} matches: {ids})")
+        row = exact[0]
+        if not pick(row, "_ID"):
+            raise ResolveError(f"role {role_name!r}: Identity row lacks _ID; cannot build a principal")
+        return build_role_principal(row, self._cds_directory())
+
+    def _resolve_group(self, group_name: str) -> dict[str, Any]:
         rows = self._identity.query_groups(group_name, self._directory_uuids())
         wanted = group_name.casefold()
         exact = [r for r in rows if wanted in (str(pick(r, "SystemName", default="")).casefold(),
@@ -97,9 +152,7 @@ class PrincipalResolver:
         missing = [k for k in ("InternalName", "DirectoryServiceUuid", "ServiceInstanceLocalized") if not pick(row, k)]
         if missing:
             raise ResolveError(f"group {group_name!r}: Identity row lacks {', '.join(missing)}; cannot build a principal")
-        principal = build_principal(row)
-        self._cache[cache_key] = principal
-        return principal
+        return build_group_principal(row)
 
 
 class SecretIndex:

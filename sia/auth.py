@@ -74,10 +74,11 @@ class _CachingTokenProvider:
         self._clock = clock
         self._token: str | None = None
         self._expires_at: float = 0.0
+        self._refresh_at: float = 0.0
         self._lock = threading.Lock()  # concurrent workers share one provider
 
     def _stale(self) -> bool:
-        return not self._token or self._clock() >= self._expires_at - _REFRESH_MARGIN_SECONDS
+        return not self._token or self._clock() >= self._refresh_at
 
     def __call__(self, force: bool = False) -> str:
         if force or self._stale():
@@ -85,9 +86,13 @@ class _CachingTokenProvider:
                 if force or self._stale():
                     token, expires_at = self._fetch()
                     register_secret(token)
+                    acquired_at = self._clock()
+                    remaining_lifetime = max(0.0, expires_at - acquired_at)
+                    refresh_margin = min(float(_REFRESH_MARGIN_SECONDS), remaining_lifetime / 2)
                     self._token, self._expires_at = token, expires_at
+                    self._refresh_at = expires_at - refresh_margin
                     self._log.info("%s token acquired for %s (valid for ~%d min)", self.name, self._client_id,
-                                   max(0, int((expires_at - self._clock()) / 60)))
+                                   max(0, int(remaining_lifetime / 60)))
                     force = False
         assert self._token is not None
         return self._token

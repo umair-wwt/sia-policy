@@ -5,7 +5,7 @@ import pytest
 from sia.config import Defaults
 from sia.inputs import ServerRow, StrongAccountRow
 from sia.payloads import (
-    build_bulk_target_sets, build_fqdn_rule, build_policy, build_policy_update, build_principal,
+    build_bulk_target_sets, build_fqdn_rule, build_policy, build_policy_update, build_group_principal, build_role_principal,
     build_secret_payload, build_target_set, build_target_set_update, build_vault_account, description_for, exact_fqdns,
     is_owned_policy, is_owned_target_set, names_match, ownership_marker, policy_name_for, policy_signature, policy_status,
     render, sanitize_template, split_fqdn, validate_template,
@@ -18,7 +18,7 @@ NAME = "web01.corp.example.com"
 
 
 def server(**overrides) -> ServerRow:
-    base = dict(fqdn="web01.corp.example.com", strong_account="SA-corp-rdp", groups=("SIA-Web-Admins",),
+    base = dict(fqdn="web01.corp.example.com", strong_account="SA-corp-rdp", principals=("SIA-Web-Admins",),
                 policy_name=None, assign_groups=None, domain=None, description=None, line=2)
     base.update(overrides)
     return ServerRow(**base)
@@ -133,13 +133,13 @@ def test_target_set_payloads_carry_owner_marker():
 
 
 def test_principal_from_identity_row():
-    assert build_principal(GROUP_ROW) == {
+    assert build_group_principal(GROUP_ROW) == {
         "id": "b1f9c0e2-1111-2222-3333-444455556666", "name": "SIA-Web-Admins", "type": "GROUP",
         "sourceDirectoryId": "09B9A9B0-6CE8-465F-AB03-65766D33B05E", "sourceDirectoryName": "CyberArk Cloud Directory"}
 
 
 def test_policy_payload_golden():
-    policy = build_policy(server(), [build_principal(GROUP_ROW)], DEFAULTS)
+    policy = build_policy(server(), [build_group_principal(GROUP_ROW)], DEFAULTS)
     expected = {
         "metadata": {
             "name": NAME,
@@ -150,7 +150,7 @@ def test_policy_payload_golden():
             "timeZone": "America/New_York",
             "status": {"status": "Active"},
         },
-        "principals": [build_principal(GROUP_ROW)],
+        "principals": [build_group_principal(GROUP_ROW)],
         "delegationClassification": "Unrestricted",
         "conditions": {"accessWindow": {"daysOfTheWeek": [0, 1, 2, 3, 4, 5, 6]}, "maxSessionDuration": 2, "idleTime": 10},
         "targets": {"FQDN/IP": {"fqdnRules": [{"operator": "EXACTLY", "computernamePattern": "web01.corp.example.com",
@@ -160,7 +160,7 @@ def test_policy_payload_golden():
     }
     assert policy == expected
     # metadata.status is required by the API (ArkUAPMetadata.status has no default); tenants reject a create without it
-    assert build_policy(server(), [build_principal(GROUP_ROW)],
+    assert build_policy(server(), [build_group_principal(GROUP_ROW)],
                         Defaults(policy_status="Suspended"))["metadata"]["status"] == {"status": "Suspended"}
     assert is_owned_policy(policy, OWNER) and not is_owned_policy({"metadata": {"policyTags": ["automated"]}}, OWNER)
     json.dumps(policy)  # serializable
@@ -170,7 +170,7 @@ def test_policy_overrides_and_hours():
     d = Defaults(from_hour="08:00", to_hour="18:00", days_of_week=(1, 2, 3, 4, 5), max_session_hours=4,
                  idle_minutes=15, enable_reconnect=True, policy_tags=(), owner_tag="team-x")
     s = server(assign_groups=("Remote Desktop Users",), domain="example.com", policy_name="P1", description="D1")
-    policy = build_policy(s, [build_principal(GROUP_ROW)], d)
+    policy = build_policy(s, [build_group_principal(GROUP_ROW)], d)
     assert policy["metadata"]["name"] == "P1" and policy["metadata"]["description"] == "D1"
     assert policy["metadata"]["policyTags"] == ["team-x"] and policy["metadata"]["timeZone"] == "GMT"
     assert policy["conditions"] == {"accessWindow": {"daysOfTheWeek": [1, 2, 3, 4, 5], "fromHour": "08:00", "toHour": "18:00"},
@@ -183,7 +183,7 @@ def test_policy_overrides_and_hours():
 def test_too_many_tags_rejected():
     d = Defaults(policy_tags=tuple(f"t{i}" for i in range(20)))
     with pytest.raises(ValueError, match="maximum is 20"):
-        build_policy(server(), [build_principal(GROUP_ROW)], d)
+        build_policy(server(), [build_group_principal(GROUP_ROW)], d)
 
 
 def test_validate_and_sanitize_template():
@@ -261,16 +261,16 @@ def test_sanitize_template_omits_invalid_optional_shapes_and_keeps_valid_profile
 
 
 def test_policy_from_template_clones_approved_fields_only():
-    policy = build_policy(server(), [build_principal(GROUP_ROW)], DEFAULTS, template=TEMPLATE)
+    policy = build_policy(server(), [build_group_principal(GROUP_ROW)], DEFAULTS, template=TEMPLATE)
     assert policy["conditions"] == sanitize_template(TEMPLATE)["conditions"]
     assert policy["behavior"] == {"connectAs": {"rdp": TEMPLATE["behavior"]["connectAs"]["rdp"]}}  # SSH profile dropped
     assert policy["metadata"]["timeZone"] == "Europe/London" and policy["metadata"]["policyTags"] == ["ref", OWNER]
     assert policy["delegationClassification"] == "Restricted"
     assert policy["metadata"]["name"] == NAME and "policyId" not in policy["metadata"]
     assert policy["metadata"]["status"] == {"status": "Active"}      # the template's status never carries over
-    assert policy["principals"] == [build_principal(GROUP_ROW)]
+    assert policy["principals"] == [build_group_principal(GROUP_ROW)]
     assert policy["targets"]["FQDN/IP"]["fqdnRules"][0]["computernamePattern"] == "web01.corp.example.com"
-    policy2 = build_policy(server(assign_groups=("Users",)), [build_principal(GROUP_ROW)], DEFAULTS, template=TEMPLATE)
+    policy2 = build_policy(server(assign_groups=("Users",)), [build_group_principal(GROUP_ROW)], DEFAULTS, template=TEMPLATE)
     assert policy2["behavior"]["connectAs"]["rdp"]["localEphemeralUser"]["assignGroups"] == ["Users"]
     assert TEMPLATE["behavior"]["connectAs"]["rdp"]["localEphemeralUser"]["assignGroups"] == ["Administrators", "Backup Operators"]
 
@@ -278,7 +278,7 @@ def test_policy_from_template_clones_approved_fields_only():
 def test_policy_from_template_without_tags_or_timezone():
     template = {"metadata": {"name": "Ref"}, "conditions": {"maxSessionDuration": 1},
                 "behavior": {"connectAs": {"rdp": {"domainEphemeralUser": {"assignGroups": [], "assignDomainGroups": ["G"]}}}}}
-    policy = build_policy(server(), [build_principal(GROUP_ROW)], DEFAULTS, template=template)
+    policy = build_policy(server(), [build_group_principal(GROUP_ROW)], DEFAULTS, template=template)
     assert policy["metadata"]["policyTags"] == [OWNER] and policy["metadata"]["timeZone"] == "America/New_York"
     assert policy["delegationClassification"] == "Unrestricted"
     assert policy["behavior"]["connectAs"]["rdp"]["domainEphemeralUser"]["assignDomainGroups"] == ["G"]
@@ -290,7 +290,7 @@ def test_policy_requires_principals():
 
 
 def test_policy_update_signature_status_and_fqdns():
-    desired = build_policy(server(), [build_principal(GROUP_ROW)], DEFAULTS)
+    desired = build_policy(server(), [build_group_principal(GROUP_ROW)], DEFAULTS)
     existing = {**desired, "metadata": {**desired["metadata"], "policyId": "pol-42", "status": {"status": "ACTIVE"}}}
     update = build_policy_update(existing, desired)
     assert update["metadata"]["policyId"] == "pol-42" and update["metadata"]["name"] == NAME
@@ -326,29 +326,29 @@ def test_names_match_html_escaped():
 
 def test_ssh_policy_behavior_and_description():
     lnx = server(fqdn="lnx01.corp.example.com", strong_account=None, protocol="ssh", ssh_username="ec2-user")
-    policy = build_policy(lnx, [build_principal(GROUP_ROW)], DEFAULTS)
+    policy = build_policy(lnx, [build_group_principal(GROUP_ROW)], DEFAULTS)
     assert policy["behavior"] == {"connectAs": {"ssh": {"username": "ec2-user"}}}
     assert policy["metadata"]["description"] == "Automated: SSH ZSP access to lnx01.corp.example.com"
     assert policy["targets"]["FQDN/IP"]["fqdnRules"][0]["computernamePattern"] == "lnx01.corp.example.com"
-    fallback = build_policy(server(protocol="ssh", strong_account=None), [build_principal(GROUP_ROW)], Defaults(ssh_username="root"))
+    fallback = build_policy(server(protocol="ssh", strong_account=None), [build_group_principal(GROUP_ROW)], Defaults(ssh_username="root"))
     assert fallback["behavior"]["connectAs"]["ssh"]["username"] == "root"
     with pytest.raises(ValueError, match="needs ssh_username"):
-        build_policy(server(protocol="ssh", strong_account=None), [build_principal(GROUP_ROW)], DEFAULTS)
+        build_policy(server(protocol="ssh", strong_account=None), [build_group_principal(GROUP_ROW)], DEFAULTS)
 
 
 def test_template_profile_chosen_by_protocol():
-    rdp_policy = build_policy(server(), [build_principal(GROUP_ROW)], DEFAULTS, template=TEMPLATE)
+    rdp_policy = build_policy(server(), [build_group_principal(GROUP_ROW)], DEFAULTS, template=TEMPLATE)
     assert set(rdp_policy["behavior"]["connectAs"]) == {"rdp"}
-    ssh_policy = build_policy(server(protocol="ssh", strong_account=None), [build_principal(GROUP_ROW)], DEFAULTS, template=TEMPLATE)
+    ssh_policy = build_policy(server(protocol="ssh", strong_account=None), [build_group_principal(GROUP_ROW)], DEFAULTS, template=TEMPLATE)
     assert ssh_policy["behavior"] == {"connectAs": {"ssh": {"username": "root"}}}
-    overridden = build_policy(server(protocol="ssh", strong_account=None, ssh_username="ec2-user"), [build_principal(GROUP_ROW)], DEFAULTS, template=TEMPLATE)
+    overridden = build_policy(server(protocol="ssh", strong_account=None, ssh_username="ec2-user"), [build_group_principal(GROUP_ROW)], DEFAULTS, template=TEMPLATE)
     assert overridden["behavior"]["connectAs"]["ssh"]["username"] == "ec2-user"
     rdp_only = {**TEMPLATE, "behavior": {"connectAs": {"rdp": TEMPLATE["behavior"]["connectAs"]["rdp"]}}}
     with pytest.raises(ValueError, match="no SSH profile"):
-        build_policy(server(protocol="ssh", strong_account=None), [build_principal(GROUP_ROW)], DEFAULTS, template=rdp_only)
+        build_policy(server(protocol="ssh", strong_account=None), [build_group_principal(GROUP_ROW)], DEFAULTS, template=rdp_only)
     ssh_only = {**TEMPLATE, "behavior": {"connectAs": {"ssh": {"username": "root"}}}}
     with pytest.raises(ValueError, match="no RDP profile"):
-        build_policy(server(), [build_principal(GROUP_ROW)], DEFAULTS, template=ssh_only)
+        build_policy(server(), [build_group_principal(GROUP_ROW)], DEFAULTS, template=ssh_only)
 
 
 def test_domain_scoped_target_set_payload():
@@ -396,3 +396,32 @@ def test_policy_signature_treats_null_and_empty_echoes_as_unset():
     reconnect = json.loads(json.dumps(echoed))
     reconnect["behavior"]["connectAs"]["rdp"]["localEphemeralUser"]["enableEphemeralUserReconnect"] = False
     assert policy_signature(desired)["behavior"] != policy_signature(reconnect)["behavior"]
+
+
+ROLE_ROW = {"_ID": "c7d2e1f0-5555-6666-7777-888899990000", "Name": "SIA-Web-Admins", "Description": "Web administrators",
+            "IsHidden": False, "AdministrativeRights": []}
+CDS_DIRECTORY = {"Service": "CDS", "directoryServiceUuid": "09B9A9B0-6CE8-465F-AB03-65766D33B05E",
+                 "DisplayName": "CyberArk Cloud Directory"}
+
+
+def test_role_principal_from_identity_row():
+    assert build_role_principal(ROLE_ROW, CDS_DIRECTORY) == {
+        "id": "c7d2e1f0-5555-6666-7777-888899990000", "name": "SIA-Web-Admins", "type": "ROLE",
+        "sourceDirectoryId": "09B9A9B0-6CE8-465F-AB03-65766D33B05E", "sourceDirectoryName": "CyberArk Cloud Directory"}
+    assert build_role_principal(ROLE_ROW) == {"id": "c7d2e1f0-5555-6666-7777-888899990000", "name": "SIA-Web-Admins", "type": "ROLE"}
+    assert build_role_principal(ROLE_ROW, {"DirectoryServiceUuid": "d-1", "Name": "Cloud"})["sourceDirectoryName"] == "Cloud"
+    assert build_role_principal(ROLE_ROW, {"directoryServiceUuid": "d-2"})["sourceDirectoryName"] == "CyberArk Cloud Directory"
+    assert "sourceDirectoryId" not in build_role_principal(ROLE_ROW, {"Service": "CDS"})   # no uuid: send neither field
+    policy = build_policy(server(), [build_role_principal(ROLE_ROW, CDS_DIRECTORY)], DEFAULTS)
+    assert policy["principals"] == [build_role_principal(ROLE_ROW, CDS_DIRECTORY)]
+
+
+def test_policy_signature_ignores_directory_fields_for_role_principals():
+    full = {"principals": [{"id": "r1", "type": "ROLE", "sourceDirectoryId": "x", "sourceDirectoryName": "CyberArk Cloud Directory"}]}
+    bare = {"principals": [{"id": "r1", "type": "role"}]}
+    assert policy_signature(full)["principal_details"] == [("r1", "ROLE", "", "")] == policy_signature(bare)["principal_details"]
+    assert policy_signature(full)["principals"] == ["r1"]
+    groups = {"principals": [{"id": "g1", "type": "Group", "sourceDirectoryId": "d1", "sourceDirectoryName": "Dir"}]}
+    assert policy_signature(groups)["principal_details"] == [("g1", "GROUP", "d1", "Dir")]
+    moved = {"principals": [{"id": "g1", "type": "GROUP", "sourceDirectoryId": "d2", "sourceDirectoryName": "Dir"}]}
+    assert policy_signature(groups)["principal_details"] != policy_signature(moved)["principal_details"]

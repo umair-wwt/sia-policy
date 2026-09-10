@@ -7,13 +7,13 @@ from sia.inputs import InputError, effective_policy_name, inline_inputs, load_in
 
 ROOT = Path(__file__).resolve().parents[1]
 
-SERVERS_HDR = "fqdn,strong_account,group,policy_name,assign_groups,domain,description\n"
+SERVERS_HDR = "fqdn,strong_account,principal,policy_name,assign_groups,domain,description\n"
 ACCOUNTS_HDR = "name,type,safe,account_name,username,account_domain,password_env\n"
 VAULT_SPEC = StrongAccountTemplate(name="ADM-{hostname}", type="vault", safe="SIA-LocalAdmins",
                                    account_name="{hostname}-Administrator", username="Administrator")
 
 
-DOMAINS_HDR = "domain,strong_account,target_set,target_set_type,group_template\n"
+DOMAINS_HDR = "domain,strong_account,target_set,target_set_type,principal_template\n"
 
 
 def make_inputs(tmp_path: Path, servers: str, accounts: str, groups: str | None = None, servers_hdr: str = SERVERS_HDR,
@@ -36,8 +36,8 @@ def test_example_inputs_load():
                                    "fs01.corp.example.com", "app-lnx01.corp.example.com")
     first, second = inputs.rows_for("web01.corp.example.com")
     assert first.strong_account == second.strong_account == "ADM-web01"
-    assert first.groups == ("SIA-Web-Admins",) and first.policy_suffix is None and first.domain_joined is True
-    assert second.groups == ("SIA-Platform-Ops",) and second.policy_suffix == "-ops" and second.assign_groups == ("Remote Desktop Users",)
+    assert first.principals == ("SIA-Web-Admins",) and first.policy_suffix is None and first.domain_joined is True
+    assert second.principals == ("SIA-Platform-Ops",) and second.policy_suffix == "-ops" and second.assign_groups == ("Remote Desktop Users",)
     adm = inputs.strong_accounts["ADM-web01"]
     assert adm.type == "vault" and adm.safe == "SIA-LocalAdmins" and adm.account_name == "web01-Administrator"
     assert adm.username == "Administrator" and adm.sia_name == "web01-Administrator_SIA-LocalAdmins"
@@ -49,16 +49,15 @@ def test_example_inputs_load():
     shared = inputs.strong_accounts["SA-corp-domain"]
     assert shared.type == "vault" and shared.account_domain == "corp.example.com" and shared.address == "corp.example.com" and not shared.is_local
     lnx = inputs.servers[5]
-    assert lnx.is_ssh and lnx.strong_account is None and lnx.ssh_username == "ec2-user" and lnx.groups == ("SIA-Linux-Admins",)
+    assert lnx.is_ssh and lnx.strong_account is None and lnx.ssh_username == "ec2-user" and lnx.principals == ("SIA-Linux-Admins",)
     dmz_sa = inputs.strong_accounts["SA-dmz-localadmin"]
     assert dmz_sa.secret_type == "ProvisionerUser" and dmz_sa.password_env == "SIA_SA_DMZ_LOCALADMIN_PASSWORD"
     assert inputs.strong_accounts["SA-legacy"].secret_type is None
-    assert inputs.pinned_directory("SIA-Platform-Ops") == "CyberArk Cloud Directory"
-    assert inputs.pinned_directory("SIA-Web-Admins") is None
+    assert inputs.groups == {} and inputs.pinned_directory("SIA-Web-Admins") is None   # no groups.csv is shipped
     assert {sa.name for sa in inputs.referenced_strong_accounts} == {"ADM-web01", "ADM-web02", "SA-dmz-localadmin", "SA-corp-domain"}
     assert [s.fqdn for s in inputs.target_rows] == ["web01.corp.example.com", "web02.corp.example.com",
                                                     "dmz-app01.dmz.example.com", "fs01.corp.example.com"]
-    assert inputs.referenced_groups == ["SIA-Web-Admins", "SIA-Platform-Ops", "SIA-DMZ-Admins", "SIA-Linux-Admins"]
+    assert inputs.referenced_principals == ["SIA-Web-Admins", "SIA-Platform-Ops", "SIA-DMZ-Admins", "SIA-Linux-Admins"]
     assert inputs.warnings == ()
     wave = inputs.window(1, 2)
     assert [s.fqdn for s in wave.servers] == ["web02.corp.example.com", "dmz-app01.dmz.example.com"]
@@ -71,12 +70,12 @@ def test_example_inputs_load():
 
 
 def test_fqdn_normalized_and_bom_tolerated(tmp_path):
-    (tmp_path / "servers.csv").write_bytes(b"\xef\xbb\xbffqdn,strong_account,group\nWEB01.Corp.Example.COM., SA1 , Admins \n\n")
+    (tmp_path / "servers.csv").write_bytes(b"\xef\xbb\xbffqdn,strong_account,principal\nWEB01.Corp.Example.COM., SA1 , Admins \n\n")
     (tmp_path / "strong_accounts.csv").write_text("name,type\nSA1,existing\n", encoding="utf-8")
     inputs = load_inputs(tmp_path)
     assert inputs.servers[0].fqdn == "web01.corp.example.com"
     assert inputs.servers[0].strong_account == "SA1"
-    assert inputs.servers[0].groups == ("Admins",)
+    assert inputs.servers[0].principals == ("Admins",)
     assert inputs.servers[0].assign_groups is None
 
 
@@ -92,7 +91,7 @@ def test_default_password_env_derived(tmp_path):
     ("a.b.c,SA1,G\na.b.c,SA1,G\n", "SA1,existing,,,,,\n", "collides with line 2"),
     ("a.b.c,SA1,G\na.b.c,SA2,G,P2\n", "SA1,existing,,,,,\nSA2,existing,,,,,\n", "strong_account 'SA2' conflicts with line 2"),
     ("a.b.c,SA1,G\na.b.c,SA1,G,P2,,other.dom\n", "SA1,existing,,,,,\n", "domain 'other.dom' conflicts"),
-    ("a.b.c,SA1,\n", "SA1,existing,,,,,\n", "group is required"),
+    ("a.b.c,SA1,\n", "SA1,existing,,,,,\n", "principal is required"),
     ("a.b.c,,G\n", "SA1,existing,,,,,\n", "strong_account is required"),
     ("a.b.c,SA-missing,G\n", "SA1,existing,,,,,\n", "not defined in strong_accounts.csv"),
     ("a.b.c,SA1,G\n", "SA1,bogus,,,,,\n", "type must be one of"),
@@ -114,20 +113,34 @@ def test_all_problems_reported_together(tmp_path):
         load_inputs(tmp_path)
     text = str(exc.value)
     assert "servers.csv:2" in text and "servers.csv:3" in text
-    assert "SA2" in text and "group is required" in text
+    assert "SA2" in text and "principal is required" in text
 
 
 def test_unknown_column(tmp_path):
-    """`group` is optional now (group_template can derive it), so a typo is caught as an unknown column."""
+    """`principal` is optional (principal_template can derive it), so a typo is caught as an unknown column."""
     (tmp_path / "servers.csv").write_text("fqdn,strong_account,groups\n", encoding="utf-8")
     (tmp_path / "strong_accounts.csv").write_text("name,type\n", encoding="utf-8")
     with pytest.raises(InputError) as exc:
         load_inputs(tmp_path)
-    assert "unknown column(s): groups" in str(exc.value)
+    assert "unknown column(s): groups" in str(exc.value) and "was renamed" not in str(exc.value)
+
+
+def test_legacy_group_names_get_a_rename_hint(tmp_path):
+    make_inputs(tmp_path, "a.b.c,SA1,G\n", "SA1,existing,,,,,\n", servers_hdr="fqdn,strong_account,group\n")
+    with pytest.raises(InputError) as exc:
+        load_inputs(tmp_path)
+    text = str(exc.value)
+    assert "servers.csv: unknown column(s): group" in text
+    assert "servers.csv: column 'group' was renamed to 'principal'" in text and 'principal_type = "group"' in text
+    make_inputs(tmp_path, "a.b.c,SA1,G\n", "SA1,existing,,,,,\n")
+    (tmp_path / "domains.csv").write_text("domain,strong_account,target_set,target_set_type,group_template\n"
+                                          "corp.example.com,SA-CORP,,Domain,SIA-{hostname_upper}-RDP\n", encoding="utf-8")
+    with pytest.raises(InputError, match="domains.csv: column 'group_template' was renamed to 'principal_template'"):
+        load_inputs(tmp_path)
 
 
 def test_missing_required_column(tmp_path):
-    (tmp_path / "servers.csv").write_text("strong_account,group\n", encoding="utf-8")
+    (tmp_path / "servers.csv").write_text("strong_account,principal\n", encoding="utf-8")
     (tmp_path / "strong_accounts.csv").write_text("name,type\n", encoding="utf-8")
     with pytest.raises(InputError, match=r"missing required column\(s\): fqdn"):
         load_inputs(tmp_path)
@@ -139,22 +152,22 @@ def test_missing_files(tmp_path):
 
 
 def test_servers_csv_requires_data_and_unambiguous_headers(tmp_path):
-    (tmp_path / "servers.csv").write_text("fqdn,strong_account,group\n", encoding="utf-8")
+    (tmp_path / "servers.csv").write_text("fqdn,strong_account,principal\n", encoding="utf-8")
     with pytest.raises(InputError, match="no data rows found"):
         load_inputs(tmp_path)
-    (tmp_path / "servers.csv").write_text("fqdn,group,group\na.b.c,G,G2\n", encoding="utf-8")
-    with pytest.raises(InputError, match="duplicate column.*group"):
+    (tmp_path / "servers.csv").write_text("fqdn,principal,principal\na.b.c,G,G2\n", encoding="utf-8")
+    with pytest.raises(InputError, match="duplicate column.*principal"):
         load_inputs(tmp_path)
-    (tmp_path / "servers.csv").write_text("fqdn,,group\na.b.c,SA1,G\n", encoding="utf-8")
+    (tmp_path / "servers.csv").write_text("fqdn,,principal\na.b.c,SA1,G\n", encoding="utf-8")
     with pytest.raises(InputError, match="blank column name"):
         load_inputs(tmp_path)
 
 
 def test_malformed_csv_has_file_and_line(tmp_path):
-    (tmp_path / "servers.csv").write_text('fqdn,strong_account,group\n"a.b.c,SA1,G\n', encoding="utf-8")
+    (tmp_path / "servers.csv").write_text('fqdn,strong_account,principal\n"a.b.c,SA1,G\n', encoding="utf-8")
     with pytest.raises(InputError, match=r"servers\.csv:\d+: invalid CSV"):
         load_inputs(tmp_path)
-    (tmp_path / "servers.csv").write_bytes(b"fqdn,strong_account,group\na.b.c,SA1,\xff\n")
+    (tmp_path / "servers.csv").write_bytes(b"fqdn,strong_account,principal\na.b.c,SA1,\xff\n")
     with pytest.raises(InputError, match="must be UTF-8"):
         load_inputs(tmp_path)
 
@@ -162,7 +175,42 @@ def test_malformed_csv_has_file_and_line(tmp_path):
 def test_groups_csv_duplicates(tmp_path):
     make_inputs(tmp_path, "a.b.c,SA1,G\n", "SA1,existing,,,,,\n", groups="G,\nG,CyberArk Cloud Directory\n")
     with pytest.raises(InputError, match="duplicate group"):
-        load_inputs(tmp_path)
+        load_inputs(tmp_path, principal_type="group")
+
+
+@pytest.mark.parametrize("use_inline", [False, True])
+@pytest.mark.parametrize(("groups_content", "group_error"), [
+    (b"name,directory\nOld-Group,CDS\nold-group,CDS\n", "duplicate group"),
+    (b"legacy_name,directory\nOld-Group,CDS\n", "missing required column.*name"),
+    (b"name,directory\nG,\xff\n", "groups.csv: file must be UTF-8"),
+])
+def test_groups_csv_is_only_parsed_for_group_principals(tmp_path, use_inline, groups_content, group_error):
+    make_inputs(tmp_path, "a.b.c,SA1,G\n", "SA1,existing,,,,,\n")
+    (tmp_path / "groups.csv").write_bytes(groups_content)
+
+    def load(principal_type):
+        if use_inline:
+            return inline_inputs(tmp_path, [{"fqdn": "a.b.c", "strong_account": "SA1", "principal": "G"}],
+                                 principal_type=principal_type)
+        return load_inputs(tmp_path, principal_type=principal_type)
+
+    role_inputs = load("role")
+    assert role_inputs.groups == {}
+    assert any('groups.csv is only used when [defaults] principal_type = "group"' in warning
+               for warning in role_inputs.warnings)
+    with pytest.raises(InputError, match=group_error):
+        load("group")
+
+
+@pytest.mark.parametrize("use_inline", [False, True])
+def test_input_loaders_reject_unknown_principal_type(tmp_path, use_inline):
+    make_inputs(tmp_path, "a.b.c,SA1,G\n", "SA1,existing,,,,,\n")
+    with pytest.raises(ValueError, match="principal_type must be one of role, group"):
+        if use_inline:
+            inline_inputs(tmp_path, [{"fqdn": "a.b.c", "strong_account": "SA1", "principal": "G"}],
+                          principal_type="user")
+        else:
+            load_inputs(tmp_path, principal_type="user")
 
 
 def test_password_env_names_and_collisions_are_rejected(tmp_path):
@@ -191,7 +239,7 @@ def test_domain_column_validation(tmp_path, domain, ok):
 def test_ssh_rows(tmp_path):
     make_inputs(tmp_path, "", "SA1,existing,,,,,\n")
     (tmp_path / "servers.csv").write_text(
-        "fqdn,strong_account,group,policy_name,assign_groups,domain,description,protocol,ssh_username\n"
+        "fqdn,strong_account,principal,policy_name,assign_groups,domain,description,protocol,ssh_username\n"
         "lnx1.corp.local,SA1,G,,,,,ssh,ec2-user\nlnx2.corp.local,,G,,Administrators,,,SSH,\n", encoding="utf-8")
     inputs = load_inputs(tmp_path, ssh_username_default="root")
     lnx1, lnx2 = inputs.servers
@@ -206,18 +254,18 @@ def test_ssh_rows(tmp_path):
 
 def test_protocol_validation_and_rdp_ignores_ssh_username(tmp_path):
     (tmp_path / "servers.csv").write_text(
-        "fqdn,strong_account,group,protocol,ssh_username\nw1.corp.local,SA1,G,telnet,\nw2.corp.local,SA1,G,rdp,root\n", encoding="utf-8")
+        "fqdn,strong_account,principal,protocol,ssh_username\nw1.corp.local,SA1,G,telnet,\nw2.corp.local,SA1,G,rdp,root\n", encoding="utf-8")
     (tmp_path / "strong_accounts.csv").write_text("name,type\nSA1,existing\n", encoding="utf-8")
     with pytest.raises(InputError, match="protocol must be one of rdp, ssh"):
         load_inputs(tmp_path)
     (tmp_path / "servers.csv").write_text(
-        "fqdn,strong_account,group,protocol,ssh_username\nw2.corp.local,SA1,G,rdp,root\n", encoding="utf-8")
+        "fqdn,strong_account,principal,protocol,ssh_username\nw2.corp.local,SA1,G,rdp,root\n", encoding="utf-8")
     inputs = load_inputs(tmp_path)
     assert inputs.servers[0].ssh_username is None and any("ssh_username ignored for protocol=rdp" in w for w in inputs.warnings)
 
 
 def test_strong_account_template_string_keeps_lookup_only_behaviour(tmp_path):
-    (tmp_path / "servers.csv").write_text("fqdn,strong_account,group\nweb01.corp.local,,G\nweb02.corp.local,SA-explicit,G\n", encoding="utf-8")
+    (tmp_path / "servers.csv").write_text("fqdn,strong_account,principal\nweb01.corp.local,,G\nweb02.corp.local,SA-explicit,G\n", encoding="utf-8")
     (tmp_path / "strong_accounts.csv").write_text("name,type\nSA-explicit,existing\n", encoding="utf-8")
     inputs = load_inputs(tmp_path, strong_account_template="ADM-{hostname}")
     assert inputs.servers[0].strong_account == "ADM-web01"
@@ -226,17 +274,17 @@ def test_strong_account_template_string_keeps_lookup_only_behaviour(tmp_path):
     assert {a.name for a in inputs.referenced_strong_accounts} == {"ADM-web01", "SA-explicit"}
     with pytest.raises(InputError, match="strong_account is required .*strong_account_template"):
         load_inputs(tmp_path)  # no template configured
-    (tmp_path / "servers.csv").write_text("fqdn,strong_account,group\nweb03.corp.local,ADM-typo,G\n", encoding="utf-8")
+    (tmp_path / "servers.csv").write_text("fqdn,strong_account,principal\nweb03.corp.local,ADM-typo,G\n", encoding="utf-8")
     with pytest.raises(InputError, match="not defined in strong_accounts.csv"):
         load_inputs(tmp_path, strong_account_template="ADM-{hostname}")  # explicit names must still be declared
 
 
 def test_templated_vault_and_credentials_accounts(tmp_path):
-    (tmp_path / "servers.csv").write_text("fqdn,strong_account,group\nweb01.corp.local,,G\nweb01.corp.local,,G2\nweb02.corp.local,,G\n", encoding="utf-8")
+    (tmp_path / "servers.csv").write_text("fqdn,strong_account,principal\nweb01.corp.local,,G\nweb01.corp.local,,G2\nweb02.corp.local,,G\n", encoding="utf-8")
     (tmp_path / "strong_accounts.csv").write_text("name,type\n", encoding="utf-8")
     with pytest.raises(InputError, match="collides"):
         load_inputs(tmp_path, strong_account_template=VAULT_SPEC)  # two rows for web01 need distinct policy names
-    (tmp_path / "servers.csv").write_text("fqdn,strong_account,group,policy_suffix\nweb01.corp.local,,G,\nweb01.corp.local,,G2,-ops\nweb02.corp.local,,G,\n", encoding="utf-8")
+    (tmp_path / "servers.csv").write_text("fqdn,strong_account,principal,policy_suffix\nweb01.corp.local,,G,\nweb01.corp.local,,G2,-ops\nweb02.corp.local,,G,\n", encoding="utf-8")
     inputs = load_inputs(tmp_path, strong_account_template=VAULT_SPEC)
     assert [s.strong_account for s in inputs.servers] == ["ADM-web01", "ADM-web01", "ADM-web02"]
     assert {a.name for a in inputs.referenced_strong_accounts} == {"ADM-web01", "ADM-web02"}
@@ -261,7 +309,7 @@ def test_templated_vault_and_credentials_accounts(tmp_path):
 
 
 def test_policy_names_per_row(tmp_path):
-    hdr = "fqdn,strong_account,group,policy_name,policy_suffix\n"
+    hdr = "fqdn,strong_account,principal,policy_name,policy_suffix\n"
     make_inputs(tmp_path, "web01.corp.local,SA1,G,,\nweb01.corp.local,SA1,G2,,-ops\nweb01.dmz.local,SA1,G,,\n", "SA1,existing,,,,,\n", servers_hdr=hdr)
     inputs = load_inputs(tmp_path)
     assert [effective_policy_name("{fqdn}", s.fqdn, s.dns_domain, s.policy_name, s.policy_suffix) for s in inputs.servers] == [
@@ -278,14 +326,14 @@ def test_policy_names_per_row(tmp_path):
 
 
 def test_domain_joined_and_address_columns(tmp_path):
-    hdr = "fqdn,strong_account,group,domain_joined\n"
+    hdr = "fqdn,strong_account,principal,domain_joined\n"
     make_inputs(tmp_path, "a.b.c,SA1,G,no\nd.b.c,SA1,G,YES\ne.b.c,SA1,G,\n", "SA1,existing,,,,,\n", servers_hdr=hdr)
     inputs = load_inputs(tmp_path)
     assert [s.domain_joined for s in inputs.servers] == [False, True, True]
     make_inputs(tmp_path, "a.b.c,SA1,G,maybe\n", "SA1,existing,,,,,\n", servers_hdr=hdr)
     with pytest.raises(InputError, match="domain_joined must be yes or no"):
         load_inputs(tmp_path)
-    (tmp_path / "servers.csv").write_text("fqdn,strong_account,group\na.b.c,SA1,G\n", encoding="utf-8")
+    (tmp_path / "servers.csv").write_text("fqdn,strong_account,principal\na.b.c,SA1,G\n", encoding="utf-8")
     (tmp_path / "strong_accounts.csv").write_text("name,type,safe,account_name,username,address\nSA1,vault,S,acc,svc,corp.local\n", encoding="utf-8")
     assert load_inputs(tmp_path).strong_accounts["SA1"].address == "corp.local"
     (tmp_path / "strong_accounts.csv").write_text("name,type,address\nSA1,existing,corp.local\n", encoding="utf-8")
@@ -295,7 +343,7 @@ def test_domain_joined_and_address_columns(tmp_path):
 
 # --------------------------------------------------------------------------- domains.csv, group and target-set scope
 
-SERVERS_MIN = "fqdn,strong_account,group,domain_joined\n"
+SERVERS_MIN = "fqdn,strong_account,principal,domain_joined\n"
 
 
 def test_domains_csv_supplies_group_strong_account_and_target_set(tmp_path):
@@ -305,10 +353,10 @@ def test_domains_csv_supplies_group_strong_account_and_target_set(tmp_path):
         "web01.corp.example.com,,,\nweb02.corp.example.com,,,\napp01.lab.example.com,,,\n", "",
         servers_hdr=SERVERS_MIN,
         domains="corp.example.com,SA-CORP-SIA,,Domain,\nlab.example.com,SA-LAB-SIA,,Domain,SIA-{hostname_upper}-LAB\n")
-    inputs = load_inputs(path, group_template="SIA-{hostname_upper}-RDP", target_set_scope="auto")
+    inputs = load_inputs(path, principal_template="SIA-{hostname_upper}-RDP", target_set_scope="auto")
     web01, web02, app01 = inputs.servers
-    assert web01.groups == ("SIA-WEB01-RDP",) and web02.groups == ("SIA-WEB02-RDP",)
-    assert app01.groups == ("SIA-APP01-LAB",)                        # the domain's template wins over [defaults]
+    assert web01.principals == ("SIA-WEB01-RDP",) and web02.principals == ("SIA-WEB02-RDP",)
+    assert app01.principals == ("SIA-APP01-LAB",)                        # the domain's template wins over [defaults]
     assert web01.strong_account == web02.strong_account == "SA-CORP-SIA"
     assert app01.strong_account == "SA-LAB-SIA"
     # both corp servers share one Domain target set; the lab server has its own
@@ -324,8 +372,8 @@ def test_strong_accounts_csv_is_optional(tmp_path):
     """Minimum viable input: an fqdn column plus domains.csv."""
     (tmp_path / "servers.csv").write_text("fqdn\nweb01.corp.example.com\n", encoding="utf-8")
     (tmp_path / "domains.csv").write_text(DOMAINS_HDR + "corp.example.com,SA-CORP-SIA,,Domain,\n", encoding="utf-8")
-    inputs = load_inputs(tmp_path, group_template="SIA-{hostname_upper}-RDP", target_set_scope="auto")
-    assert inputs.servers[0].strong_account == "SA-CORP-SIA" and inputs.servers[0].groups == ("SIA-WEB01-RDP",)
+    inputs = load_inputs(tmp_path, principal_template="SIA-{hostname_upper}-RDP", target_set_scope="auto")
+    assert inputs.servers[0].strong_account == "SA-CORP-SIA" and inputs.servers[0].principals == ("SIA-WEB01-RDP",)
 
 
 def test_strong_account_precedence(tmp_path):
@@ -387,22 +435,22 @@ def test_custom_target_set_name_and_type(tmp_path):
     assert inputs.servers[0].target_set_name == "example.com" and inputs.servers[0].target_set_type == "Suffix"
 
 
-def test_group_is_required_without_a_template(tmp_path):
+def test_principal_is_required_without_a_template(tmp_path):
     path = make_inputs(tmp_path, "web01.corp.example.com,SA1,,\n", "SA1,existing,,,,,\n", servers_hdr=SERVERS_MIN)
     with pytest.raises(InputError) as exc:
         load_inputs(path)
-    assert "group is required" in str(exc.value) and "group_template" in str(exc.value)
+    assert "principal is required" in str(exc.value) and "principal_template" in str(exc.value)
 
 
-def test_group_template_may_produce_several_groups(tmp_path):
+def test_principal_template_may_produce_several_principals(tmp_path):
     path = make_inputs(tmp_path, "web01.corp.example.com,SA1,,\n", "SA1,existing,,,,,\n", servers_hdr=SERVERS_MIN)
-    inputs = load_inputs(path, group_template="SIA-{hostname}-RDP;SIA-{domain}-ALL")
-    assert inputs.servers[0].groups == ("SIA-web01-RDP", "SIA-corp.example.com-ALL")
+    inputs = load_inputs(path, principal_template="SIA-{hostname}-RDP;SIA-{domain}-ALL")
+    assert inputs.servers[0].principals == ("SIA-web01-RDP", "SIA-corp.example.com-ALL")
 
 
-def test_explicit_group_cell_beats_the_template(tmp_path):
+def test_explicit_principal_cell_beats_the_template(tmp_path):
     path = make_inputs(tmp_path, "web01.corp.example.com,SA1,Typed-In,\n", "SA1,existing,,,,,\n", servers_hdr=SERVERS_MIN)
-    assert load_inputs(path, group_template="SIA-{hostname}").servers[0].groups == ("Typed-In",)
+    assert load_inputs(path, principal_template="SIA-{hostname}").servers[0].principals == ("Typed-In",)
 
 
 def test_strong_account_domain_may_be_templated(tmp_path):
@@ -430,6 +478,41 @@ def test_domains_csv_validation(tmp_path):
     assert "shares target set 'shared.example.com'" in text and "only hold one strong account" in text
 
 
+@pytest.mark.parametrize("reverse", [False, True])
+def test_domains_sharing_a_target_set_must_agree_on_type(tmp_path, reverse):
+    rows = [
+        "corp.example.com,SA-SHARED,example.com,Domain,\n",
+        "lab.example.com,SA-SHARED,example.com,Suffix,\n",
+    ]
+    if reverse:
+        rows.reverse()
+    path = make_inputs(tmp_path, "web01.corp.example.com,,G,\n", "", servers_hdr=SERVERS_MIN,
+                       domains="".join(rows))
+    with pytest.raises(InputError) as caught:
+        load_inputs(path, target_set_scope="auto")
+    message = str(caught.value)
+    assert "shares target set 'example.com'" in message
+    assert "target_set_type" in message and "Domain" in message and "Suffix" in message
+    assert "one target-set name cannot have two types" in message
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+def test_matching_shared_target_set_definitions_are_order_independent(tmp_path, reverse):
+    domains = [
+        "corp.example.com,SA-SHARED,example.com,Suffix,\n",
+        "lab.example.com,SA-SHARED,example.com,Suffix,\n",
+    ]
+    servers = ["web01.corp.example.com,,G,\n", "app01.lab.example.com,,G,\n"]
+    if reverse:
+        domains.reverse()
+        servers.reverse()
+    path = make_inputs(tmp_path, "".join(servers), "", servers_hdr=SERVERS_MIN, domains="".join(domains))
+    loaded = load_inputs(path, target_set_scope="auto")
+    assert {row.target_set_key for row in loaded.servers} == {"example.com"}
+    assert {row.target_set_type for row in loaded.servers} == {"Suffix"}
+    assert {row.strong_account for row in loaded.servers} == {"SA-SHARED"}
+
+
 def test_unknown_strong_account_names_domains_csv_in_the_hint(tmp_path):
     path = make_inputs(tmp_path, "web01.corp.example.com,SA-typo,G,\n", "SA1,existing,,,,,\n", servers_hdr=SERVERS_MIN)
     with pytest.raises(InputError, match="not defined in strong_accounts.csv or domains.csv"):
@@ -447,19 +530,19 @@ def test_rows_of_one_server_must_agree_on_their_target_set(tmp_path):
 
 
 def test_inline_inputs_match_the_csv_path(tmp_path):
-    """--server rows resolve their group, account and target set exactly as servers.csv rows would."""
+    """--server rows resolve their principal, account and target set exactly as servers.csv rows would."""
     (tmp_path / "domains.csv").write_text(DOMAINS_HDR + "corp.example.com,SA-CORP-SIA,,Domain,\n", encoding="utf-8")
     inputs = inline_inputs(tmp_path, [{"fqdn": "WEB01.corp.example.com"}],
-                           group_template="SIA-{hostname_upper}-RDP", target_set_scope="auto")
+                           principal_template="SIA-{hostname_upper}-RDP", target_set_scope="auto")
     row = inputs.servers[0]
-    assert row.fqdn == "web01.corp.example.com" and row.groups == ("SIA-WEB01-RDP",)
+    assert row.fqdn == "web01.corp.example.com" and row.principals == ("SIA-WEB01-RDP",)
     assert row.strong_account == "SA-CORP-SIA" and row.target_set_key == "corp.example.com"
 
 
 def test_inline_inputs_report_problems_with_the_server_name(tmp_path):
     (tmp_path / "domains.csv").write_text(DOMAINS_HDR, encoding="utf-8")
     with pytest.raises(InputError) as exc:
-        inline_inputs(tmp_path, [{"fqdn": "not-an-fqdn", "group": "G", "strong_account": "SA1"}])
+        inline_inputs(tmp_path, [{"fqdn": "not-an-fqdn", "principal": "G", "strong_account": "SA1"}])
     assert "--server not-an-fqdn" in str(exc.value)
 
 
@@ -484,6 +567,22 @@ def test_a_domain_target_set_may_not_collide_with_a_server_of_its_own(tmp_path):
     text = str(exc.value)
     assert "shares target set 'jump01.lab.example.com'" in text
     assert "'SA-JUMP'" in text and "'SA-LAB'" in text and "holds exactly one strong account" in text
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+def test_domain_and_per_server_target_set_collision_must_agree_on_type(tmp_path, reverse):
+    servers = ["web01.lab.example.com,,G,\n", "jump01.lab.example.com,SA-SHARED,G,\n"]
+    if reverse:
+        servers.reverse()
+    path = make_inputs(
+        tmp_path, "".join(servers), "SA-SHARED,existing,,,,,\n", servers_hdr=SERVERS_MIN,
+        domains="lab.example.com,SA-SHARED,jump01.lab.example.com,Domain,\n")
+    with pytest.raises(InputError) as caught:
+        load_inputs(path, target_set_scope="auto")
+    message = str(caught.value)
+    assert "shares target set 'jump01.lab.example.com'" in message
+    assert "target_set_type" in message and "Domain" in message and "Target" in message
+    assert "one target-set name cannot have two types" in message
 
 
 def test_domain_wide_target_set_may_not_be_typed_target(tmp_path):
@@ -525,7 +624,7 @@ def test_account_and_group_pins_are_case_insensitive(tmp_path):
         tmp_path, "web01.corp.example.com,sa-one,team-ops\n", "SA-One,existing,,,,,\n",
         groups="Team-Ops,CyberArk Cloud Directory\n",
     )
-    inputs = load_inputs(tmp_path)
+    inputs = load_inputs(tmp_path, principal_type="group")
     assert inputs.servers[0].strong_account == "SA-One"
     assert inputs.strong_account_for(inputs.servers[0]).name == "SA-One"
     assert inputs.pinned_directory("TEAM-OPS") == "CyberArk Cloud Directory"
@@ -536,7 +635,7 @@ def test_repeated_server_rows_accept_case_variants_of_the_same_account(tmp_path)
         tmp_path,
         "web01.corp.example.com,sa-one,Team,,\nweb01.corp.example.com,SA-ONE,Other,,-ops\n",
         "SA-One,existing,,,,,\n",
-        servers_hdr="fqdn,strong_account,group,policy_name,policy_suffix\n",
+        servers_hdr="fqdn,strong_account,principal,policy_name,policy_suffix\n",
     )
     inputs = load_inputs(tmp_path)
     assert [row.strong_account for row in inputs.servers] == ["SA-One", "SA-One"]
@@ -546,7 +645,7 @@ def test_groups_reject_case_only_duplicates(tmp_path):
     make_inputs(tmp_path, "web01.corp.example.com,SA1,G\n", "SA1,existing,,,,,\n",
                 groups="Team,CyberArk Cloud Directory\nteam,corp.example.com\n")
     with pytest.raises(InputError, match="duplicate group"):
-        load_inputs(tmp_path)
+        load_inputs(tmp_path, principal_type="group")
 
 
 def test_target_mapping_must_name_the_consuming_server_exactly(tmp_path):
@@ -576,7 +675,8 @@ def test_shipped_sample_input_loads_with_the_example_configuration():
     defaults = load_config(ROOT / "config.example.toml").defaults
     loaded = load_inputs(ROOT / "input", strong_account_template=defaults.strong_account_spec or "",
                          ssh_username_default=defaults.ssh_username, policy_name_template=defaults.policy_name_template,
-                         group_template=defaults.group_template, target_set_scope=defaults.target_set_scope)
+                         principal_template=defaults.principal_template, principal_type=defaults.principal_type,
+                         target_set_scope=defaults.target_set_scope)
     accounts = {server.strong_account for server in loaded.servers if not server.is_ssh}
     assert accounts == {"ADM-web01", "ADM-web02", "SA-dmz-localadmin", "SA-corp-domain"}
     assert loaded.strong_accounts["ADM-web01"].type == "vault"

@@ -1,0 +1,260 @@
+"""Success requires read-back evidence that a write reached the requested tenant state."""
+from __future__ import annotations
+
+import copy
+from dataclasses import replace
+
+import pytest
+
+from sia.checkpoint import Checkpoint
+from sia.http import SIAApiError
+from tests.fakes import FakeSIA, FakeUAP
+from tests.test_resolve_reconcile import DEFAULTS, GROUP_DEFAULTS, ONE, calls, make
+
+
+class PrincipalLessListUAP(FakeUAP):
+    """A valid list projection that omits the authorization block."""
+
+    def list_policies(self, **kwargs):
+        rows = super().list_policies(**kwargs)
+        for row in rows:
+            row.pop("principals", None)
+        return rows
+
+
+def test_principal_less_list_projection_fetches_full_policy_before_passing():
+    seed, sia, original, _ = make(ONE)
+    assert seed.run().failures == 0
+    original.policies[0]["principals"][0]["id"] = "wrong-role"
+    uap = PrincipalLessListUAP(copy.deepcopy(original.policies))
+
+    result = make(ONE, sia=sia, uap=uap, dry_run=True, only="policies", drift=False)[0].run()
+
+    assert result.servers[0].policy.status == "drift"
+    assert "principals differ" in result.servers[0].policy.detail
+    assert calls(uap, "get_policy") == [result.servers[0].policy.ref]
+
+
+def test_policy_remains_unverified_when_full_response_omits_principals():
+    seed, sia, original, _ = make(ONE)
+    assert seed.run().failures == 0
+
+    class PrincipalLessEverywhereUAP(PrincipalLessListUAP):
+        def get_policy(self, policy_id):
+            row = super().get_policy(policy_id)
+            row.pop("principals", None)
+            return row
+
+    uap = PrincipalLessEverywhereUAP(copy.deepcopy(original.policies))
+    result = make(ONE, sia=sia, uap=uap, dry_run=True, only="policies", drift=False)[0].run()
+
+    outcome = result.servers[0].policy
+    assert outcome.status == "unverified" and outcome.ref
+    assert "missing principals" in outcome.detail and "cannot confirm who has access" in outcome.detail
+    assert not calls(uap, "update_policy")
+
+
+def test_policy_create_requires_full_readback_convergence(tmp_path):
+    class WrongCreateUAP(FakeUAP):
+        def create_policy(self, payload):
+            policy_id = super().create_policy(payload)
+            self.policies[-1]["principals"] = [{"id": "wrong-role", "name": "Wrong", "type": "ROLE"}]
+            return policy_id
+
+    checkpoint = Checkpoint(tmp_path / "checkpoint.jsonl")
+    result = make(ONE, uap=WrongCreateUAP(), checkpoint=checkpoint)[0].run()
+    outcome = result.servers[0].policy
+
+    assert outcome.status == "unverified" and outcome.ref == "pol-1"
+    assert "read-back still differs in principals" in outcome.detail
+    assert outcome.diagnostic["mutation_state"] == "applied"
+    assert checkpoint.done_count() == 0
+
+
+def test_role_migration_update_is_unverified_when_put_does_not_converge(tmp_path):
+    seed, sia, group_uap, _ = make(ONE, defaults=GROUP_DEFAULTS)
+    assert seed.run().failures == 0
+
+    class NoOpUpdateUAP(FakeUAP):
+        def update_policy(self, policy_id, payload):
+            self.calls.append(("update_policy", (policy_id, payload)))
+
+    uap = NoOpUpdateUAP(copy.deepcopy(group_uap.policies))
+    checkpoint = Checkpoint(tmp_path / "checkpoint.jsonl")
+    result = make(ONE, sia=sia, uap=uap, update=True, checkpoint=checkpoint)[0].run()
+    outcome = result.servers[0].policy
+
+    assert calls(uap, "update_policy")[0][1]["principals"][0]["type"] == "ROLE"
+    assert uap.policies[0]["principals"][0]["type"] == "GROUP"
+    assert outcome.status == "unverified" and "read-back still differs in principals" in outcome.detail
+    assert outcome.diagnostic["mutation_state"] == "applied" and outcome.ref
+    assert checkpoint.done_count() == 0
+
+
+def test_policy_readback_polls_until_normalized_state_converges():
+    seed, sia, original, _ = make(ONE)
+    assert seed.run().failures == 0
+    original.policies[0]["conditions"]["idleTime"] = 99
+
+    class EventuallyConsistentUAP(FakeUAP):
+        stale = None
+
+        def update_policy(self, policy_id, payload):
+            self.stale = copy.deepcopy(self.policies[0])
+            super().update_policy(policy_id, payload)
+
+        def get_policy(self, policy_id):
+            if self.stale is not None:
+                self.calls.append(("get_policy", policy_id))
+                stale, self.stale = self.stale, None
+                return stale
+            return super().get_policy(policy_id)
+
+    uap = EventuallyConsistentUAP(copy.deepcopy(original.policies))
+    result = make(ONE, sia=sia, uap=uap, update=True, status_polls=2)[0].run()
+
+    assert result.servers[0].policy.status == "updated"
+    assert calls(uap, "get_policy") == ["pol-1", "pol-1"]
+
+
+@pytest.mark.parametrize(("defaults", "expected_status", "suspended_ok"), [
+    (DEFAULTS, "Active", False),
+    (replace(DEFAULTS, policy_status="Suspended"), "Suspended", True),
+])
+def test_transient_policy_status_uses_configured_stable_update_intent(
+        defaults, expected_status, suspended_ok):
+    uap = FakeUAP()
+    uap.create_status = defaults.policy_status
+    seed, sia, uap, _ = make(ONE, uap=uap, defaults=defaults)
+    assert seed.run().failures == 0
+    uap.policies[0]["metadata"]["status"] = {"status": "Warning"}
+    uap.policies[0]["principals"] = []
+
+    preview = make(
+        ONE, sia=sia, uap=uap, defaults=defaults, dry_run=True, update=True,
+        suspended_ok=suspended_ok)[0].run().servers[0].policy
+    assert preview.status == "planned"
+    assert f"status Warning -> {expected_status}" in preview.detail
+
+    outcome = make(
+        ONE, sia=sia, uap=uap, defaults=defaults, update=True,
+        suspended_ok=suspended_ok)[0].run().servers[0].policy
+    payload = calls(uap, "update_policy")[-1][1]
+    assert payload["metadata"]["status"] == {"status": expected_status}
+    assert outcome.status == "updated"
+
+
+def test_stable_active_status_is_preserved_when_update_default_is_suspended():
+    seed, sia, uap, _ = make(ONE)
+    assert seed.run().failures == 0
+    uap.policies[0]["principals"] = []
+    staged_default = replace(DEFAULTS, policy_status="Suspended")
+
+    outcome = make(ONE, sia=sia, uap=uap, defaults=staged_default, update=True)[0].run().servers[0].policy
+
+    assert calls(uap, "update_policy")[-1][1]["metadata"]["status"] == {"status": "Active"}
+    assert outcome.status == "updated"
+
+
+def test_role_directory_normalization_does_not_block_verified_update():
+    seed, sia, original, _ = make(ONE)
+    assert seed.run().failures == 0
+    original.policies[0]["principals"] = []
+
+    class DirectoryNormalizingUAP(FakeUAP):
+        def update_policy(self, policy_id, payload):
+            super().update_policy(policy_id, payload)
+            principal = self.policies[0]["principals"][0]
+            principal["sourceDirectoryId"] = "tenant-normalized-id"
+            principal["sourceDirectoryName"] = "Tenant normalized directory"
+
+    uap = DirectoryNormalizingUAP(copy.deepcopy(original.policies))
+    outcome = make(ONE, sia=sia, uap=uap, update=True)[0].run().servers[0].policy
+
+    assert outcome.status == "updated"
+
+
+def test_target_set_update_requires_exact_account_filtered_readback(tmp_path):
+    seed, original, uap, _ = make(ONE)
+    assert seed.run().failures == 0
+    original.target_sets[0]["secret_id"] = "wrong-secret"
+
+    class NoOpTargetSIA(FakeSIA):
+        def update_target_set(self, name, payload):
+            self.calls.append(("update_target_set", (name, payload)))
+            return copy.deepcopy(self.target_sets[0])
+
+    sia = NoOpTargetSIA(copy.deepcopy(original.secrets), copy.deepcopy(original.target_sets))
+    checkpoint = Checkpoint(tmp_path / "checkpoint.jsonl")
+    result = make(ONE, sia=sia, uap=uap, update=True, status_polls=2, checkpoint=checkpoint)[0].run()
+    outcome = result.servers[0].target_set
+
+    assert outcome.status == "unverified" and outcome.ref
+    assert "did not return the requested target set" in outcome.detail
+    assert outcome.diagnostic["mutation_state"] == "applied"
+    update_index = next(i for i, call in enumerate(sia.calls) if call[0] == "update_target_set")
+    assert [call[1] for call in sia.calls[update_index + 1:] if call[0] == "list_target_sets"] == [
+        ("sec-1", "web01.corp.example.com"), ("sec-1", "web01.corp.example.com")]
+    assert checkpoint.done_count() == 0
+
+
+def test_target_set_readback_retries_transient_failure_then_converges():
+    seed, original, uap, _ = make(ONE)
+    assert seed.run().failures == 0
+    original.target_sets[0]["secret_id"] = "wrong-secret"
+
+    class TransientReadFailureSIA(FakeSIA):
+        pending = None
+        failed_once = False
+
+        def update_target_set(self, name, payload):
+            self.calls.append(("update_target_set", (name, payload)))
+            self.pending = (name, copy.deepcopy(payload))
+            return copy.deepcopy(self.target_sets[0])
+
+        def list_target_sets(self, **kwargs):
+            if self.pending and not self.failed_once:
+                self.failed_once = True
+                raise SIAApiError("GET", "/api/targetsets", 503, "temporarily unavailable")
+            if self.pending:
+                name, payload = self.pending
+                next(row for row in self.target_sets if row["name"] == name).update(payload)
+                self.pending = None
+            return super().list_target_sets(**kwargs)
+
+    sia = TransientReadFailureSIA(copy.deepcopy(original.secrets), copy.deepcopy(original.target_sets))
+    result = make(ONE, sia=sia, uap=uap, update=True, status_polls=2)[0].run()
+
+    assert result.servers[0].target_set.status == "updated"
+    assert sia.target_sets[0]["secret_id"] == "sec-1"
+
+
+def test_target_set_accepted_state_survives_readback_interruption(tmp_path):
+    seed, original, uap, _ = make(ONE)
+    assert seed.run().failures == 0
+    original.target_sets[0]["secret_id"] = "wrong-secret"
+
+    class InterruptedReadbackSIA(FakeSIA):
+        updated = False
+
+        def update_target_set(self, name, payload):
+            self.calls.append(("update_target_set", (name, payload)))
+            self.updated = True
+            return copy.deepcopy(self.target_sets[0])
+
+        def list_target_sets(self, **kwargs):
+            if self.updated:
+                raise KeyboardInterrupt
+            return super().list_target_sets(**kwargs)
+
+    checkpoint = Checkpoint(tmp_path / "checkpoint.jsonl")
+    sia = InterruptedReadbackSIA(copy.deepcopy(original.secrets), copy.deepcopy(original.target_sets))
+    rec = make(ONE, sia=sia, uap=uap, update=True, checkpoint=checkpoint)[0]
+
+    with pytest.raises(KeyboardInterrupt) as raised:
+        rec.run()
+    result = raised.value.partial_result
+    outcome = result.servers[0].target_set
+    assert outcome.status == "unverified" and outcome.ref == "web01.corp.example.com"
+    assert outcome.diagnostic["mutation_state"] == "applied"
+    assert result.incomplete and result.interrupted and checkpoint.done_count() == 0

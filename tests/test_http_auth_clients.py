@@ -49,6 +49,46 @@ def test_platform_token_fetch_cache_and_refresh():
     assert redact(f"leak {token1} and pw-1234") == "leak *** and ***"  # tokens and secret are registered for redaction
 
 
+@pytest.mark.parametrize("lifetime", [60, 20])
+def test_platform_short_lived_token_is_cached_until_half_its_lifetime(lifetime):
+    now = [1000.0]
+    session = FakeSession([
+        FakeResponse(200, {"access_token": "short-token-1", "expires_in": lifetime}),
+        FakeResponse(200, {"access_token": "short-token-2", "expires_in": lifetime}),
+    ])
+    provider = PlatformTokenProvider("https://abc.id.cyberark.cloud", "svc", "pw-1234",
+                                     session=session, clock=lambda: now[0])
+
+    assert provider() == "short-token-1"
+    assert provider() == "short-token-1"
+    now[0] += lifetime / 2 - 0.001
+    assert provider() == "short-token-1"
+    assert len(session.requests) == 1
+
+    now[0] += 0.001
+    assert provider() == "short-token-2"
+    assert len(session.requests) == 2
+
+
+def test_platform_long_lived_token_refreshes_at_sixty_seconds_before_expiry_and_on_force():
+    now = [1000.0]
+    session = FakeSession([
+        FakeResponse(200, {"access_token": "long-token-1", "expires_in": 900}),
+        FakeResponse(200, {"access_token": "long-token-2", "expires_in": 900}),
+        FakeResponse(200, {"access_token": "long-token-3", "expires_in": 900}),
+    ])
+    provider = PlatformTokenProvider("https://abc.id.cyberark.cloud", "svc", "pw-1234",
+                                     session=session, clock=lambda: now[0])
+
+    assert provider() == "long-token-1"
+    now[0] = 1839.999
+    assert provider() == "long-token-1"
+    now[0] = 1840.0
+    assert provider() == "long-token-2"
+    assert provider(force=True) == "long-token-3"
+    assert len(session.requests) == 3
+
+
 def test_platform_token_errors_do_not_leak_secret():
     session = FakeSession([FakeResponse(401, {"error": "invalid_client", "error_description": "bad creds super-secret-pw"})])
     provider = PlatformTokenProvider("https://abc.id.cyberark.cloud", "svc@acme", "super-secret-pw", session=session)
@@ -78,6 +118,28 @@ def test_service_user_oidc_flow():
     assert kw2["params"] == {"client_id": "__idaptive_cybr_user_oidc", "response_type": "id_token",
                              "scope": "openid profile api", "redirect_uri": "https://cyberark.cloud/redirect"}
     assert redact("access-1234") == "***"
+
+
+def test_service_user_oidc_uses_id_token_expiry_for_refresh_threshold():
+    now = [1000.0]
+    id_token1 = make_jwt({"exp": 1040, "unique_name": "svc@acme"})
+    id_token2 = make_jwt({"exp": 1080, "unique_name": "svc@acme"})
+    session = FakeSession([
+        FakeResponse(200, {"access_token": "access-1"}),
+        FakeResponse(302, "", {"Location": f"https://cyberark.cloud/redirect#id_token={id_token1}"}),
+        FakeResponse(200, {"access_token": "access-2"}),
+        FakeResponse(302, "", {"Location": f"https://cyberark.cloud/redirect#id_token={id_token2}"}),
+    ])
+    provider = ServiceUserOIDCTokenProvider("https://abc.id.cyberark.cloud", "svc@acme", "pw-1234",
+                                            session=session, clock=lambda: now[0])
+
+    assert provider() == id_token1
+    now[0] = 1019.999
+    assert provider() == id_token1
+    assert len(session.requests) == 2
+    now[0] = 1020.0
+    assert provider() == id_token2
+    assert len(session.requests) == 4
 
 
 def test_service_user_oidc_errors():
@@ -470,3 +532,19 @@ def test_service_user_oidc_accepts_a_non_latin1_secret():
     assert provider() == id_token
     header = session.requests[0][2]["headers"]["Authorization"]
     assert base64.b64decode(header.removeprefix("Basic ")).decode("utf-8") == f"svc@acme:{secret}"
+
+
+def test_identity_client_role_query_wire_contract():
+    client, session = http_with([
+        FakeResponse(200, {"success": True, "Result": {"roles": {"Results": [{"Row": {"Name": "R1", "_ID": "r1"}}]}}}),
+        FakeResponse(200, {"success": True, "Result": {"Roles": {"Results": [{"Row": {"Name": "R2", "_ID": "r2"}}]}}}),
+    ])
+    ident = IdentityClient(client, "https://abc.id.cyberark.cloud")
+    assert ident.query_roles("R1", ["u1"]) == [{"Name": "R1", "_ID": "r1"}]
+    assert session.requests[0][:2] == ("POST", "https://abc.id.cyberark.cloud/UserMgmt/DirectoryServiceQuery")
+    body = session.requests[0][2]["json"]
+    assert body["directoryServices"] == ["u1"]
+    assert json.loads(body["roles"]) == {"Name": {"_like": {"value": "R1", "ignoreCase": True}}}   # the SDK's role filter
+    assert "group" not in body and "user" not in body
+    assert body["Args"]["PageNumber"] == 1 and body["Args"]["PageSize"] == 200
+    assert ident.query_roles("R2", ["u1"]) == [{"Name": "R2", "_ID": "r2"}]   # the documented capitalised container

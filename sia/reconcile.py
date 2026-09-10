@@ -4,7 +4,7 @@ Units of work
   * one strong account per referenced account row (shared by every server that names it);
   * one target set per distinct target-set name: normally that is one per Windows server (FQDN), but a "Domain" set
     covers every server in one AD domain, so its outcome is copied to all of them;
-  * one access policy per servers.csv row (a server may have several, e.g. one per Identity group).
+  * one access policy per servers.csv row (a server may have several, e.g. one per Identity role or group).
 
 Safety rules
   * dry_run computes everything and writes nothing.
@@ -79,8 +79,17 @@ class WriteCancelled(ReconcileError):
     mutation_state = "not_applied"
 
 
+def _principal_summary(policy: dict) -> list[str]:
+    """`name (TYPE)` per principal, sorted, so a drift line says which principals changed and of what kind."""
+    return sorted(f"{p.get('name') or p.get('id') or '?'} ({str(p.get('type') or '?').upper()})"
+                  for p in policy.get("principals") or [] if isinstance(p, dict))
+
+
 def _policy_change_values(key: str, current: dict, desired: dict) -> str:
     """Compact, named before/after values for the settings an operator can change."""
+    if key == "principals":
+        before, after = _principal_summary(current), _principal_summary(desired)
+        return f" ({', '.join(before) or 'none'} -> {', '.join(after) or 'none'})" if before != after else ""
     paths = {
         "description": [("description", ("metadata", "description"))],
         "time_zone": [("time zone", ("metadata", "timeZone"))],
@@ -443,16 +452,16 @@ class Reconciler:
         self._principal_errors = {}
         if not self._writes("policies"):
             return
-        groups = dict.fromkeys(group for server, _ in self._rows for group in server.groups)
-        for group in groups:
+        names = dict.fromkeys(name for server, _ in self._rows for name in server.principals)
+        for name in names:
             try:
-                self.resolver.resolve(group)
+                self.resolver.resolve(name)
             except ResolveError as exc:
-                # A valid empty search is a known per-row missing group. A
+                # A valid empty search is a known per-row missing principal. A
                 # malformed/ambiguous directory result cannot authorize a write.
                 if "not found" not in str(exc).lower():
                     raise
-                self._principal_errors[group.casefold()] = exc
+                self._principal_errors[name.casefold()] = exc
 
     def _snapshot_target_sets(self, names: list[str], accounts: list[StrongAccountRow]) -> None:
         self._target_sets = {}
@@ -503,15 +512,18 @@ class Reconciler:
             self._policy_list = self.uap.list_policies(filter_query=filter_query)
         self._policies = self._policies_by_name(self._policy_list)
         wanted = {sr.policy_name.casefold() for _, sr in self._rows}
-        required = ("principals", "targets", "conditions", "behavior") if self.drift else ("targets",)
+        required = ("principals", "targets", "conditions", "behavior")
         incomplete = []
         for name in sorted(wanted):
             policy = self._policies.get(name)
-            if policy is not None and (self.drift or self.set_policy_status is not None or policy.get("principals") is None):
-                if any(policy.get(key) is None for key in required):
-                    incomplete.append(name)
+            if policy is not None and policy.get("principals") is None:
+                incomplete.append(name)
+            elif policy is not None and self.drift and any(policy.get(key) is None for key in required):
+                incomplete.append(name)
         # One GET per existing policy: with --drift over a large tenant this dominates the snapshot, so fan out.
-        fetched = self._parallel(incomplete, lambda n: self._full_policy(self._policies[n], force=self.drift))
+        # A principal-less list projection must also bypass _full_policy's targets-only shortcut: principals are part
+        # of the lightweight safety check, so their absence is not permission to report the policy as up to date.
+        fetched = self._parallel(incomplete, lambda n: self._full_policy(self._policies[n], force=True))
         for name, full in zip(incomplete, fetched, strict=True):
             self._policies[name] = full
         if any(sr.policy_name.casefold() not in self._policies for _, sr in self._rows):
@@ -564,6 +576,16 @@ class Reconciler:
         diagnostic = diagnose(exc, stage=stage, object_name=object_name,
                               mutation_state=mutation_state).to_dict()
         return Outcome(status, f"{detail}: {exc}", ref, diagnostic)
+
+    @staticmethod
+    def _applied_unverified(detail: str, *, stage: str, object_name: str, ref: str) -> Outcome:
+        """A write was accepted, but its read-back did not prove that the requested state converged."""
+        diagnostic = Diagnostic(
+            code="SIA-API-RESPONSE", message=detail, stage=stage, object_name=object_name,
+            mutation_state="applied",
+            actions=("Run plan --drift to reconcile the current tenant state before retrying the write.",),
+        ).to_dict()
+        return Outcome("unverified", detail, ref, diagnostic)
 
     def _tick(self, stage: str, total: int) -> None:
         if not self.progress_every:
@@ -1030,7 +1052,6 @@ class Reconciler:
                 if pending.target_set_key == server.target_set_key:
                     pending.target_set = Outcome("uncertain", "Target-set update started; response not yet confirmed", name)
             self.sia.update_target_set(name, desired)
-            return Outcome("updated", f"updated target set {name}: {summary}", name)
         except WriteCancelled:
             return self._blocked_by_abort()
         except SIAApiError as exc:
@@ -1039,6 +1060,65 @@ class Reconciler:
             return self._exception_outcome(
                 self._error_status(exc), "update failed", exc,
                 stage="target set update", object_name=name, ref=name)
+        accepted = self._applied_unverified(
+            f"Target-set update for {name} was accepted; read-back not yet complete",
+            stage="target set read-back", object_name=name, ref=name)
+        for _, pending in self._rows:
+            if pending.target_set_key == server.target_set_key:
+                pending.target_set = Outcome(
+                    accepted.status, accepted.detail, accepted.ref, accepted.diagnostic)
+        try:
+            read_back, mismatch = self._poll_target_set(name, desired, secret_id)
+        except SIAApiError as exc:
+            return self._exception_outcome(
+                "unverified", f"target set {name} update was accepted, but read-back failed", exc,
+                stage="target set read-back", object_name=name, ref=name, mutation_state="applied")
+        if mismatch:
+            return self._applied_unverified(
+                f"target set {name} update was accepted, but read-back {mismatch}",
+                stage="target set read-back", object_name=name, ref=name)
+        assert read_back is not None
+        return Outcome("updated", f"updated target set {name}: {summary}", name)
+
+    def _poll_target_set(self, name: str, desired: dict[str, Any], secret_id: str) -> tuple[dict[str, Any] | None, str]:
+        """Read an updated target set until its exact name and normalized writable fields match the PUT payload."""
+        wanted_name = name.casefold()
+        wanted_signature = self._verified_target_set_signature(desired)
+        last_mismatch = "did not return the requested target set"
+        for attempt in range(self.status_polls):
+            try:
+                rows = self.sia.list_target_sets(name=name, strong_account_id=secret_id)
+            except SIAApiError:
+                if attempt >= self.status_polls - 1:
+                    raise
+                self._sleep(POLICY_STATUS_POLL_SECONDS)
+                continue
+            exact = [row for row in rows
+                     if str(pick(row, "name", default="")).casefold() == wanted_name]
+            if len(exact) == 1:
+                try:
+                    actual_signature = self._verified_target_set_signature(exact[0])
+                except (AttributeError, TypeError, ValueError):
+                    last_mismatch = "returned a malformed target-set object"
+                else:
+                    if actual_signature == wanted_signature:
+                        return exact[0], ""
+                    changed = [key.replace("_", " ") for key in wanted_signature
+                               if actual_signature.get(key) != wanted_signature[key]]
+                    last_mismatch = "still differs in " + ", ".join(changed)
+            elif len(exact) > 1:
+                last_mismatch = f"returned {len(exact)} exact-name matches"
+            if attempt < self.status_polls - 1:
+                self._sleep(POLICY_STATUS_POLL_SECONDS)
+        return None, last_mismatch
+
+    @staticmethod
+    def _verified_target_set_signature(target_set: dict[str, Any]) -> dict[str, Any]:
+        """Normalize a target set without coercing malformed certificate-validation values to truthy booleans."""
+        for key in ("enable_certificate_validation", "enableCertificateValidation"):
+            if key in target_set and not isinstance(target_set[key], bool):
+                raise TypeError(f"{key} is not a boolean")
+        return target_set_signature(target_set)
 
     def _bulk_create(self, queue: dict[str, list[dict[str, Any]]], queued: dict[str, list[ServerResult]]) -> None:
         total = sum(len(sets) for sets in queue.values())
@@ -1103,10 +1183,10 @@ class Reconciler:
                 sr.policy = Outcome("skipped", f"disabled by --only {self.only}")
                 continue
             try:
-                for group in server.groups:
-                    if group.casefold() in self._principal_errors:
-                        raise self._principal_errors[group.casefold()]
-                principals = [self.resolver.resolve(g) for g in server.groups]
+                for name in server.principals:
+                    if name.casefold() in self._principal_errors:
+                        raise self._principal_errors[name.casefold()]
+                principals = [self.resolver.resolve(name) for name in server.principals]
                 desired = build_policy(server, principals, self.defaults, self._template)
                 if self.set_policy_status is not None:
                     desired["metadata"]["status"] = {"status": self.set_policy_status}
@@ -1128,7 +1208,7 @@ class Reconciler:
                 sr.policy = self._blocked_by_abort()
                 continue
             if self.dry_run:
-                sr.policy = Outcome("planned", f"would create {server.protocol.upper()} policy for [{', '.join(server.groups)}] -> {server.fqdn}")
+                sr.policy = Outcome("planned", f"would create {server.protocol.upper()} policy for [{', '.join(server.principals)}] -> {server.fqdn}")
                 continue
             create.append((server, sr, desired))
         self._execute(compare, self._compare_policy, stage="policies (existing)", canary=False)
@@ -1144,7 +1224,7 @@ class Reconciler:
         if self._abort_reason:
             sr.policy = self._blocked_by_abort()
             return
-        groups = ", ".join(server.groups)
+        principals = ", ".join(server.principals)
         try:
             self.check_cancelled()
             sr.policy = Outcome("uncertain", "Policy create started; response not yet confirmed")
@@ -1165,24 +1245,31 @@ class Reconciler:
             return
         with self._lock:
             self._policies[sr.policy_name.casefold()] = {**desired, "metadata": {**desired["metadata"], "policyId": policy_id}}
-        sr.policy = Outcome("unverified", "Policy create accepted; read-back not yet complete", policy_id,
-                            Diagnostic(code="SIA-API-RESPONSE", message="Policy create accepted; read-back not yet complete.",
-                                       mutation_state="applied").to_dict())
+        sr.policy = self._applied_unverified(
+            "Policy create accepted; read-back not yet complete",
+            stage="policy read-back", object_name=sr.policy_name, ref=policy_id)
+        expected_status = self.set_policy_status or self.defaults.policy_status
         try:
-            status, description = self._poll_status(policy_id)
+            _read_back, status, description, mismatch = self._poll_policy(policy_id, desired, expected_status)
         except SIAApiError as exc:
             sr.policy = self._exception_outcome(
                 "unverified", f"policy {policy_id} may have been created, but read-back failed", exc,
                 stage="policy read-back", object_name=sr.policy_name, ref=policy_id, mutation_state="applied")
             self._checkpoint_row(server, sr)
             return
-        detail = f"{server.protocol.upper()} policy {policy_id} for [{groups}], status={status}"
+        detail = f"{server.protocol.upper()} policy {policy_id} for [{principals}], status={status}"
         if status.lower() == "error":
             sr.policy = Outcome("failed", f"{detail}: {description}", policy_id)
-        elif status != (self.set_policy_status or self.defaults.policy_status):
+        elif status != expected_status or mismatch:
             suffix = f": {description}" if description else ""
-            sr.policy = Outcome("unverified", f"{detail}{suffix}; requested status was "
-                                              f"{self.set_policy_status or self.defaults.policy_status}", policy_id)
+            problems = []
+            if status != expected_status:
+                problems.append(f"requested status was {expected_status}")
+            if mismatch:
+                problems.append(f"read-back {mismatch}")
+            sr.policy = self._applied_unverified(
+                f"{detail}{suffix}; " + "; ".join(problems),
+                stage="policy read-back", object_name=sr.policy_name, ref=policy_id)
         else:
             sr.policy = Outcome("created", detail, policy_id)
         self._checkpoint_row(server, sr)
@@ -1215,14 +1302,19 @@ class Reconciler:
         full = existing
         wants_full = self.drift or self.set_policy_status is not None or renamed or existing.get("principals") is None
         required_blocks = ("principals", "targets", "conditions", "behavior") if self.drift else ("targets",)
-        if wants_full and any(existing.get(key) is None for key in required_blocks):
+        missing_principals = existing.get("principals") is None
+        if missing_principals or (wants_full and any(existing.get(key) is None for key in required_blocks)):
             try:
-                full = self._full_policy(existing, force=self.drift)
+                full = self._full_policy(existing, force=True)
             except SIAApiError as exc:
                 sr.policy = self._exception_outcome(
                     "failed", f"could not read existing policy {policy_id}", exc,
                     stage="policy lookup", object_name=sr.policy_name, ref=policy_id)
                 return
+        if full.get("principals") is None:
+            sr.policy = Outcome("unverified", f"policy {policy_id} full response is missing principals; "
+                                                 "cannot confirm who has access or safely update", policy_id)
+            return
         if self.drift and any(full.get(key) is None for key in required_blocks):
             missing = ", ".join(key for key in required_blocks if full.get(key) is None)
             sr.policy = Outcome("unverified", f"policy {policy_id} full response is missing {missing}; cannot confirm settings or safely update", policy_id)
@@ -1285,13 +1377,21 @@ class Reconciler:
         if self._abort_reason:
             sr.policy = self._blocked_by_abort()
             return
+        expected_status = self.set_policy_status or (
+            status if status in ("Active", "Suspended") else self.defaults.policy_status)
         if self.dry_run:
-            sr.policy = Outcome("planned", f"would update policy {policy_id}: {summary}", policy_id)
+            status_change = ""
+            if self.set_policy_status is None and status not in ("Active", "Suspended"):
+                status_change = f"; status {status or 'unknown'} -> {expected_status}"
+            sr.policy = Outcome("planned", f"would update policy {policy_id}: {summary}{status_change}", policy_id)
             return
+        # Validating, Warning and Error are platform-owned observations, not valid requested states. A corrective
+        # update asks for the configured stable state; Active/Suspended are preserved unless explicitly overridden.
+        update_payload = build_policy_update(full, desired, status=expected_status)
         try:
             self.check_cancelled()
             sr.policy = Outcome("uncertain", "Policy update started; response not yet confirmed", policy_id)
-            self.uap.update_policy(policy_id, build_policy_update(full, desired, status=self.set_policy_status))
+            self.uap.update_policy(policy_id, update_payload)
         except WriteCancelled:
             sr.policy = self._blocked_by_abort()
             return
@@ -1302,11 +1402,12 @@ class Reconciler:
             if self._systematic(exc):
                 self._abort(f"updating policy {sr.policy_name!r}: {exc}")
             return
-        sr.policy = Outcome("unverified", "Policy update accepted; read-back not yet complete", policy_id,
-                            Diagnostic(code="SIA-API-RESPONSE", message="Policy update accepted; read-back not yet complete.",
-                                       mutation_state="applied").to_dict())
+        sr.policy = self._applied_unverified(
+            "Policy update accepted; read-back not yet complete",
+            stage="policy read-back", object_name=sr.policy_name, ref=policy_id)
         try:
-            read_status, description = self._poll_status(policy_id)
+            _read_back, read_status, description, mismatch = self._poll_policy(
+                policy_id, update_payload, expected_status)
         except SIAApiError as exc:
             sr.policy = self._exception_outcome(
                 "unverified", f"policy {policy_id} update was accepted, but read-back failed", exc,
@@ -1315,28 +1416,67 @@ class Reconciler:
         detail = f"policy {policy_id}: {summary}; status={read_status}"
         if read_status.lower() == "error":
             sr.policy = Outcome("failed", f"{detail}: {description}", policy_id)
+        elif read_status != expected_status or mismatch:
+            suffix = f": {description}" if description else ""
+            problems = []
+            if read_status != expected_status:
+                problems.append(f"requested status was {expected_status}")
+            if mismatch:
+                problems.append(f"read-back {mismatch}")
+            sr.policy = self._applied_unverified(
+                f"{detail}{suffix}; " + "; ".join(problems),
+                stage="policy read-back", object_name=sr.policy_name, ref=policy_id)
         elif read_status not in ("Active", "Suspended"):
             suffix = f": {description}" if description else ""
-            sr.policy = Outcome("unverified", f"{detail}{suffix}", policy_id)
-        elif self.set_policy_status is not None and read_status != self.set_policy_status:
-            sr.policy = Outcome("unverified", f"{detail}; requested status was {self.set_policy_status}", policy_id)
+            sr.policy = self._applied_unverified(
+                f"{detail}{suffix}", stage="policy read-back", object_name=sr.policy_name, ref=policy_id)
         elif self.set_policy_status is None and read_status == "Suspended" and not self.suspended_ok:
             sr.policy = Outcome("inactive", f"{detail}; fields were updated but the existing suspended state was preserved", policy_id)
         else:
             sr.policy = Outcome("updated", detail, policy_id)
 
-    def _poll_status(self, policy_id: str) -> tuple[str, str]:
+    def _poll_policy(self, policy_id: str, desired: dict[str, Any],
+                     expected_status: str) -> tuple[dict[str, Any], str, str, str]:
+        """Poll until a policy's status and normalized writable fields both match the submitted payload."""
+        policy: dict[str, Any] = {}
         status, description = "unknown", ""
+        mismatch = "returned no policy state"
+        desired_signature = policy_signature(desired)
         for attempt in range(self.status_polls):
-            policy = self.uap.get_policy(policy_id)
-            st = ((policy.get("metadata") or {}).get("status") or {})
-            if isinstance(st, str):
-                status, description = st.capitalize(), ""
+            try:
+                policy = self.uap.get_policy(policy_id)
+            except SIAApiError:
+                if attempt >= self.status_polls - 1:
+                    raise
+                self._sleep(POLICY_STATUS_POLL_SECONDS)
+                continue
+            try:
+                metadata = policy.get("metadata")
+                if not isinstance(metadata, dict):
+                    raise TypeError("metadata is not an object")
+                returned_id = pick(metadata, "policyId", "policy_id")
+                if str(returned_id or "") != str(policy_id):
+                    raise ValueError("policy id does not match the requested object")
+                st = metadata.get("status")
+                if st is None:
+                    st = {}
+                if isinstance(st, str):
+                    status, description = st.capitalize(), ""
+                elif isinstance(st, dict):
+                    status = str(st.get("status") or "unknown").capitalize()
+                    description = str(st.get("statusDescription") or st.get("status_description") or "")
+                else:
+                    raise TypeError("status is not text or an object")
+                actual_signature = policy_signature(policy)
+            except (AttributeError, TypeError, ValueError):
+                status, description = "unknown", ""
+                mismatch = "returned a malformed policy object"
             else:
-                status = str(st.get("status") or "unknown").capitalize()
-                description = str(st.get("statusDescription") or st.get("status_description") or "")
-            if status.lower() != "validating":
+                changed = [key.replace("_", " ") for key in desired_signature
+                           if actual_signature.get(key) != desired_signature[key]]
+                mismatch = "still differs in " + ", ".join(changed) if changed else ""
+            if status.lower() == "error" or (status == expected_status and not mismatch):
                 break
             if attempt < self.status_polls - 1:
                 self._sleep(POLICY_STATUS_POLL_SECONDS)
-        return status, description
+        return policy, status, description, mismatch

@@ -87,6 +87,8 @@ def defaults_table(**overrides) -> str:
     ({"strong_account_safe_template": '"{safe}"'}, "strong_account_safe_template"),
     ({"strong_account_domain": '""'}, "strong_account_domain"),
     ({"description_template": '"{proto}"'}, "description_template"),
+    ({"principal_type": '"user"'}, "principal_type must be one of role, group"),
+    ({"group_template": '""'}, r"unknown key\(s\): group_template \('group_template' was renamed to 'principal_template'"),
 ])
 def test_invalid_defaults_rejected(tmp_path, overrides, fragment):
     with pytest.raises(ConfigError, match=fragment):
@@ -277,16 +279,18 @@ def test_password_file(tmp_path, caplog):
         assert "readable by other users" in caplog.text
 
 
-def test_group_template_and_target_set_scope(tmp_path):
-    cfg = load_config(make(tmp_path, 'group_template = "SIA-{hostname_upper}-RDP"\ntarget_set_scope = "auto"\n'))
-    assert cfg.defaults.group_template == "SIA-{hostname_upper}-RDP" and cfg.defaults.target_set_scope == "auto"
+def test_principal_template_and_target_set_scope(tmp_path):
+    cfg = load_config(make(tmp_path, 'principal_template = "SIA-{hostname_upper}-RDP"\ntarget_set_scope = "auto"\n'))
+    assert cfg.defaults.principal_template == "SIA-{hostname_upper}-RDP" and cfg.defaults.target_set_scope == "auto"
     assert load_config(make(tmp_path)).defaults.target_set_scope == "server"      # unchanged default
-    assert load_config(make(tmp_path)).defaults.group_template == ""
+    assert load_config(make(tmp_path)).defaults.principal_template == ""
+    assert load_config(make(tmp_path)).defaults.principal_type == "role"                       # roles by default
+    assert load_config(make(tmp_path, 'principal_type = "group"\n')).defaults.principal_type == "group"
 
 
 @pytest.mark.parametrize("defaults_extra, fragment", [
     ('target_set_scope = "everything"\n', "target_set_scope must be one of"),
-    ('group_template = "SIA-{server}"\n', "group_template may only use"),
+    ('principal_template = "SIA-{server}"\n', "principal_template may only use"),
     ('strong_account_domain = "{nope}"\n', "strong_account_domain may only use"),
 ])
 def test_new_defaults_validation(tmp_path, defaults_extra, fragment):
@@ -372,7 +376,7 @@ def test_urls_time_zone_and_stray_template_braces_are_validated(tmp_path):
         load_config(make(tmp_path, other_sections='[pvwa]\nbase_url = "https://good.example\\nignored.example"\n'))
     assert load_config(make(tmp_path, other_sections='[pvwa]\nbase_url = "https://pvwa:8443"\n')).pvwa.enabled
     with pytest.raises(ConfigError, match="not a valid template"):
-        load_config(make(tmp_path, 'group_template = "SIA-{hostname}}"\n'))
+        load_config(make(tmp_path, 'principal_template = "SIA-{hostname}}"\n'))
 
 
 def test_config_relative_file_paths_resolve_beside_config(tmp_path):
@@ -484,8 +488,8 @@ def test_identity_url_rejects_empty_delimiters_trailing_slash_and_bad_port(tmp_p
 
 
 @pytest.mark.parametrize("extra, fragment", [
-    ('group_template = "{hostname!r}"\n', "conversions"),
-    ('group_template = "{hostname:>20}"\n', "format specifications"),
+    ('principal_template = "{hostname!r}"\n', "conversions"),
+    ('principal_template = "{hostname:>20}"\n', "format specifications"),
     ("policy_tags = [" + ", ".join(f'\"tag{i}\"' for i in range(20)) + "]\n", "maximum is 20"),
 ])
 def test_template_operators_and_effective_tag_limit_are_rejected(tmp_path, extra, fragment):

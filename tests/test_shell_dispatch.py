@@ -47,7 +47,7 @@ def test_explicit_child_flags_and_project_paths_are_forwarded(monkeypatch, tmp_p
 
     def home(args, current_session, run):
         assert run(["plan", "--server", "web01.example.com", "--server", "web02.example.com",
-                    "--group", "RDP Operators", "--workers", "3", "--only", "policies",
+                    "--principal", "RDP Operators", "--workers", "3", "--only", "policies",
                     "--update", "--set-policy-status", "Suspended", "--input", "another input",
                     "--config", "override.toml", "--json"]) == 7
         return 0
@@ -65,7 +65,7 @@ def test_explicit_child_flags_and_project_paths_are_forwarded(monkeypatch, tmp_p
     assert child.report_dir == str(tmp_path / "reports")
     assert child.ca_bundle == str(tmp_path / "ca.pem") and child.verbose
     assert child.server == ["web01.example.com", "web02.example.com"]
-    assert child.group == ["RDP Operators"] and child.workers == 3
+    assert child.principal == ["RDP Operators"] and child.workers == 3
     assert child.only == "policies" and child.update and child.set_policy_status == "Suspended"
     assert child.input == "another input" and child.json
 

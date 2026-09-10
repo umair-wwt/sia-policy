@@ -3,16 +3,19 @@ from dataclasses import replace
 
 import pytest
 
-from sia.checkpoint import Checkpoint
+from sia.checkpoint import CHECKPOINT_VERSION, Checkpoint
 from sia.config import Defaults
 from sia.http import SIAApiError
 from sia.inputs import GroupRow, Inputs, ServerRow, StrongAccountRow
 from sia.reconcile import ReconcileError, Reconciler
 from sia.report import result_dict
 from sia.resolve import PrincipalResolver, ResolveError, SecretIndex
-from tests.fakes import AD_UUID, CDS_UUID, FakeIdentity, FakePVWA, FakeSIA, FakeUAP, group_row
+from tests.fakes import AD_UUID, CDS_UUID, FakeIdentity, FakePVWA, FakeSIA, FakeUAP, group_row, role_row
 
 DEFAULTS = Defaults(time_zone="America/New_York")
+GROUP_DEFAULTS = replace(DEFAULTS, principal_type="group")   # the pre-roles behaviour, still selectable
+WEB_ADMINS_ROLE = {"id": "role-SIA-Web-Admins", "name": "SIA-Web-Admins", "type": "ROLE",
+                   "sourceDirectoryId": CDS_UUID, "sourceDirectoryName": "CyberArk Cloud Directory"}
 OWNER = "sia-policy-automation"
 OWNED_FILTER = "((targetCategory eq 'VM') and (policyTags eq 'sia-policy-automation'))"
 MARK = "[managed-by:sia-policy-automation]"
@@ -26,10 +29,10 @@ def sa(name, kind, **kw):
     return StrongAccountRow(name=name, type=kind, **base)
 
 
-def srv(fqdn, account, groups, **kw):
+def srv(fqdn, account, principals, **kw):
     base = dict(policy_name=None, assign_groups=None, domain=None, description=None, line=2)
     base.update(kw)
-    return ServerRow(fqdn=fqdn, strong_account=account, groups=tuple(groups), **base)
+    return ServerRow(fqdn=fqdn, strong_account=account, principals=tuple(principals), **base)
 
 
 def inputs(servers, accounts, groups=None):
@@ -60,7 +63,7 @@ def make(inp=STANDARD, sia=None, uap=None, identity=None, *, dry_run=False, upda
     uap = uap or FakeUAP()
     identity = identity or FakeIdentity()
     passwords = {"SIA_SA_SA_DMZ_PASSWORD": "pw-secret"} if passwords is None else passwords
-    resolver = PrincipalResolver(identity, inp.pinned_directory)
+    resolver = PrincipalResolver(identity, inp.pinned_directory, principal_type=defaults.principal_type)
     rec = Reconciler(sia=sia, uap=uap, resolver=resolver, inputs=inp, defaults=defaults, dry_run=dry_run, update=update,
                      only=only, get_password=lambda a: passwords.get(a.password_env or "") or passwords.get(a.name),
                      sleep=lambda s: None, fail_fast=fail_fast, adopt=adopt, adopt_all=adopt_all, workers=workers,
@@ -77,32 +80,68 @@ def calls(fake, name):
 
 
 # ------------------------------------------------------------- resolver
-def test_resolver_builds_principal_and_caches():
+def test_resolver_builds_role_principal_and_caches():
     identity = FakeIdentity()
-    resolver = PrincipalResolver(identity)
-    p = resolver.resolve("SIA-Web-Admins")
-    assert p == {"id": f"id-SIA-Web-Admins-{CDS_UUID[:4]}", "name": "SIA-Web-Admins", "type": "GROUP",
-                 "sourceDirectoryId": CDS_UUID, "sourceDirectoryName": "CyberArk Cloud Directory"}
+    resolver = PrincipalResolver(identity)                      # principal_type defaults to "role"
+    assert resolver.principal_type == "role"
+    assert resolver.resolve("SIA-Web-Admins") == WEB_ADMINS_ROLE
+    assert identity.role_directories == [[CDS_UUID]]            # roles are looked up in the Cloud Directory only
     resolver.resolve("sia-web-admins")
     assert identity.queries == ["SIA-Web-Admins"]
     resolver.resolve("SIA-Web-Admins")
     assert len(identity.queries) == 1  # cached by case-insensitive identity
+    with pytest.raises(ValueError, match="principal_type must be one of role, group"):
+        PrincipalResolver(identity, principal_type="user")
+
+
+def test_resolver_builds_group_principal_when_configured():
+    identity = FakeIdentity()
+    resolver = PrincipalResolver(identity, principal_type="group")
+    assert resolver.resolve("SIA-Web-Admins") == {
+        "id": f"id-SIA-Web-Admins-{CDS_UUID[:4]}", "name": "SIA-Web-Admins", "type": "GROUP",
+        "sourceDirectoryId": CDS_UUID, "sourceDirectoryName": "CyberArk Cloud Directory"}
+    assert identity.role_directories == []                      # no role query was issued
+    resolver.resolve("sia-web-admins")
+    assert identity.queries == ["SIA-Web-Admins"]
 
 
 def test_resolver_not_found_lists_similar():
-    resolver = PrincipalResolver(FakeIdentity([group_row("SIA-Web-Admins-Prod")]))
-    with pytest.raises(ResolveError, match=r"not found.*similar names: SIA-Web-Admins-Prod"):
+    resolver = PrincipalResolver(FakeIdentity(roles=[role_row("SIA-Web-Admins-Prod")]))
+    with pytest.raises(ResolveError, match=r"role 'SIA-Web-Admins' not found in Identity; similar names: SIA-Web-Admins-Prod"):
+        resolver.resolve("SIA-Web-Admins")
+    resolver = PrincipalResolver(FakeIdentity([group_row("SIA-Web-Admins-Prod")]), principal_type="group")
+    with pytest.raises(ResolveError, match=r"group 'SIA-Web-Admins' not found.*similar names: SIA-Web-Admins-Prod"):
         resolver.resolve("SIA-Web-Admins")
 
 
-def test_resolver_ambiguous_then_pinned():
+def test_role_resolver_rejects_duplicate_ids_and_incomplete_rows():
+    two_ids = FakeIdentity(roles=[role_row("Admins", "r-1"), role_row("Admins", "r-2"), role_row("Admins-Prod", "r-3")])
+    with pytest.raises(ResolveError, match="role 'Admins' is ambiguous \\(2 matches: r-1, r-2\\)") as exc:
+        PrincipalResolver(two_ids).resolve("Admins")
+    assert "not found" not in str(exc.value)                    # an ambiguity must stop the run, not fail one row
+    repeated = FakeIdentity(roles=[role_row("Admins", "r-1"), role_row("admins", "r-1")])
+    assert PrincipalResolver(repeated).resolve("ADMINS")["id"] == "r-1"
+    with pytest.raises(ResolveError, match="role 'Admins': Identity row lacks _ID"):
+        PrincipalResolver(FakeIdentity(roles=[{"Name": "Admins", "_ID": ""}])).resolve("Admins")
+
+
+def test_role_resolver_without_a_cds_directory_queries_every_directory():
+    identity = FakeIdentity()
+    identity.directories = [{"Service": "AdProxy", "directoryServiceUuid": AD_UUID, "DisplayName": "corp.example.com"}]
+    principal = PrincipalResolver(identity).resolve("SIA-Web-Admins")
+    assert identity.role_directories == [[AD_UUID]]
+    assert principal == {"id": "role-SIA-Web-Admins", "name": "SIA-Web-Admins", "type": "ROLE"}
+
+
+def test_group_resolver_ambiguous_then_pinned():
     rows = [group_row("Admins", CDS_UUID, "CyberArk Cloud Directory"), group_row("Admins", AD_UUID, "corp.example.com (AD)")]
     with pytest.raises(ResolveError, match="ambiguous"):
-        PrincipalResolver(FakeIdentity(rows)).resolve("Admins")
-    assert PrincipalResolver(FakeIdentity(rows), lambda g: "corp.example.com (AD)").resolve("Admins")["sourceDirectoryId"] == AD_UUID
-    assert PrincipalResolver(FakeIdentity(rows), lambda g: "AdProxy").resolve("Admins")["sourceDirectoryId"] == AD_UUID
+        PrincipalResolver(FakeIdentity(rows), principal_type="group").resolve("Admins")
+    assert PrincipalResolver(FakeIdentity(rows), lambda g: "corp.example.com (AD)",
+                             principal_type="group").resolve("Admins")["sourceDirectoryId"] == AD_UUID
+    assert PrincipalResolver(FakeIdentity(rows), lambda g: "AdProxy", principal_type="group").resolve("Admins")["sourceDirectoryId"] == AD_UUID
     with pytest.raises(ResolveError, match="not found in Identity in directory 'Nope'"):
-        PrincipalResolver(FakeIdentity(rows), lambda g: "Nope").resolve("Admins")
+        PrincipalResolver(FakeIdentity(rows), lambda g: "Nope", principal_type="group").resolve("Admins")
 
 
 def test_secret_index_is_deterministic():
@@ -173,7 +212,7 @@ def test_apply_creates_everything_then_is_idempotent():
     assert [p["metadata"]["name"] for p in policies] == [WEB01_FQDN, WEB02_FQDN, DMZ_FQDN]
     assert all(p["metadata"]["policyTags"] == ["automated", OWNER] for p in policies)
     assert all(p["metadata"]["status"] == {"status": "Active"} for p in policies)   # required by the API on create
-    assert [p["id"] for p in policies[1]["principals"]] == [f"id-SIA-Web-Admins-{CDS_UUID[:4]}", f"id-SIA-Platform-Ops-{CDS_UUID[:4]}"]
+    assert [p["id"] for p in policies[1]["principals"]] == ["role-SIA-Web-Admins", "role-SIA-Platform-Ops"]
     assert policies[1]["behavior"]["connectAs"]["rdp"]["localEphemeralUser"]["assignGroups"] == ["Remote Desktop Users"]
     assert policies[0]["targets"]["FQDN/IP"]["fqdnRules"] == [{"operator": "EXACTLY", "computernamePattern": WEB01_FQDN, "domain": "corp.example.com"}]
     assert policies[0]["conditions"]["maxSessionDuration"] == 2
@@ -202,7 +241,7 @@ def test_two_policies_per_server_share_account_and_target_set():
     policies = calls(uap, "create_policy")
     assert [p["metadata"]["name"] for p in policies] == [WEB01_FQDN, f"{WEB01_FQDN}-ops"]
     assert policies[1]["behavior"]["connectAs"]["rdp"]["localEphemeralUser"]["assignGroups"] == ["Remote Desktop Users"]
-    assert [p["id"] for p in policies[1]["principals"]] == [f"id-SIA-Platform-Ops-{CDS_UUID[:4]}"]
+    assert [p["id"] for p in policies[1]["principals"]] == ["role-SIA-Platform-Ops"]
     result2 = make(inp, sia=sia, uap=uap)[0].run()
     assert all(sr.target_set.status == "exists" and sr.policy.status == "exists" for sr in result2.servers)
     # renaming the second policy in the UI must not be mistaken for the first one
@@ -235,7 +274,7 @@ def test_checkpoint_and_resume(tmp_path):
     assert cp.path.is_file() and cp.done_count() == 3
     lines = [json.loads(line) for line in cp.path.read_text().splitlines()]
     assert len(lines) == 3 and lines[0]["key"] == f"{WEB01_FQDN}|{WEB01_FQDN}"
-    assert lines[0]["version"] == 2
+    assert lines[0]["version"] == CHECKPOINT_VERSION
     assert lines[0]["statuses"] == {"secret": "created", "target_set": "created", "policy": "created"}
     assert lines[0]["refs"]["policy"].startswith("pol-") and "pw" not in json.dumps(lines)
 
@@ -293,11 +332,11 @@ def test_checkpoint_fingerprint_covers_defaults_pinned_directories_and_template_
     pinned_a = Inputs(servers=ONE.servers, strong_accounts=ONE.strong_accounts,
                       groups={"SIA-Web-Admins": GroupRow("SIA-Web-Admins", "CyberArk Cloud Directory", 2)})
     pins_cp = Checkpoint(tmp_path / "pins.jsonl")
-    rec, sia, uap, _ = make(pinned_a, checkpoint=pins_cp)
+    rec, sia, uap, _ = make(pinned_a, checkpoint=pins_cp, defaults=GROUP_DEFAULTS)
     assert rec.run().failures == 0
     pinned_b = Inputs(servers=ONE.servers, strong_accounts=ONE.strong_accounts,
                       groups={"SIA-Web-Admins": GroupRow("SIA-Web-Admins", "CDS", 9)})
-    result = make(pinned_b, sia=sia, uap=uap, checkpoint=pins_cp, resume=True)[0].run()
+    result = make(pinned_b, sia=sia, uap=uap, checkpoint=pins_cp, resume=True, defaults=GROUP_DEFAULTS)[0].run()
     assert result.resumed == 0 and any("input changed" in warning for warning in result.warnings)
 
     template = json.loads(json.dumps(TEMPLATE))
@@ -562,7 +601,7 @@ def test_unmanaged_target_set_up_to_date_is_reported():
 
 
 def test_group_not_found_fails_policy_only():
-    identity = FakeIdentity([group_row("SIA-Web-Admins"), group_row("SIA-Platform-Ops")])  # no DMZ group
+    identity = FakeIdentity(roles=[role_row("SIA-Web-Admins"), role_row("SIA-Platform-Ops")])  # no DMZ role
     result = make(identity=identity)[0].run()
     dmz = by_fqdn(result)[DMZ_FQDN]
     assert dmz.target_set.status == "created" and dmz.policy.status == "failed" and "SIA-DMZ-Admins" in dmz.policy.detail
@@ -731,10 +770,10 @@ def test_unmanaged_policy_update_requires_adopt():
     result = make(ONE, uap=uap, update=True, adopt=["WEB01.corp.example.com"])[0].run()  # adopt by name, case-insensitive
     assert result.servers[0].policy.status == "updated"
     pid, payload = calls(uap, "update_policy")[0]
-    assert pid == "manual-1" and OWNER in payload["metadata"]["policyTags"] and payload["principals"][0]["id"].startswith("id-SIA-Web-Admins")
+    assert pid == "manual-1" and OWNER in payload["metadata"]["policyTags"] and payload["principals"][0]["id"].startswith("role-SIA-Web-Admins")
 
     # already correct but unmanaged: reported; adopting adds the tag
-    uap = FakeUAP([{**MANUAL, "principals": [{"id": f"id-SIA-Web-Admins-{CDS_UUID[:4]}"}]}])
+    uap = FakeUAP([{**MANUAL, "principals": [{"id": "role-SIA-Web-Admins"}]}])
     result = make(ONE, uap=uap)[0].run()
     assert result.servers[0].policy.status == "exists" and "unmanaged" in result.servers[0].policy.detail
     result = make(ONE, uap=uap, update=True, adopt_all=True)[0].run()
@@ -743,7 +782,7 @@ def test_unmanaged_policy_update_requires_adopt():
 
 def test_create_conflict_is_reclassified_not_failed():
     """A same-name policy hidden from the owner-tag listing answers 409 on create: compare it instead of failing."""
-    uap = FakeUAP([{**MANUAL, "principals": [{"id": f"id-SIA-Web-Admins-{CDS_UUID[:4]}"}]}])
+    uap = FakeUAP([{**MANUAL, "principals": [{"id": "role-SIA-Web-Admins"}]}])
     rec, sia, uap, _ = make(ONE, uap=uap)
     result = rec.run()
     sr = result.servers[0]
@@ -1099,3 +1138,45 @@ def test_adopting_a_domain_target_set_does_not_adopt_its_policies():
     assert rows[WEB01_FQDN].target_set.status == "updated"          # the set was adopted
     assert rows[WEB01_FQDN].policy.status == "unverified"           # incomplete policy response; never adopted or updated
     assert "cannot confirm settings or safely update" in rows[WEB01_FQDN].policy.detail
+
+
+# ------------------------------------------------- role principals: migration, tolerance, ambiguity
+def test_group_era_policy_migrates_to_role_with_update():
+    rec, sia, uap, _ = make(ONE, defaults=GROUP_DEFAULTS)           # a policy created before the switch to roles
+    assert rec.run().failures == 0
+    assert uap.policies[0]["principals"][0]["type"] == "GROUP"
+    result = make(ONE, sia=sia, uap=uap)[0].run()                    # roles are the default now
+    sr = by_fqdn(result)[WEB01_FQDN]
+    assert sr.policy.status == "drift" and "principals differ" in sr.policy.detail
+    assert "SIA-Web-Admins (GROUP) -> SIA-Web-Admins (ROLE)" in sr.policy.detail
+    assert calls(uap, "update_policy") == []
+    result = make(ONE, sia=sia, uap=uap, update=True)[0].run()
+    assert by_fqdn(result)[WEB01_FQDN].policy.status == "updated"
+    _, payload = calls(uap, "update_policy")[0]
+    assert payload["principals"] == [WEB_ADMINS_ROLE]
+    assert by_fqdn(make(ONE, sia=sia, uap=uap)[0].run())[WEB01_FQDN].policy.status == "exists"
+
+
+def test_role_principal_directory_fields_do_not_cause_drift():
+    rec, sia, uap, _ = make(ONE)
+    assert rec.run().failures == 0
+    stored = uap.policies[0]["principals"][0]
+    del stored["sourceDirectoryId"], stored["sourceDirectoryName"]      # a tenant that drops the optional fields
+    stored["type"] = "Role"                                              # ... and echoes the type in another case
+    result = make(ONE, sia=sia, uap=uap, update=True)[0].run()
+    assert by_fqdn(result)[WEB01_FQDN].policy.status == "exists" and calls(uap, "update_policy") == []
+    stored["sourceDirectoryName"] = "CyberArk Cloud Directory (tenant)"   # ... or rewrites them
+    stored["sourceDirectoryId"] = "another-id"
+    result = make(ONE, sia=sia, uap=uap, update=True)[0].run()
+    assert by_fqdn(result)[WEB01_FQDN].policy.status == "exists" and calls(uap, "update_policy") == []
+    stored["id"] = "someone-else"                                        # the role itself is still compared
+    result = make(ONE, sia=sia, uap=uap)[0].run()
+    assert by_fqdn(result)[WEB01_FQDN].policy.status == "drift" and "principals differ" in by_fqdn(result)[WEB01_FQDN].policy.detail
+
+
+def test_ambiguous_role_stops_the_run_before_writes():
+    identity = FakeIdentity(roles=[role_row("SIA-Web-Admins", "r-1"), role_row("SIA-Web-Admins", "r-2")])
+    rec, sia, uap, _ = make(ONE, identity=identity)
+    with pytest.raises(ResolveError, match="role 'SIA-Web-Admins' is ambiguous"):
+        rec.run()
+    assert calls(uap, "create_policy") == [] and not sia.secrets and not sia.target_sets

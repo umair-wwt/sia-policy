@@ -28,11 +28,13 @@ idle_minutes = 10
 assign_local_groups = ["Administrators"]
 enable_reconnect = false
 
-# Leave blank when server/group/account mappings are provided in the input CSV files. With a blank
+# Leave blank when server/principal/account mappings are provided in the input CSV files. With a blank
 # strong_account_template every servers.csv row must name its strong account (or its domain must be listed in
 # domains.csv). To derive one per server instead, set for example strong_account_template = "ADM-{hostname}",
 # strong_account_type = "vault" and the safe/account-name templates documented in config.example.toml.
-group_template = ""
+# Policies grant access to an Identity role by default; set principal_type = "group" to name Identity groups instead.
+principal_type = "role"
+principal_template = ""
 strong_account_template = ""
 strong_account_type = "existing"
 target_set_scope = "server"

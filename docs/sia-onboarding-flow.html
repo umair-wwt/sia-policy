@@ -101,23 +101,23 @@
 <main>
   <div class="eyebrow">sia-policy-automation · briefing for CyberArk / Idira engineers</div>
   <h1>SIA Onboarding Flow</h1>
-  <p class="lede">One set of objects <strong>per server</strong>, created from a spreadsheet: for every Windows server its own strong account (its local administrator, referenced from the Vault), its own target set, and an access policy <strong>named after the server</strong> for the Identity group that may use it — a second row gives a second group its own policy. For Linux servers only the policy (SIA uses an SSH certificate there). Run it again and it changes nothing; change a list and it shows you the difference before touching anything; stop it half-way and it resumes.</p>
+  <p class="lede">One set of objects <strong>per server</strong>, created from a spreadsheet: for every Windows server its own strong account (its local administrator, referenced from the Vault), its own target set, and an access policy <strong>named after the server</strong> for the Identity role (or group) that may use it — a second row gives a second principal its own policy. For Linux servers only the policy (SIA uses an SSH certificate there). Run it again and it changes nothing; change a list and it shows you the difference before touching anything; stop it half-way and it resumes.</p>
 
   <h2>The one idea to get first</h2>
   <p>In SIA, the strong account is <em>not</em> a setting on the policy. Three separate objects do the work, and the server's <strong>FQDN is the key that joins them</strong> at connection time. The tool creates the three amber objects below, one set per server; everything dashed must already exist (the local admin account in the Vault can be onboarded by the optional <code>vault</code> stage).</p>
 
   <figure>
     <div class="panel">
-      <svg viewBox="0 0 900 400" role="img" aria-label="Schematic: an Identity group is granted RDP to a server by an access policy; the policy's FQDN rule names a target set of the same name, which points at a strong account that is vaulted in PAM Self-Hosted; the connector uses that strong account to create an ephemeral local user on the server. The policy, target set and strong account are created by the tool; the group, server and vault account already exist." font-family="'Source Sans 3', system-ui, sans-serif" font-size="12" fill="currentColor">
+      <svg viewBox="0 0 900 400" role="img" aria-label="Schematic: an Identity role is granted RDP to a server by an access policy; the policy's FQDN rule names a target set of the same name, which points at a strong account that is vaulted in PAM Self-Hosted; the connector uses that strong account to create an ephemeral local user on the server. The policy, target set and strong account are created by the tool; the role, server and vault account already exist." font-family="'Source Sans 3', system-ui, sans-serif" font-size="12" fill="currentColor">
         <defs>
           <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
             <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/>
           </marker>
         </defs>
 
-        <!-- Identity group (exists) -->
+        <!-- Identity role (exists) -->
         <rect x="20" y="56" width="170" height="64" rx="6" fill="none" stroke="#A9BDDB" stroke-width="1.5" stroke-dasharray="5 4"/>
-        <text x="105" y="78" text-anchor="middle" font-weight="600" font-size="13">Identity group</text>
+        <text x="105" y="78" text-anchor="middle" font-weight="600" font-size="13">Identity role</text>
         <text x="105" y="100" text-anchor="middle" font-family="'IBM Plex Mono', monospace" font-size="11.5" fill="#A9BDDB">SIA-Web-Admins</text>
 
         <!-- Access policy (tool) -->
@@ -178,7 +178,7 @@
         <rect x="20" y="362" width="22" height="12" rx="3" fill="rgba(242,184,75,0.10)" stroke="#F2B84B" stroke-width="1.8"/>
         <text x="50" y="372" font-size="11.5">created and owned by the tool</text>
         <rect x="260" y="362" width="22" height="12" rx="3" fill="none" stroke="#A9BDDB" stroke-width="1.5" stroke-dasharray="5 4"/>
-        <text x="290" y="372" font-size="11.5">must already exist (group, server + connector, Vault account)</text>
+        <text x="290" y="372" font-size="11.5">must already exist (role, server + connector, Vault account)</text>
       </svg>
     </div>
     <figcaption>What a user's connection walks through, and where the tool's three objects sit in that path. SIA matches the FQDN from the policy rule to a target set of the same name; the target set names the strong account. Every server has its own set of the three.</figcaption>
@@ -187,7 +187,7 @@
   <div class="objects">
     <div class="object">
       <h3>Access policy</h3>
-      <p>Who may connect (Identity group), to which FQDN, how (RDP with an ephemeral local user in chosen local groups) and when. Named after the server; a second group gets a second policy (<span class="mono">-ops</span>).</p>
+      <p>Who may connect (an Identity role, or a group), to which FQDN, how (RDP with an ephemeral local user in chosen local groups) and when. Named after the server; a second principal gets a second policy (<span class="mono">-ops</span>).</p>
       <span class="mono">web01.corp.example.com</span>
     </div>
     <div class="object">
@@ -207,8 +207,8 @@
   <h2>What SIA does when someone connects</h2>
   <p>The tool is not in this path. It sets up the objects the path relies on, and <code>connect-info</code> writes down what the user needs.</p>
   <ol class="steps">
-    <li><div><p class="title">The user picks <span class="mono">web01.corp.example.com</span> in the portal (Access › Infrastructure › Connect › RDP) or an RDP client</p><p>Nothing is typed: no user name, no password. From an RDP client the gateway is <span class="mono">&lt;subdomain&gt;.rdp.cyberark.cloud</span> and the user name is the connection string <span class="mono">secureaccess /i alice@acme.cyberark.cloud /s acme /a web01.corp.example.com</span>. Their Identity session says who they are and which groups they are in.</p></div></li>
-    <li><div><p class="title">SIA looks for a policy that matches</p><p>Group ∈ principals, FQDN matches the rule, current time inside the access window. Users pick the <em>server</em>; the policy named after it is what applies.</p></div></li>
+    <li><div><p class="title">The user picks <span class="mono">web01.corp.example.com</span> in the portal (Access › Infrastructure › Connect › RDP) or an RDP client</p><p>Nothing is typed: no user name, no password. From an RDP client the gateway is <span class="mono">&lt;subdomain&gt;.rdp.cyberark.cloud</span> and the user name is the connection string <span class="mono">secureaccess /i alice@acme.cyberark.cloud /s acme /a web01.corp.example.com</span>. Their Identity session says who they are and which roles and groups they hold.</p></div></li>
+    <li><div><p class="title">SIA looks for a policy that matches</p><p>Role (or group) ∈ principals, FQDN matches the rule, current time inside the access window. Users pick the <em>server</em>; the policy named after it is what applies.</p></div></li>
     <li><div><p class="title">SIA finds the target set named <span class="mono">web01.corp.example.com</span></p><p>The target set's <code>secret_id</code> says which strong account to use. Without a target set the policy is valid but the connection cannot be provisioned.</p></div></li>
     <li><div><p class="title">The connector uses the strong account</p><p>Over WinRM it creates a temporary local user named after the connecting user — the first 7 characters of the login plus a random string, 20 characters in all (<span class="mono">alice.sXk3f9Qm2dLp7bR</span>) — and adds it to the local groups the policy names (e.g. Administrators). The strong account's password comes from the Vault.</p></div></li>
     <li><div><p class="title">Session runs, then the temporary user is removed</p><p>The session ends after the policy's maximum length (2 h by default) or idle time (10 min), with a 30-second warning; the temporary user and its profile are deleted. Reconnecting means a new temporary user (<code>enable_reconnect = false</code>). Zero standing privileges: nothing is left on the box afterwards.</p></div></li>
@@ -219,20 +219,20 @@
   <table>
     <thead><tr><th>Your file</th><th>One row means</th><th>Becomes in SIA</th></tr></thead>
     <tbody>
-      <tr><td><code>servers.csv</code></td><td>"this FQDN, for these groups" — one row per policy, so a server may have two rows</td><td>one target set per server + one access policy per row, named after the server (<code>web01.corp.example.com</code>, <code>web01.corp.example.com-ops</code>)</td></tr>
+      <tr><td><code>servers.csv</code></td><td>"this FQDN, for these principals (roles by default)" — one row per policy, so a server may have two rows</td><td>one target set per server + one access policy per row, named after the server (<code>web01.corp.example.com</code>, <code>web01.corp.example.com-ops</code>)</td></tr>
       <tr><td><code>config.toml</code> naming rule</td><td>"every server's local admin is <code>&lt;hostname&gt;-Administrator</code> in Safe <code>SIA-LocalAdmins</code>"</td><td>one strong account per server, created as a Vault reference named <code>&lt;account&gt;_&lt;safe&gt;</code> (SIA generates that name); onboarded into the Vault first when missing and the <code>vault</code> stage is on</td></tr>
       <tr><td><code>strong_accounts.csv</code></td><td>the few accounts you name explicitly: <em>existing</em> / a <em>vault</em> reference / raw <em>credentials</em>, e.g. a domain account shared by several servers</td><td>looked up by name, or created as a VM secret</td></tr>
-      <tr><td><code>groups.csv</code> (optional)</td><td>"this group name lives in this directory"</td><td>only used to disambiguate when the same group name exists in two directories</td></tr>
+      <tr><td><code>groups.csv</code> (optional)</td><td>"this group name lives in this directory"</td><td>group principals only (<code>principal_type = "group"</code>): disambiguates a group name that exists in two directories</td></tr>
     </tbody>
   </table>
   </div>
-  <p>Group names are turned into what a UAP policy actually needs — the group's ID plus the directory it came from — by asking Identity's directory service. Passwords are never in a CSV: they come from a protected password file, environment variables or a prompt, and are redacted from every log and error.</p>
+  <p>Principal names are turned into what a UAP policy actually needs — a role's ID (roles are the default), or a group's ID plus the directory it came from — by asking Identity's directory service. Passwords are never in a CSV: they come from a protected password file, environment variables or a prompt, and are redacted from every log and error.</p>
 
   <h2>How a run flows</h2>
   <ol class="steps">
     <li><div><p class="title">Read and check the lists</p><p>Every problem is reported with file and line (bad FQDN, unknown strong account, duplicate policy name…). If anything is wrong, nothing else happens.</p></div></li>
     <li><div><p class="title">Sign in and read what the tenant already has — for this wave only</p><p>The service user gets a platform token. Up to 2,000 servers the tool reads per server (one search each, in parallel); above that it reads one listing of the policies it manages. Rows already finished according to the checkpoint are not read at all (<code>--resume</code>).</p><p class="aside">Identity, SIA (<span class="mono">dpa</span>) and UAP APIs — all read-only at this point.</p></div></li>
-    <li><div><p class="title">Turn names into IDs</p><p>Each group name becomes a principal (ID + source directory). Each strong-account name is matched to a secret.</p></div></li>
+    <li><div><p class="title">Turn names into IDs</p><p>Each principal name becomes a role ID (or a group ID plus its source directory). Each strong-account name is matched to a secret.</p></div></li>
     <li><div><p class="title">Compare desired with actual, per server</p><p>Every object ends up as <span class="status s-ok">create</span> <span class="status s-muted">exists</span> <span class="status s-warn">drift</span> or <span class="status s-bad">blocked</span>. <code>plan</code> stops here and prints the table.</p></div></li>
     <li><div><p class="title">Apply in dependency order</p><p>Vault accounts (optional), then strong accounts, then target sets (batches of 50), then policies — each policy is read back to confirm the requested <em>Active</em> or <em>Suspended</em> state, and only complete verified rows go into the checkpoint. A report (table, JSON, CSV) is written.</p><p class="aside">A server whose strong account or target set failed has its policies <em>blocked</em>, never created half-way. The first object of each stage is created alone; only then do the workers fan out.</p></div></li>
   </ol>
@@ -254,7 +254,7 @@ python sia_onboard.py plan  --input input               <span class="comment"># 
 python sia_onboard.py apply --input input --workers 8   <span class="comment"># do it (asks for "yes"); --resume continues an interrupted run</span>
 python sia_onboard.py verify --input input              <span class="comment"># PASS / MISSING / FAIL per row, for sign-off</span>
 python sia_onboard.py connect-info --input input --rdp-dir out   <span class="comment"># gateway, user name and .rdp file per server</span></code></pre>
-  <div class="callout"><p><strong>First time on a tenant:</strong> create one policy for one server by hand, run <code>show-policy</code> on it, then <code>plan</code> and <code>apply</code> with a one-server CSV. Test the RDP login as a group member (watch the temporary user appear and disappear), run <code>verify</code>, re-run <code>apply</code> (everything must say <em>exists</em>), then load the real lists in waves of a few thousand.</p></div>
+  <div class="callout"><p><strong>First time on a tenant:</strong> create one policy for one server by hand, run <code>show-policy</code> on it, then <code>plan</code> and <code>apply</code> with a one-server CSV. Test the RDP login as a member of the role (watch the temporary user appear and disappear), run <code>verify</code>, re-run <code>apply</code> (everything must say <em>exists</em>), then load the real lists in waves of a few thousand.</p></div>
 
   <h2>Questions engineers usually ask</h2>
   <dl class="faq">
@@ -272,7 +272,7 @@ python sia_onboard.py connect-info --input input --rdp-dir out   <span class="co
     <dd>Domain ephemeral users, creating the Windows accounts themselves, deleting anything, and changing tenant settings. Those are deliberate boundaries for this version; Linux/SSH rows are supported (policy only).</dd>
   </dl>
 
-  <footer>Payload shapes follow the documented Access Control Policies, SIA strong-account/target-set and PVWA APIs and CyberArk's official SDKs. Conventions are confirmed per tenant with <code>preflight</code> and <code>show-policy</code> before bulk runs: the API path families, the FQDN-rule encoding, the principal's source-directory fields and the fields the policy list carries.</footer>
+  <footer>Payload shapes follow the documented Access Control Policies, SIA strong-account/target-set and PVWA APIs and CyberArk's official SDKs. Conventions are confirmed per tenant with <code>preflight</code> and <code>show-policy</code> before bulk runs: the API path families, the FQDN-rule encoding, the principal shape (ROLE by default; source-directory fields optional for roles) and the fields the policy list carries.</footer>
 </main>
 
 </body>

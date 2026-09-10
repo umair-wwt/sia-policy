@@ -306,3 +306,34 @@ def test_service_user_token_success_shape_is_strict():
         "https://id", "svc", "pw", session=FakeSession([FakeResponse(200, ["not-an-object"])]))
     with pytest.raises(AuthError, match="token response"):
         provider()
+
+
+@pytest.mark.parametrize("body, fragment", [
+    ("not-json", None),
+    ({"success": False, "Message": "denied"}, "denied"),
+    ({"success": True, "Result": {}}, "roles object"),
+    ({"success": True, "Result": {"roles": {}}}, "Results"),
+    ({"success": True, "Result": {"roles": {"Results": [{"Row": {"_ID": "r1"}}]}}}, "needs a role name"),
+])
+def test_identity_role_query_errors_are_not_reported_as_mutations(body, fragment):
+    client, _ = http_with([FakeResponse(200, body)])
+    with pytest.raises(SIAApiError) as failed:
+        IdentityClient(client, "https://id").query_roles("Admins", ["d1"])
+    assert failed.value.method == "POST" and failed.value.mutation_state == "not_applicable"
+    if fragment:
+        assert fragment in str(failed.value)
+
+
+def test_identity_role_deduplication_collapses_repeated_ids_only():
+    rows = [{"Row": {"_ID": "same", "Name": "Admins"}}, {"Row": {"_ID": "same", "Name": "Admins"}},
+            {"Row": {"_ID": "other", "Name": "Admins"}}, {"Row": {"Name": "No-Id"}}]
+    client, _ = http_with([FakeResponse(200, {"success": True, "Result": {"roles": {"Results": rows}}})])
+    found = IdentityClient(client, "https://id").query_roles("Admins", ["d1"])
+    assert [row.get("_ID") for row in found] == ["same", "other", None]   # a row without _ID reaches the resolver
+
+
+def test_identity_role_pagination_cap_is_an_error():
+    roles = [{"Row": {"_ID": f"r{i}", "Name": f"R{i}"}} for i in range(200)]
+    client, _ = http_with([FakeResponse(200, {"success": True, "Result": {"roles": {"Results": roles}}})])
+    with pytest.raises(SIAApiError, match="Identity role pagination exceeded the 1-page safety limit"):
+        IdentityClient(client, "https://id").query_roles("R", ["d1"], max_pages=1)

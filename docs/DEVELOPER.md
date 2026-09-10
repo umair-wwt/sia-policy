@@ -41,7 +41,7 @@ flowchart TB
         INP["inputs.py<br/>CSV parsing, multi-row servers, templated accounts"]
         CONF["config.py<br/>TOML + .env loading, StrongAccountTemplate"]
         REC["reconcile.py<br/>snapshot · reconcile · stages · ownership · resume"]
-        RES["resolve.py<br/>group name to principal, account to secret"]
+        RES["resolve.py<br/>role/group name to principal, account to secret"]
         PAY["payloads.py<br/>pure payload builders (golden-tested)"]
         CL["clients.py<br/>SIAClient (probe, path families) · UAPClient · IdentityClient"]
         PV["pvwa.py<br/>PVWAClient (vault stage)"]
@@ -90,15 +90,15 @@ flowchart TB
 | `sia/console.py` / `sia/starter.py` | Live command/value/path completion, memory-only allowlisted command history, wrapping terminal presentation with plain fallback; bundled non-secret config template created exclusively when missing. |
 | `sia/diagnostics.py` / `sia/doctor.py` / `sia/help.py` | Stable redacted diagnostic codes and `What happened / What changed / What to do next` rendering; independent offline/online checks; searchable built-in operator guidance. |
 | `sia/runtime.py` | Per-terminal-session credential overlay, non-secret config drafts keyed by resolved path, and temporary process-environment bridge. Exported values take precedence; file values are not permanently copied into the process. |
-| `sia/inputs.py` | Reads the CSVs into frozen dataclasses (`ServerRow`, `StrongAccountRow`, `GroupRow`, `DomainRow`); reports every problem with `file:line`; allows several rows per FQDN (they must agree on strong account, domain, protocol, target set) and rejects duplicate effective policy names before any tenant contact (`effective_policy_name`); resolves each row's group (`_resolve_groups`), strong account (`_resolve_strong_account`) and target set (`_resolve_target_set`); renders templated accounts of type `existing`/`vault`/`credentials`; `Inputs.unique_fqdns`, `rows_for`, `target_rows`, `window()` (waves). `_build_server_row` is shared by `load_inputs` (servers.csv) and `inline_inputs` (`--server`), so the two paths cannot validate differently. |
+| `sia/inputs.py` | Reads the CSVs into frozen dataclasses (`ServerRow`, `StrongAccountRow`, `GroupRow`, `DomainRow`); reports every problem with `file:line`; allows several rows per FQDN (they must agree on strong account, domain, protocol, target set) and rejects duplicate effective policy names before any tenant contact (`effective_policy_name`); resolves each row's principal (`_resolve_principals`), strong account (`_resolve_strong_account`) and target set (`_resolve_target_set`); renders templated accounts of type `existing`/`vault`/`credentials`; `Inputs.unique_fqdns`, `rows_for`, `target_rows`, `window()` (waves). `_build_server_row` is shared by `load_inputs` (servers.csv) and `inline_inputs` (`--server`), so the two paths cannot validate differently. |
 | `sia/auth.py` | `PlatformTokenProvider` (documented client-credentials flow) and `ServiceUserOIDCTokenProvider` (the SDKs' `Oauth2/Token` + `OAuth2/Authorize` flow). Both cache until a minute before expiry, refresh on demand, and register every secret with the redactor. |
 | `sia/http.py` | One `requests.Session`; bearer header; the retry policy in [§5](#5-safety-mechanisms); `RateLimiter` (token bucket + shared 429 penalty); `SIAApiError` with redacted body, `status` (0 for network errors), `client_error`, `not_found`, `uncertain`. |
 | `sia/clients.py` | 1:1 endpoint wrappers. `SIAClient.probe()` detects the strong-account and target-set path families (`SIACapabilities`), listings paginate and accept name / strong-account filters, `find_secret()`; `UAPClient` lists (`filter`, `q`, `nextToken`), `owned_vm_filter()`, `find_policies_for_fqdn()`; `IdentityClient`. No business logic. |
 | `sia/pvwa.py` | `PVWAClient`: logon (CyberArk/LDAP), `find_account`, `add_account`, logoff — reuses `HttpClient` with the PVWA token sent verbatim. |
-| `sia/resolve.py` | `PrincipalResolver` (Identity group → UAP principal, with directory pinning and ambiguity errors), `SecretIndex` (deterministic secret lookup), `pick()` (snake/camel-tolerant key access). |
-| `sia/payloads.py` | Pure functions: every request body (SIA secret, target set, UAP policy, PVWA account), template validation/sanitising, full managed-field signatures, `policy_status`, rename detection and ownership. `metadata.status` uses `[defaults] policy_status` on create; updates preserve the live value unless an explicit status action is requested. |
+| `sia/resolve.py` | `PrincipalResolver` (Identity role or group → UAP principal, per `[defaults] principal_type`: roles are looked up in the CyberArk Cloud Directory through `query_roles` and are ambiguous only when two ids share one name; groups keep directory pinning and ambiguity errors), `SecretIndex` (deterministic secret lookup), `pick()` (snake/camel-tolerant key access). |
+| `sia/payloads.py` | Pure functions: every request body (SIA secret, target set, UAP policy, PVWA account), template validation/sanitising, full managed-field signatures, `policy_status`, rename detection and ownership. `metadata.status` uses `[defaults] policy_status` on create; updates preserve an existing Active/Suspended value unless an explicit status action is requested. Corrective updates from platform-managed states request the configured stable status. |
 | `sia/reconcile.py` | The engine: `snapshot()` reads the tenant once with the chosen lookup strategy; `reconcile()` decides and applies in dependency order (vault → secrets → target sets → policies), enforces ownership, fail-fast, uncertain-write handling, bounded drift reads, conflict reclassification, checkpointing and progress. `workers` parallelises reads, creations and existing-policy comparisons through `_execute()` — the first item of each creating stage always runs alone (canary). |
-| `sia/checkpoint.py` | Version-2 append-only JSON-lines checkpoint; validates complete stage status/reference records and fingerprints the tenant, effective settings, template, account mapping and row inputs before resume. |
+| `sia/checkpoint.py` | Version-3 append-only JSON-lines checkpoint; validates complete stage status/reference records and fingerprints the tenant, effective settings, template, account mapping and row inputs before resume. Earlier versions are rechecked under the stronger verification rules. |
 | `sia/connect.py` | The consuming side: gateway host, portal URL, login suffix, `zsp_username()`, `rdp_file_text()`, CSV/`.rdp` writers (`connect-info`). |
 | `sia/report.py` | Console summary and diagnostics, collision-resistant atomic JSON/CSV reports, explicit report-write failures after tenant work, exit codes, and verify verdicts. |
 | `sia/artifacts.py` | Stages all output bytes before publication, preserves existing file modes, publishes generated names exclusively, and reports intended/completed paths on partial output failure. |
@@ -110,13 +110,13 @@ flowchart TB
 flowchart TD
     A["1 - Read and validate the CSVs<br/>(--offset/--limit slice by server)"] -->|any problem| X["exit 2: every error listed with file:line<br/>tenant not contacted"]
     A --> B["2 - snapshot(): authenticate, load template,<br/>drop checkpointed rows (--resume),<br/>read the wave's secrets, target sets and policies<br/>(search per server, or one filtered list)"]
-    B --> C["3 - reconcile(dry_run=True): preview<br/>group -> principal · account -> secret · compare"]
+    B --> C["3 - reconcile(dry_run=True): preview<br/>principal name -> role/group id · account -> secret · compare"]
     C -->|plan / verify / connect-info| R1["print table / verdicts / connection CSV, exit 0/1"]
     C -->|apply, after 'yes'| D["4 - reconcile(dry_run=False), same snapshot"]
     D --> E["5a - Vault accounts (PVWA POST Accounts), optional<br/>canary, then --workers threads"]
     E --> F["5b - Strong accounts (POST secrets)<br/>canary, then --workers threads"]
     F --> G["5c - Target sets (POST targetsets/bulk, chunks of 50)<br/>one per target-set name"]
-    G --> H["5d - Policies: compare existing in parallel,<br/>create missing (canary, then --workers), read status back;<br/>checkpoint every finished row"]
+    G --> H["5d - Policies: compare existing in parallel,<br/>create missing (canary, then --workers), verify saved fields and status;<br/>checkpoint every finished row"]
     H --> R2["print table, write report, exit 0/1"]
 ```
 
@@ -124,10 +124,13 @@ Details worth knowing:
 
 - `snapshot()` runs once per command; `apply` without `--yes` previews and applies from the same snapshot (no
   second tenant read). A create that then hits a name conflict is reclassified (§3), so a stale preview is safe.
-- Policy creation reads the policy back `status_polls` times (default 5; `[http] status_polls`), 2 s apart while the
-  status is `Validating`. A failed read-back, missing ID, malformed response, or status that never proves the
-  requested final state is `unverified`; it is not counted or checkpointed as success. `Error` is a failure.
-- Group resolution stays single-threaded (the resolver cache is not thread-safe and groups are few); reads,
+- Policy creates and updates read the policy back up to `status_polls` times (default 5; `[http] status_polls`),
+  2 s apart while the saved fields or intended final status have not converged. Success requires the normalized
+  managed fields and intended status to match; optional ROLE directory metadata is ignored. Failed or incomplete
+  read-back, or a persistent mismatch, is `unverified` and cannot complete a checkpoint. `Error` is a failure.
+- Target-set updates read back the exact name under the intended strong account and compare all managed fields
+  within the same polling limit. Missing, conflicting or divergent state remains `unverified`; only reads are retried.
+- Principal resolution stays single-threaded (the resolver cache is not thread-safe and principals are few); reads,
   creates and existing-policy comparisons fan out on a `ThreadPoolExecutor`.
 - `--only <stage>` disables writes for the other stages; lookups and comparisons still run for everything.
 - A row is written to the checkpoint only after every stage has a complete good status and required object reference
@@ -166,21 +169,21 @@ Runs only when a `PVWAClient` is given (`[pvwa] base_url` set) and only for refe
 The address is the account's `address` column, else the AD domain for domain accounts, else the FQDN of the
 first server using the account.
 
-### Group, strong account and target set of a row (`inputs.py`)
+### Principal, strong account and target set of a row (`inputs.py`)
 
 Resolved at parse time, before any tenant contact:
 
 | | Order |
 |---|---|
-| group | the `group` cell → the domain's `group_template` (domains.csv) → `[defaults] group_template` → error |
+| principal | the `principal` cell → the domain's `principal_template` (domains.csv) → `[defaults] principal_template` → error; `[defaults] principal_type` decides whether the name is looked up as a role (CDS) or a group |
 | strong account | the `strong_account` cell → the domain's `strong_account` (domain-joined rows only) → `[defaults] strong_account_template` → error |
 | target set | `scope = server`: the FQDN, type `Target`. `scope = auto`/`domain`: the domain's `target_set` (default: the domain name) and `target_set_type`, but only for a row that took its account from domains.csv; otherwise the FQDN. `scope = domain` additionally rejects a domain-joined row whose domain has no domains.csv entry. |
 
 A strong account named only in domains.csv is materialised as a `type=existing` `StrongAccountRow` with
 `account_domain` set to the domain — the tool looks it up and never creates it, which is what "onboarded by hand"
 means operationally. An explicit `strong_accounts.csv` row of the same name wins.
-`_check_shared_target_sets()` rejects two domains that point at one target set with different strong accounts,
-which is what lets the reconciler assume every row in a target-set group shares an account.
+Shared target-set validation rejects domain definitions or effective server rows that point at one target set
+with different strong accounts or types. Every row sharing a target set therefore agrees on its account and scope.
 
 ### Strong account (`_ensure_secrets`)
 
@@ -205,7 +208,7 @@ server in the AD domain, so `--update` on one re-points all of them — the drif
 | Not found | `created` via bulk (207 per-item) / `planned` |
 | Found, same `secret_id` | `exists` (+ *unmanaged* note if no `managed-by:` marker) |
 | Found, other `secret_id`, no `--update` | `drift` |
-| Found, other `secret_id`, `--update`, owned or adopted | `updated` (`PUT …/targetsets/{name}`) |
+| Found, other `secret_id`, `--update`, owned or adopted | `updated` after `PUT …/targetsets/{name}` and matching read-back; otherwise `unverified` |
 | Found, other `secret_id`, `--update`, neither | `drift` with `--adopt` hint |
 
 ### Policy (`_ensure_policies` / `_reconcile_existing_policy`)
@@ -230,7 +233,8 @@ flowchart TD
 ```
 
 `policy_signature()` normalises every policy field the tool writes: name/description, time frame, entitlement,
-sorted tags, time zone, principal IDs/types/source-directory metadata, delegation classification, conditions,
+sorted tags, time zone, principal IDs/types (source-directory metadata for non-role principals; optional for
+ROLE and therefore ignored), delegation classification, conditions,
 FQDN rules, and complete RDP/SSH behavior (including local groups and reconnect). A top-level key missing from a
 partial list object is `None`; `--drift` / `--update` fetches the full object before using the complete signature.
 Names are compared HTML-unescaped. Status is handled separately: normal updates preserve the live value;
@@ -261,21 +265,23 @@ referenced strong account), and the policies carrying the owner tag (`filter=(ta
 
 **Bounded drift reads.** The list endpoint returns partial policies. `_reconcile_existing_policy()` compares what
 the object carries and fetches the full policy (`GET /api/policies/{id}`) only when `drift` is requested
-(`--drift`, implied by `--update`), when the object lacks `principals`, or for a rename candidate. Rename detection
+(`--drift`, implied by `--update`), when the object lacks `principals`, or for a rename candidate. Missing principals
+force the full read even when targets are already present; a full response without principals is `unverified`. Rename detection
 (`_build_owned_index()`) indexes owner-tagged policies by their `EXACTLY` FQDN rules; objects without targets are
 fetched in full only when their description mentions one of the wave's FQDNs.
 
 **Conflict reclassification.** A create answered with 409 (or a 400 mentioning an existing/duplicate name) — e.g. a
 same-name policy hidden from the owner-tag listing — is looked up by name and compared instead of failing.
 
-**Checkpoint / resume.** Version 2 records append `{version, key, fingerprint, statuses, refs, at}` only for rows
+**Checkpoint / resume.** Version 3 records append `{version, key, fingerprint, statuses, refs, at}` only for rows
 whose exact `secret`, `target_set` and `policy` stages are complete and whose non-`n/a` stages have references.
 The fingerprint covers the tenant URLs, all effective object-shaping settings, sanitized template content, account
 mapping, full row input and the `update`/`drift` options the row was checked with (a row verified by a lighter
 run is reconciled again by `--update`). `--resume` drops only a matching complete record before the snapshot. Older, malformed,
 incomplete and mismatched records emit a warning and are reconciled. `uncertain`/`unverified` outcomes are never a
 successful record. A checkpoint is a local cache of an earlier verified result, not proof of current tenant state.
-`verify` and `connect-info` never use it.
+`verify` and `connect-info` never use it. Version-2 records remain in the file but cannot skip verification;
+the next successful apply appends a version-3 record for that row.
 
 **Parallelism and pacing.** `_parallel()` for reads (no canary), `_execute()` for writes (canary first, then the
 pool). `RateLimiter` (token bucket at `[http] max_requests_per_second`, shared by every `HttpClient`) is acquired
@@ -350,9 +356,9 @@ checkpoint, reports, connection CSV and `.rdp` files never contain secrets.
   beside the config file. Command-line paths remain relative to the invocation directory.
 - `validate()` checks HTTPS base URLs, IANA time zones, hour format, session/idle ranges, day values, lists,
   `provision_format` containing `<user>`,
-  the `owner_tag` charset, `identity_auth`, `status_polls` 1–10, `target_set_scope`, that `[http] ca_bundle`
+  the `owner_tag` charset, `identity_auth`, `status_polls` 1–10, `target_set_scope`, `principal_type`, that `[http] ca_bundle`
   exists on disk and is not combined with `verify = false`, that every name template (now including
-  `group_template` and `strong_account_domain`) uses only `{hostname}`, `{fqdn}`, `{domain}` and their
+  `principal_template` and `strong_account_domain`) uses only `{hostname}`, `{fqdn}`, `{domain}` and their
   `_upper`/`_lower` variants (`description_template` may also use `{protocol}`), the
   `strong_account_type` matrix (vault needs safe + account-name templates, credentials needs a username template,
   both need `strong_account_template`), the `[http]` scale keys (`max_requests_per_second >= 0`,
@@ -397,7 +403,7 @@ PascalCase; PVWA uses camelCase.
 | Strong accounts (legacy) | `GET /api/secrets?secret_type=ProvisionerUser,PCloudAccount` · `POST /api/secrets` |
 | Target sets | `GET /api/[discovery/]targetsets[?strongAccountId=…][&name=…][&b64StartKey=…]` → `{target_sets, b64_last_evaluated_key}` · `POST …/targetsets/bulk` (207, `results[].{target_set_name, success}`) · `PUT …/targetsets/{name}` |
 | Policies | `GET https://<sub>.uap.cyberark.cloud/api/policies?limit=50&filter=…[&q=…][&nextToken=…]` → `{results, nextToken}` (partial objects) · `GET /api/policies/{id}` · `POST /api/policies` → `{policyId}` · `PUT /api/policies/{id}` |
-| Directories | `GET {identity_url}/Core/GetDirectoryServices` · `POST {identity_url}/UserMgmt/DirectoryServiceQuery` with `{"directoryServices": [...], "group": "<json filter>", "Args": {...}}` |
+| Directories | `GET {identity_url}/Core/GetDirectoryServices` · `POST {identity_url}/UserMgmt/DirectoryServiceQuery` with `{"directoryServices": [<CDS uuid>], "roles": "{\"Name\": {\"_like\": {\"value\": …, \"ignoreCase\": true}}}", "Args": {...}}` → `Result.roles` (or `Roles`) rows `{_ID, Name, …}`; for groups `{"directoryServices": [...], "group": "<json filter>", "Args": {...}}` → `Result.Group` rows `{InternalName, SystemName, DirectoryServiceUuid, ServiceInstanceLocalized, …}` |
 | PVWA | `POST {pvwa}/PasswordVault/API/auth/{CyberArk\|LDAP}/Logon` → token (sent verbatim as `Authorization`) · `GET {pvwa}/PasswordVault/API/Accounts?search=<name>&filter=safeName eq <safe>` → `{value: [...]}` · `POST {pvwa}/PasswordVault/API/Accounts` · `POST …/auth/Logoff` |
 
 Headers on every call: `Authorization: Bearer <token>` (PVWA: the raw token), `Accept: application/json`, `X-IDAP-NATIVE-CLIENT: true`.
@@ -463,8 +469,8 @@ replaces the object, so omitting them would reset them to the platform default.
     "timeZone": "America/New_York",
     "status": {"status": "Active"}
   },
-  "principals": [{"id": "<InternalName>", "name": "SIA-Web-Admins", "type": "GROUP",
-                  "sourceDirectoryId": "<DirectoryServiceUuid>", "sourceDirectoryName": "CyberArk Cloud Directory"}],
+  "principals": [{"id": "<role _ID>", "name": "SIA-Web-Admins", "type": "ROLE",
+                  "sourceDirectoryId": "<CDS directoryServiceUuid>", "sourceDirectoryName": "CyberArk Cloud Directory"}],
   "delegationClassification": "Unrestricted",
   "conditions": {"accessWindow": {"daysOfTheWeek": [1, 2, 3, 4, 5], "fromHour": "07:00", "toHour": "19:00"},
                  "maxSessionDuration": 2, "idleTime": 10},
@@ -475,24 +481,31 @@ replaces the object, so omitting them would reset them to the platform default.
 }
 ```
 
+The principal is an Identity **role** by default (`[defaults] principal_type = "role"`): `id` is the role's `_ID` from
+DirectoryServiceQuery, and the two source-directory fields are optional for ROLE in the Access Control Policies API —
+the tool sends the CyberArk Cloud Directory when `GetDirectoryServices` lists it and ignores both fields when comparing.
+With `principal_type = "group"` the principal is `{"id": "<InternalName>", "name": …, "type": "GROUP",
+"sourceDirectoryId": "<DirectoryServiceUuid>", "sourceDirectoryName": "<ServiceInstanceLocalized>"}` and the directory
+fields are compared.
 `metadata.status` is **required** on create -- `ArkUAPMetadata.status` has no default and tenants reject a POST
 without it (`Field required (field: status)`); CyberArk's own SDK example sends
 `ArkUAPPolicyStatus(status=ArkUAPStatusType.ACTIVE)`. Allowed create defaults are `Active` and `Suspended`
 (`[defaults] policy_status`); `Validating`/`Error`/`Warning` are assigned by the platform and reported back on
-read. `build_policy_update` carries the *existing* status over so an unrelated fix cannot un-suspend a policy.
-Only `--update --set-policy-status Active|Suspended` deliberately substitutes the requested status, and the same
-option is available on `plan` for preview.
+read. The reconciler preserves an existing `Active` or `Suspended` status unless
+`--update --set-policy-status Active|Suspended` overrides it. A corrective field update from `Validating`, `Error`
+or `Warning` instead requests the configured stable status through `build_policy_update`; these platform states
+cannot themselves be requested. Both explicit and corrective status changes are included in the plan preview.
 **Linux policy** — identical except for the
 behaviour block and no target set / strong account: `"behavior": {"connectAs": {"ssh": {"username": "ec2-user"}}}`.
 
 Conventions confirmed per tenant with `show-policy` (and `--from-list`) before bulk runs: the FQDN-rule encoding
-(full FQDN in `computernamePattern` + DNS domain in `domain`), the principal's `sourceDirectoryName`/`sourceDirectoryId`
-values, and which fields the list endpoint carries.
+(full FQDN in `computernamePattern` + DNS domain in `domain`), the principal `type` (ROLE by default) and whether the
+tenant stores `sourceDirectoryName`/`sourceDirectoryId` for it, and which fields the list endpoint carries.
 
 ## 8. The consuming side
 
 `sia/connect.py` is pure and secret-free. `connect-info` combines it with a dry-run snapshot (unless
-`--no-tenant`) to produce, per row: `fqdn, hostname, policy_name, groups, protocol, strong_account, secret_status,
+`--no-tenant`) to produce, per row: `fqdn, hostname, policy_name, principals, protocol, strong_account, secret_status,
 target_set_status, policy_status, policy_id, portal_url, gateway_host, rdp_username, rdp_file`.
 
 - `gateway_host(cfg)` = `[connect] gateway_host` or `<subdomain>.rdp.<root_domain>`; `portal_url(cfg)` =
@@ -516,7 +529,7 @@ python -m pytest                 # fully offline
 ```
 
 - `tests/fakes.py`: an in-memory tenant (`FakeSIA` with `capabilities`, name/account filters; `FakeUAP` honouring the
-  tag filter, `partial_list`, 409 on duplicate names; `FakeIdentity`; `FakePVWA`) with hooks to inject failures, and a
+  tag filter, `partial_list`, 409 on duplicate names; `FakeIdentity` (roles and groups); `FakePVWA`) with hooks to inject failures, and a
   scripted `requests.Session` (`FakeSession`, `FakeResponse`).
 - `tests/test_payloads.py`: golden request bodies (SIA, UAP, PVWA), template validation, signatures on partial objects.
 - `tests/test_resolve_reconcile.py`: the decision matrix — create/exists/drift/blocked/inactive, both lookup modes,
@@ -576,7 +589,7 @@ Code must stay Python 3.11-compatible (no 3.12-only f-string nesting, no PEP 695
 | Change | Where |
 |---|---|
 | New policy field or behaviour (e.g. domain ephemeral user) | `payloads.build_policy` (+ golden test), possibly a new `servers.csv` column in `inputs.py` |
-| Another way to derive a row's group / account / target set | `inputs._resolve_groups` / `_resolve_strong_account` / `_resolve_target_set` — one function each, called from `_build_server_row` |
+| Another way to derive a row's principal / account / target set | `inputs._resolve_principals` / `_resolve_strong_account` / `_resolve_target_set` — one function each, called from `_build_server_row` |
 | A new name-template placeholder | three places in step: `config.TEMPLATE_PLACEHOLDERS`, `inputs._render_name`, `payloads.render` |
 | Credentials from a secret store instead of `.env` | a `sia/ccp.py` sibling of `sia/pvwa.py`, called from `sia_onboard.resolve_client_secret` |
 | New strong-account option (e.g. ephemeral domain user settings) | `payloads.build_secret_payload` `secret_details`, `inputs.StrongAccountRow`, `config.StrongAccountTemplate` |

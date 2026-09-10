@@ -37,6 +37,7 @@ def test_parse_setting_value_is_typed_and_clear():
     assert parse_setting_value(descriptor_for("defaults", "days_of_week"), "0, 2, 6") == [0, 2, 6]
     assert parse_setting_value(descriptor_for("defaults", "policy_tags"), '["one", "two"]') == ["one", "two"]
     assert parse_setting_value(descriptor_for("defaults", "policy_status"), "suspended") == "Suspended"
+    assert parse_setting_value(descriptor_for("defaults", "principal_type"), "Group") == "group"
     with pytest.raises(ConfigError, match="must be true or false"):
         parse_setting_value(descriptor_for("http", "verify"), "perhaps")
 

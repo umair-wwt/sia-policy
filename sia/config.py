@@ -33,6 +33,11 @@ PVWA_AUTH_TYPES = ("cyberark", "ldap")
 TEMPLATE_PLACEHOLDERS = ("hostname", "fqdn", "domain", "hostname_upper", "hostname_lower", "domain_upper")
 TARGET_SET_SCOPES = ("server", "auto", "domain")
 POLICY_STATUSES = ("Active", "Suspended")
+PRINCIPAL_TYPES = ("role", "group")
+PRINCIPAL_RENAME_HINT = ('policies grant access to Identity roles by default; '
+                         'set [defaults] principal_type = "group" to keep using groups')
+# Keys earlier releases used: the unknown-key error names the replacement instead of leaving the operator guessing.
+RENAMED_KEYS: dict[tuple[str, str], str] = {("defaults", "group_template"): "principal_template"}
 # [defaults] keys that must be written explicitly in config.toml (no silent organizational defaults)
 REQUIRED_DEFAULT_KEYS = ("days_of_week", "from_hour", "to_hour", "target_set_cert_validation")
 
@@ -116,9 +121,12 @@ class Defaults:
     template_policy: str = ""
     owner_tag: str = "sia-policy-automation"   # policy tag / description marker identifying objects this tool manages
     ssh_username: str = ""                     # default certificate username for protocol=ssh rows
-    # Identity group derived from the server name (servers.csv leaves group blank), e.g. "SIA-{hostname_upper}-RDP".
-    # domains.csv may override it per domain. Several groups: separate them with ';'.
-    group_template: str = ""
+    # What kind of Identity principal a policy grants access to: role (default; tenant-wide, nothing to pin) or
+    # group (may need a directory pin in groups.csv when the same name exists in several directories).
+    principal_type: str = "role"
+    # Principal derived from the server name (servers.csv leaves principal blank), e.g. "SIA-{hostname_upper}-RDP".
+    # domains.csv may override it per domain. Several principals: separate them with ';'.
+    principal_template: str = ""
     # How wide a target set is: server = one "Target" set per FQDN (every server has its own strong account);
     # auto = servers whose strong account comes from domains.csv share that domain's set, the rest fall back to
     # per-server; domain = as auto, but a domain-joined server missing from domains.csv is an error.
@@ -213,12 +221,19 @@ class Config:
 SECTIONS = ("tenant", "defaults", "auth", "http", "connect", "pvwa")
 
 
+def unknown_key_hint(section: str, key: str) -> str:
+    """Suffix for an unknown-key error when the key is one an earlier release used under another name."""
+    new = RENAMED_KEYS.get((section, key))
+    return f" ({key!r} was renamed to {new!r}: {PRINCIPAL_RENAME_HINT})" if new else ""
+
+
 def _build(cls, section: dict[str, Any], name: str):
     """Instantiate a frozen dataclass while rejecting unknown keys and incorrect TOML types."""
     known = {f.name: f for f in fields(cls)}
     unknown = sorted(set(section) - set(known))
     if unknown:
-        raise ConfigError(f"[{name}] has unknown key(s): {', '.join(unknown)}")
+        rename_hints = "".join(unknown_key_hint(name, key) for key in unknown)
+        raise ConfigError(f"[{name}] has unknown key(s): {', '.join(unknown)}{rename_hints}")
     hints = get_type_hints(cls)
     kwargs: dict[str, Any] = {}
     for key, value in section.items():
@@ -449,7 +464,7 @@ def validation_issues(cfg: Config) -> tuple[ValidationIssue, ...]:
         ("strong_account_account_name_template", TEMPLATE_PLACEHOLDERS),
         ("strong_account_username_template", TEMPLATE_PLACEHOLDERS),
         ("strong_account_domain", TEMPLATE_PLACEHOLDERS),
-        ("group_template", TEMPLATE_PLACEHOLDERS),
+        ("principal_template", TEMPLATE_PLACEHOLDERS),
         ("description_template", TEMPLATE_PLACEHOLDERS + ("protocol",)),
     )
     for key, placeholders in template_fields:
@@ -462,6 +477,9 @@ def validation_issues(cfg: Config) -> tuple[ValidationIssue, ...]:
     if d.target_set_scope not in TARGET_SET_SCOPES:
         issues.append(_issue("defaults", "target_set_scope",
             f"[defaults] target_set_scope must be one of {', '.join(TARGET_SET_SCOPES)}"))
+    if d.principal_type not in PRINCIPAL_TYPES:
+        issues.append(_issue("defaults", "principal_type",
+            f"[defaults] principal_type must be one of {', '.join(PRINCIPAL_TYPES)}"))
     if d.policy_status not in POLICY_STATUSES:
         issues.append(_issue("defaults", "policy_status",
             f"[defaults] policy_status must be one of {', '.join(POLICY_STATUSES)} "
@@ -611,7 +629,8 @@ def parse_config(text: str, source_path: str | Path = "config.toml") -> Config:
             continue
         hints = get_type_hints(cls)
         for key in sorted(set(table) - set(hints)):
-            structural.append(_issue(section_name, key, f"[{section_name}] has unknown key(s): {key}", code="unknown"))
+            structural.append(_issue(section_name, key,
+                f"[{section_name}] has unknown key(s): {key}{unknown_key_hint(section_name, key)}", code="unknown"))
         for key, value in table.items():
             if key not in hints:
                 continue
