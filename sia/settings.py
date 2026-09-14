@@ -210,6 +210,7 @@ _HELP: dict[tuple[str, str], str] = {
     ("http", "status_polls"): "Read-backs while a newly created policy is still validating, from 1 through 10.",
     ("http", "max_requests_per_second"): "Shared request-rate limit. Zero disables rate limiting.",
     ("http", "lookup_search_max_rows"): "Largest run that uses per-server lookup in automatic lookup mode.",
+    ("http", "policy_page_size"): "Policies read per request; raise it when reading policies is slow.",
     ("http", "secrets_api"): "Strong-account API family. Auto detects it with read-only requests.",
     ("http", "targetsets_api"): "Target-set API family. Auto detects it with read-only requests.",
     ("http", "ca_bundle"): "Trusted corporate CA file or directory. Relative paths resolve beside this configuration file.",

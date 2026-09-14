@@ -163,6 +163,7 @@ class HttpConfig:
     status_polls: int = 5                      # GETs after creating a policy while it is still "Validating" (1..10)
     max_requests_per_second: float = 0.0       # global rate limit shared by all workers; 0 = off
     lookup_search_max_rows: int = 2000         # --lookup auto: search per server up to this many servers, else list
+    policy_page_size: int = 50                 # rows per GET /api/policies page; raise it if policy reads are slow
     secrets_api: str = "auto"                  # auto | public (/api/secrets/public/v1+v2) | legacy (/api/secrets)
     targetsets_api: str = "auto"               # auto | legacy (/api/targetsets) | discovery (/api/discovery/targetsets)
     ca_bundle: str = ""                        # PEM file/dir of trusted CAs (TLS-inspecting proxies); "" = certifi
@@ -530,6 +531,8 @@ def validation_issues(cfg: Config) -> tuple[ValidationIssue, ...]:
             "[http] max_requests_per_second must be a finite number >= 0 (0 = no limit)"))
     if h.lookup_search_max_rows < 0:
         issues.append(_issue("http", "lookup_search_max_rows", "[http] lookup_search_max_rows must be an integer >= 0"))
+    if h.policy_page_size < 1:
+        issues.append(_issue("http", "policy_page_size", "[http] policy_page_size must be an integer >= 1"))
     if h.secrets_api not in SECRETS_API_FAMILIES:
         issues.append(_issue("http", "secrets_api", f"[http] secrets_api must be one of {', '.join(SECRETS_API_FAMILIES)}"))
     if h.targetsets_api not in TARGETSETS_API_FAMILIES:

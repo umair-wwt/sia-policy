@@ -178,10 +178,16 @@ class SIACapabilities:
     secrets_api: str = "legacy"            # public | legacy
     targetsets_api: str = "legacy"         # legacy | discovery
     targetsets_list_unfiltered: bool = True   # GET .../targetsets without strongAccountId is accepted
+    # Server-side name filters (secret_name, target-set name, policy q=) return what an unfiltered listing shows.
+    # Flipped to False when a filtered read comes back empty for a name the listing serves: on such a tenant no
+    # "does not exist" decision may rest on a filtered read.
+    name_filter_reliable: bool = True
     probed: bool = False
 
     def describe(self) -> str:
         listing = "unfiltered listing OK" if self.targetsets_list_unfiltered else "listing needs strongAccountId"
+        if not self.name_filter_reliable:
+            listing += ", name filter unreliable"
         return f"secrets={self.secrets_api} targetsets={self.targetsets_api} ({listing})"
 
 
@@ -477,9 +483,12 @@ class UAPClient:
 
     PAGE_SIZE = 50
 
-    def __init__(self, http: HttpClient, base_url: str):
+    def __init__(self, http: HttpClient, base_url: str, page_size: int | None = None):
         self._http = http
         self._base = base_url.rstrip("/")
+        # UAP applies `filter` after the page limit, so a filtered walk drains the cursor across every policy in the
+        # tenant: on a large tenant the page size, not the number of matches, decides how many round trips that costs.
+        self._page_size = int(page_size) if page_size else self.PAGE_SIZE
 
     def list_policies(self, *, text: str | None = None, filter_query: str | None = UAP_VM_FILTER,
                       max_pages: int = MAX_LIST_PAGES) -> list[dict[str, Any]]:
@@ -491,7 +500,7 @@ class UAPClient:
         seen_pages: set[str] = set()
         url = f"{self._base}/api/policies"
         for _ in range(max_pages):
-            params: dict[str, Any] = {"limit": self.PAGE_SIZE}
+            params: dict[str, Any] = {"limit": self._page_size}
             if filter_query:
                 params["filter"] = filter_query
             if text:

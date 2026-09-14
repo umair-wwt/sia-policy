@@ -265,13 +265,20 @@ class Reconciler:
         target_set_names = list(dict.fromkeys(s.target_set_key for s, _ in self._rows if not s.is_ssh))
         accounts = self._active_accounts()
         self._lookup_mode = self._choose_lookup(len(fqdns))
-        self._snapshot_secrets(accounts)
-        self._snapshot_target_sets(target_set_names, accounts)
-        self._snapshot_policies(fqdns)
-        self._snapshot_principals()
-        self._log.info("Tenant snapshot (%s lookup): %d strong accounts, %d target sets, %d policies read for %d rows (%d resumed)",
+        # Per-stage timings: a slow tenant read is otherwise a single unbroken gap in the log, with nothing to say
+        # which of the four reads spent the time.
+        timings: list[str] = []
+        for label, read in (("secrets", lambda: self._snapshot_secrets(accounts)),
+                            ("target sets", lambda: self._snapshot_target_sets(target_set_names, accounts)),
+                            ("policies", lambda: self._snapshot_policies(fqdns)),
+                            ("principals", self._snapshot_principals)):
+            started = time.monotonic()
+            read()
+            timings.append(f"{label} {time.monotonic() - started:.1f}s")
+        self._log.info("Tenant snapshot (%s lookup): %d strong accounts, %d target sets, %d policies read for %d rows "
+                       "(%d resumed) [%s]",
                        self._lookup_mode, len(self._secrets), len(self._target_sets), len(self._policies), len(self._rows),
-                       len(self._resumed))
+                       len(self._resumed), ", ".join(timings))
         self._snapshotted = True
 
     def reconcile(self, dry_run: bool | None = None) -> RunResult:
@@ -433,6 +440,11 @@ class Reconciler:
         caps = getattr(self.sia, "capabilities", None)
         return str(getattr(caps, "secrets_api", "") or "")
 
+    def _filters_trusted(self) -> bool:
+        """Whether this tenant's server-side name filters agree with an unfiltered listing."""
+        caps = getattr(self.sia, "capabilities", None)
+        return True if caps is None else bool(getattr(caps, "name_filter_reliable", True))
+
     def _snapshot_secrets(self, accounts: list[StrongAccountRow]) -> None:
         # The legacy secrets API has no server-side name filter: a per-account search would list every secret once
         # per account, so read the listing once and index it, whatever the lookup mode.
@@ -442,6 +454,25 @@ class Reconciler:
             for secret in found:
                 if secret:
                     self._secrets.add(secret)
+            # An empty server-side filtered read is not proof of absence: secret_name only narrows what the
+            # client-side filter would pick out anyway, and some tenants match nothing for a name the unfiltered
+            # listing serves. Confirm once for the whole batch before any miss becomes a failure or a create.
+            if any(not self._secrets.has(a.sia_name) for a in accounts):
+                listed = SecretIndex(self.sia.list_secrets())
+                recovered = sorted({a.sia_name for a in accounts
+                                    if not self._secrets.has(a.sia_name) and listed.has(a.sia_name)})
+                self._secrets = listed
+                if recovered:
+                    caps = getattr(self.sia, "capabilities", None)
+                    if caps is not None:
+                        caps.name_filter_reliable = False
+                    shown = ", ".join(repr(n) for n in recovered[:3])
+                    if len(recovered) > 3:
+                        shown += f" and {len(recovered) - 3} more"
+                    self._snapshot_warnings.append(
+                        f"this tenant matched nothing when filtering by name for {shown}, but its unfiltered listing "
+                        f"serves {'it' if len(recovered) == 1 else 'them'}; no object was read by a server-side filter "
+                        "after that. Pin --lookup list (or [http] lookup_search_max_rows = 0) for this tenant.")
         else:
             self._secrets = SecretIndex(self.sia.list_secrets())
         # Ambiguity must be discovered before any account or target-set write.
@@ -470,7 +501,7 @@ class Reconciler:
         caps = getattr(self.sia, "capabilities", None)
         unfiltered = True if caps is None else bool(caps.targetsets_list_unfiltered)
         items: list[dict[str, Any]] = []
-        if self._lookup_mode == "search" and unfiltered:
+        if self._lookup_mode == "search" and unfiltered and self._filters_trusted():
             for chunk in self._parallel(names, lambda n: self.sia.list_target_sets(name=n)):
                 items.extend(chunk)
         elif unfiltered:
@@ -494,7 +525,7 @@ class Reconciler:
 
     def _snapshot_policies(self, fqdns: list[str]) -> None:
         self._owned_by_fqdn = None
-        if self._lookup_mode == "search":
+        if self._lookup_mode == "search" and self._filters_trusted():
             # q= searches name + description: the FQDN finds policies named after the server (and renamed ones whose
             # description still names it); rows with a custom policy_name are searched by that name as well.
             queries = list(dict.fromkeys(fqdns))

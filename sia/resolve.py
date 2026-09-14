@@ -174,6 +174,10 @@ class SecretIndex:
                 return
             candidates.append(secret)
 
+    def has(self, sia_name: str) -> bool:
+        """Presence test by SIA name. Unlike `find` it never raises, so it is safe on an ambiguous name."""
+        return bool(self._by_name.get(sia_name.casefold()))
+
     def find(self, account: StrongAccountRow) -> dict[str, Any] | None:
         """Deterministic: vault accounts by the platform's <account_name>_<safe> name, others by their CSV name."""
         candidates = self._by_name.get(account.sia_name.casefold(), [])

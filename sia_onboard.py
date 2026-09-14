@@ -110,7 +110,7 @@ class Context:
         identity_http = self.http if self.identity_token is self.token else HttpClient(
             self.identity_token, timeout=timeout, max_retries=cfg.http.max_retries, limiter=self.limiter, verify=verify)
         self.sia = SIAClient(self.http, cfg.tenant.dpa_url, secrets_api=cfg.http.secrets_api, targetsets_api=cfg.http.targetsets_api)
-        self.uap = UAPClient(self.http, cfg.tenant.uap_url)
+        self.uap = UAPClient(self.http, cfg.tenant.uap_url, page_size=cfg.http.policy_page_size)
         self.identity = IdentityClient(identity_http, cfg.tenant.identity_url)
         self._pvwa: PVWAClient | None = None
 

@@ -170,7 +170,9 @@ def test_search_lookup_reads_per_server():
     assert sorted(calls(sia, "find_secret")) == sorted([VAULT_SIA_NAME, "SA-dmz"])
     assert sorted(name for _, name in calls(sia, "list_target_sets")) == sorted([WEB01_FQDN, WEB02_FQDN, DMZ_FQDN])
     assert sorted(text for text, _ in calls(uap, "list_policies")) == sorted([WEB01_FQDN, WEB02_FQDN, DMZ_FQDN])
-    assert "list_secrets" not in [c[0] for c in sia.calls]
+    # This tenant is empty, so both per-name reads miss and one unfiltered listing confirms that before the misses
+    # become creates. A tenant that serves every name costs nothing extra -- see the test below.
+    assert calls(sia, "list_secrets") == [None]
 
 
 def test_auto_lookup_switches_on_size():
@@ -387,6 +389,66 @@ def test_legacy_secrets_are_listed_once_even_in_search_mode():
     result = make(ONE, sia=sia, lookup="search")[0].run()
     assert result.servers[0].secret.status == "exists"
     assert calls(sia, "find_secret") == [] and calls(sia, "list_secrets") == [None]
+
+
+def test_a_tenant_that_serves_every_name_is_never_listed_in_search_mode():
+    sia = FakeSIA(secrets=[{"secret_id": "sec-1", "secret_type": "PCloudAccount", "secret_name": VAULT_SIA_NAME}])
+    result = make(ONE, sia=sia, dry_run=True, lookup="search")[0].run()
+    assert result.secrets["SA-corp-rdp"].status == "exists"
+    assert calls(sia, "find_secret") == [VAULT_SIA_NAME] and "list_secrets" not in [c[0] for c in sia.calls]
+
+
+class BlindFilterSIA(FakeSIA):
+    """A tenant whose server-side name filters match nothing, while the unfiltered listings serve the records.
+
+    Observed on adp-amrs-uat: GET /api/secrets/public/v2 returned zero rows for a secret_name the same endpoint
+    returned when listed unfiltered, and the run reported the strong account as missing.
+    """
+
+    def find_secret(self, name):
+        self.calls.append(("find_secret", name))
+        return None
+
+    def list_target_sets(self, *, strong_account_id=None, name=None):
+        if name:
+            self.calls.append(("list_target_sets", (strong_account_id, name)))
+            return []
+        return super().list_target_sets(strong_account_id=strong_account_id)
+
+
+def test_a_blind_name_filter_does_not_become_a_missing_strong_account():
+    sia = BlindFilterSIA(secrets=[{"secret_id": "sec-1", "secret_type": "PCloudAccount", "secret_name": VAULT_SIA_NAME}])
+    result = make(ONE, sia=sia, dry_run=True, lookup="search")[0].run()
+
+    assert result.secrets["SA-corp-rdp"].status == "exists" and result.failures == 0
+    assert calls(sia, "find_secret") == [VAULT_SIA_NAME]     # the filtered read was tried first
+    assert calls(sia, "list_secrets") == [None]              # then confirmed once, unfiltered
+    assert any("unfiltered listing" in w and VAULT_SIA_NAME in w and "--lookup list" in w for w in result.warnings)
+
+
+def test_an_unreliable_name_filter_stops_the_rest_of_the_run_from_filtering():
+    sia = BlindFilterSIA(secrets=[{"secret_id": "sec-1", "secret_type": "PCloudAccount", "secret_name": VAULT_SIA_NAME}],
+                         target_sets=[{"id": "ts-1", "name": WEB01_FQDN, "type": "Target", "secret_id": "sec-1",
+                                       "secret_type": "PCloudAccount"}])
+    rec, sia, uap, _ = make(ONE, sia=sia, dry_run=True, lookup="search")
+    result = rec.run()
+
+    # Target sets and policies fall back to their unfiltered reads, so the existing target set is still seen.
+    assert calls(sia, "list_target_sets") == [(None, None)]
+    assert uap.calls == [("list_policies", (None, OWNED_FILTER))]
+    assert result.servers[0].target_set.status == "exists"
+    assert not sia.capabilities.name_filter_reliable
+    assert "name filter unreliable" in sia.capabilities.describe()
+
+
+def test_an_account_missing_from_both_reads_still_fails_after_one_confirming_listing():
+    sia = FakeSIA()
+    result = make(inputs([srv("a.corp.example.com", "SA-legacy", ["SIA-Web-Admins"])], [EXISTING]),
+                  sia=sia, lookup="search")[0].run()
+
+    assert result.secrets["SA-legacy"].status == "failed" and "type=existing" in result.secrets["SA-legacy"].detail
+    assert calls(sia, "list_secrets") == [None] and sia.capabilities.name_filter_reliable
+    assert result.warnings == [] and not calls(sia, "create_secret")
 
 
 def test_progress_is_logged(caplog):
