@@ -193,8 +193,10 @@ def test_target_set_update_requires_exact_account_filtered_readback(tmp_path):
     assert "did not return the requested target set" in outcome.detail
     assert outcome.diagnostic["mutation_state"] == "applied"
     update_index = next(i for i, call in enumerate(sia.calls) if call[0] == "update_target_set")
+    # Filtered by the strong account, which is what makes the re-pointed set invisible here; the name is matched
+    # client-side instead, so a server-side name filter cannot report a good write as unverified.
     assert [call[1] for call in sia.calls[update_index + 1:] if call[0] == "list_target_sets"] == [
-        ("sec-1", "web01.corp.example.com"), ("sec-1", "web01.corp.example.com")]
+        ("sec-1", None), ("sec-1", None)]
     assert checkpoint.done_count() == 0
 
 

@@ -483,12 +483,14 @@ class UAPClient:
 
     PAGE_SIZE = 50
 
-    def __init__(self, http: HttpClient, base_url: str, page_size: int | None = None):
+    def __init__(self, http: HttpClient, base_url: str, page_size: int | None = None,
+                 logger: logging.Logger | None = None):
         self._http = http
         self._base = base_url.rstrip("/")
         # UAP applies `filter` after the page limit, so a filtered walk drains the cursor across every policy in the
         # tenant: on a large tenant the page size, not the number of matches, decides how many round trips that costs.
         self._page_size = int(page_size) if page_size else self.PAGE_SIZE
+        self._log = logger or logging.getLogger("sia.clients")
 
     def list_policies(self, *, text: str | None = None, filter_query: str | None = UAP_VM_FILTER,
                       max_pages: int = MAX_LIST_PAGES) -> list[dict[str, Any]]:
@@ -545,12 +547,24 @@ class UAPClient:
 
     def find_policy_by_name(self, name: str) -> dict[str, Any] | None:
         """Text search then exact name match (the API's q= is a substring search)."""
-        candidates = self.list_policies(text=name, filter_query=None)
-        return _one_exact(candidates, name,
-                          name_of=lambda p: (p.get("metadata") or {}).get("name"),
-                          id_of=lambda p: (p.get("metadata") or {}).get("policyId")
-                          or (p.get("metadata") or {}).get("policy_id"),
-                          resource="policy", url=f"{self._base}/api/policies")
+        def exact(candidates: list[dict[str, Any]]) -> dict[str, Any] | None:
+            return _one_exact(candidates, name,
+                              name_of=lambda p: (p.get("metadata") or {}).get("name"),
+                              id_of=lambda p: (p.get("metadata") or {}).get("policyId")
+                              or (p.get("metadata") or {}).get("policy_id"),
+                              resource="policy", url=f"{self._base}/api/policies")
+
+        found = exact(self.list_policies(text=name, filter_query=None))
+        if found is not None:
+            return found
+        # q= only narrows what the exact match above picks out anyway. Some tenants match nothing for a name the
+        # unfiltered listing serves, and a false "not found" here aborts the run (template_policy) or lets the
+        # 409 reclassifier fail open into a duplicate policy -- so confirm before reporting absence.
+        found = exact(self.list_policies(text=None, filter_query=None))
+        if found is not None:
+            self._log.warning("policy %r was not returned by the q= search but the unfiltered listing has it; "
+                              "this tenant's server-side name filter is unreliable", name)
+        return found
 
     def create_policy(self, payload: dict[str, Any]) -> str:
         resp = self._http.post(f"{self._base}/api/policies", json=payload, expected=(200, 201))

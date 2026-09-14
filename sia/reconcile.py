@@ -1118,7 +1118,10 @@ class Reconciler:
         last_mismatch = "did not return the requested target set"
         for attempt in range(self.status_polls):
             try:
-                rows = self.sia.list_target_sets(name=name, strong_account_id=secret_id)
+                # No name= filter: the exact match below re-checks the name anyway, and a server-side filter that
+                # matches nothing would report a good write as unverified. strong_account_id already bounds this to
+                # one account's sets, and on some tenants it is the only listing key accepted.
+                rows = self.sia.list_target_sets(strong_account_id=secret_id)
             except SIAApiError:
                 if attempt >= self.status_polls - 1:
                     raise

@@ -80,15 +80,35 @@ class PVWAClient:
         """The account named `name` in `safe`, or None."""
         if max_pages < 1:
             raise ValueError("max_pages must be at least 1")
+        safe_filter = f"safeName eq {safe}"
+        matches = self._account_matches(safe, name, {"search": name, "filter": safe_filter}, max_pages)
+        if not matches:
+            # `search` is a server-side substring match over a set this walk re-checks exactly, so it only narrows
+            # what the exact comparison would pick out anyway. On a tenant whose search misses a name the safe does
+            # hold, believing the empty result onboards a SECOND privileged account into that safe -- so scan the
+            # safe itself before concluding the account is absent.
+            matches = self._account_matches(safe, name, {"filter": safe_filter}, max_pages)
+            if matches:
+                self._log.warning("account %r was not returned by search=%r but safe %r holds it; this Vault's "
+                                  "account search is unreliable", name, name, safe)
+        if len(matches) > 1:
+            raise SIAApiError("GET", f"{self._base}/PasswordVault/API/Accounts", 200,
+                              f"PVWA account {name!r} in safe {safe!r} is ambiguous across ids: "
+                              f"{', '.join(sorted(matches))}", cause="ambiguous_response")
+        return next(iter(matches.values()), None)
+
+    def _account_matches(self, safe: str, name: str, params: dict[str, str],
+                         max_pages: int) -> dict[str, dict[str, Any]]:
+        """Walk /Accounts with `params`, returning every account whose name and safe match exactly, keyed by id."""
         initial_url = f"{self._base}/PasswordVault/API/Accounts"
         url = initial_url
-        params: dict[str, str] | None = {"search": name, "filter": f"safeName eq {safe}"}
+        request_params: dict[str, str] | None = dict(params)
         seen_urls: set[str] = set()
         seen_pages: set[str] = set()
         matches: dict[str, dict[str, Any]] = {}
         for _ in range(max_pages):
-            response = self._http.get(url, params=params, headers=self._headers())
-            params = None
+            response = self._http.get(url, params=request_params, headers=self._headers())
+            request_params = None
             body = json_or_error(response)
             if not isinstance(body, dict) or not isinstance(body.get("value"), list):
                 raise SIAApiError("GET", response.url, response.status_code,
@@ -109,11 +129,7 @@ class PVWAClient:
                     matches.setdefault(account_id, account)
             next_link = body.get("nextLink")
             if next_link in (None, ""):
-                if len(matches) > 1:
-                    raise SIAApiError("GET", initial_url, 200,
-                                      f"PVWA account {name!r} in safe {safe!r} is ambiguous across ids: "
-                                      f"{', '.join(sorted(matches))}", cause="ambiguous_response")
-                return next(iter(matches.values()), None)
+                return matches
             if not isinstance(next_link, str) or not next_link.strip():
                 raise SIAApiError("GET", response.url, response.status_code,
                                   "PVWA account nextLink must be a non-empty string or null",

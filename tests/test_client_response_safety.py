@@ -209,6 +209,49 @@ def test_secret_index_rejects_only_the_referenced_ambiguous_name():
     assert index.find(other)["secret_id"] == "s3" and len(index) == 2
 
 
+def test_a_name_search_that_matches_nothing_is_confirmed_against_the_unfiltered_listing():
+    """adp-amrs-uat matched nothing for a secret_name its unfiltered listing served. The same server-side filters
+    back the policy and Vault-account lookups, where a false "not found" aborts a run or creates a duplicate."""
+    client, session = http_with([
+        FakeResponse(200, {"results": []}),                        # q=<name> matches nothing
+        FakeResponse(200, {"results": [policy("web01.corp", "p1")]}),   # the unfiltered listing has it
+    ])
+    found = UAPClient(client, "https://u").find_policy_by_name("web01.corp")
+    assert found == policy("web01.corp", "p1")
+    assert [call[2]["params"].get("q") for call in session.requests] == ["web01.corp", None]
+
+    # A policy that is genuinely absent stays absent, at the cost of exactly one confirming listing.
+    client, session = http_with([FakeResponse(200, {"results": []}), FakeResponse(200, {"results": []})])
+    assert UAPClient(client, "https://u").find_policy_by_name("nope") is None
+    assert len(session.requests) == 2
+
+    # A tenant whose filter works is never listed unfiltered.
+    client, session = http_with([FakeResponse(200, {"results": [policy("web01.corp", "p1")]})])
+    assert UAPClient(client, "https://u").find_policy_by_name("web01.corp")["metadata"]["policyId"] == "p1"
+    assert len(session.requests) == 1
+
+
+def test_a_vault_account_search_that_matches_nothing_is_confirmed_against_the_safe():
+    session = FakeSession([
+        FakeResponse(200, '"token"'),
+        FakeResponse(200, {"value": []}),                                             # search=<name> finds nothing
+        FakeResponse(200, {"value": [{"id": "1", "name": "Admin", "safeName": "Safe"}]}),   # the safe holds it
+    ])
+    pvwa = PVWAClient("https://pvwa.example", session=session, sleep=lambda _: None)
+    pvwa.logon("svc", "pw")
+    assert pvwa.find_account("safe", "admin")["id"] == "1"
+    # The retry drops `search` but keeps the safe filter, so it scans one safe rather than the whole Vault.
+    assert [call[2]["params"] for call in session.requests[1:]] == [
+        {"search": "admin", "filter": "safeName eq safe"}, {"filter": "safeName eq safe"}]
+
+    # Absent from the safe too: still None, and the duplicate-onboarding guard has cost two reads.
+    session = FakeSession([FakeResponse(200, '"token"'), FakeResponse(200, {"value": []}),
+                           FakeResponse(200, {"value": []})])
+    pvwa = PVWAClient("https://pvwa.example", session=session, sleep=lambda _: None)
+    pvwa.logon("svc", "pw")
+    assert pvwa.find_account("safe", "admin") is None and len(session.requests) == 3
+
+
 def test_pvwa_paginates_safely_and_rejects_duplicate_exact_accounts():
     session = FakeSession([
         FakeResponse(200, '"token"'),
