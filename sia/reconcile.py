@@ -49,8 +49,9 @@ from .payloads import (
     build_bulk_target_sets, build_policy, build_policy_update, build_secret_payload, build_target_set,
     build_target_set_update, build_vault_account, exact_fqdns, implied_session_overrides, is_owned_policy,
     is_owned_target_set, partition_differences, plain, policy_name_for, policy_signature, policy_status,
-    sanitize_template, target_set_name_for, target_set_signature, validate_template,
+    sanitize_template, target_set_name_for, target_set_differences, target_set_signature, validate_template,
 )
+from .payloads import TARGET_SET_SECRET_KEYS, TARGET_SET_UNKNOWN_DEFAULTS
 from .redact import register_secret
 from .resolve import PrincipalResolver, ResolveError, SecretIndex, pick, secret_id_of, secret_type_of
 
@@ -80,6 +81,24 @@ BAD = ("failed", "blocked", "inactive", "uncertain", "unverified")
 NON_SYSTEMATIC_4XX = (404, 409, 429)
 NOT_APPLICABLE = "n/a"
 _CONFLICT_WORDS = ("already exist", "duplicate", "unique", "conflict")
+
+
+_ACTIVE_WORDS = {"true": True, "1": True, "yes": True, "active": True, "enabled": True,
+                 "false": False, "0": False, "no": False, "inactive": False, "disabled": False}
+
+
+def _active_flag(value: Any) -> bool | None:
+    """A strong account's active flag however the API spells it (bool, 0/1, a word); None when it cannot be read.
+    An absent field is not a reason to think the account is disabled."""
+    if value is None:
+        return True
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int) and value in (0, 1):
+        return bool(value)
+    if isinstance(value, str):
+        return _ACTIVE_WORDS.get(value.strip().casefold())
+    return None
 
 
 def env_password(account: StrongAccountRow) -> str | None:
@@ -1023,8 +1042,6 @@ class Reconciler:
             if found:
                 sid, stype = secret_id_of(found), secret_type_of(found)
                 detail = f"{stype} secret {sid} ({account.sia_name})"
-                if account.secret_type and stype and account.secret_type != stype:
-                    result.warnings.append(f"strong account {account.name!r}: CSV type={account.type} but SIA has {stype}; using SIA's type")
                 if not sid:
                     result.secrets[account.name] = Outcome(
                         "unverified", f"strong account {account.sia_name!r} was returned without a usable secret id; "
@@ -1035,7 +1052,22 @@ class Reconciler:
                         "unverified", f"strong account {account.sia_name!r} ({sid}) has no secret type; "
                                       "target-set and policy changes are blocked", sid)
                     continue
-                if pick(found, "is_active", "isActive", default=True) is False:
+                if account.secret_type and account.secret_type.casefold() != stype.casefold():
+                    # A name match alone is not the account the CSV describes: binding target sets (and so every
+                    # session's privileged credential) to another kind of secret is a failure, not a footnote.
+                    result.secrets[account.name] = Outcome(
+                        "failed", f"{detail} is a {stype}, but {account.name!r} is type={account.type} "
+                                  f"({account.secret_type}); rename one of them before reconciling, so target sets never "
+                                  "bind to another kind of credential", sid)
+                    continue
+                raw_active = pick(found, "is_active", "isActive", default=None)
+                active = _active_flag(raw_active)
+                if active is None:
+                    result.secrets[account.name] = Outcome(
+                        "unverified", f"{detail} has an active flag this tool cannot read ({raw_active!r}); "
+                                      "target-set and policy changes are blocked", sid)
+                    continue
+                if not active:
                     result.secrets[account.name] = Outcome(
                         "inactive", f"{detail} is inactive; activate it in SIA before reconciling dependent target sets", sid)
                     continue
@@ -1169,10 +1201,10 @@ class Reconciler:
                                        secret_id: str | None, secret_type: str, result: RunResult) -> Outcome:
         name = target_set_name_for(server)
         expected_type = server.target_set_type or "Target"
-        current_secret = pick(current, "secret_id", "secretId")
+        current_secret = pick(current, *TARGET_SET_SECRET_KEYS)
         ts_type = pick(current, "type", default=expected_type)
         owned = is_owned_target_set(current, self.defaults.owner_tag)
-        if str(ts_type) != expected_type:
+        if str(ts_type).strip().casefold() != expected_type.casefold():
             result.warnings.append(f"target set {name!r} exists with type={ts_type} (expected {expected_type})")
         if not secret_id:
             # Dry run with a strong account that is only planned: it does not exist yet, so this set necessarily
@@ -1194,9 +1226,7 @@ class Reconciler:
             "certificate_validation": "certificate validation differs", "provision_format": "provision format differs",
         }
         differences: list[str] = []
-        for key in keys:
-            if current_sig[key] == desired_sig[key]:
-                continue
+        for key in target_set_differences(current_sig, desired_sig, keys, unknown_defaults=TARGET_SET_UNKNOWN_DEFAULTS):
             if key == "secret_id":
                 differences.append(f"points to secret {current_secret}, expected {secret_id} ({server.strong_account})")
             else:
@@ -1271,10 +1301,19 @@ class Reconciler:
                 except (AttributeError, TypeError, ValueError):
                     last_mismatch = "returned a malformed target-set object"
                 else:
-                    if actual_signature == wanted_signature:
+                    changed = [key.replace("_", " ") for key in
+                               target_set_differences(actual_signature, wanted_signature, tuple(wanted_signature))]
+                    if not changed:
+                        unknown = [key.replace("_", " ") for key in wanted_signature
+                                   if actual_signature.get(key) is None and wanted_signature.get(key) is not None]
+                        if unknown:
+                            warning = (f"target-set listings on this tenant do not carry {', '.join(unknown)}; the values "
+                                       "written for them cannot be read back, so they were accepted unverified")
+                            with self._lock:   # the run's warnings were copied from the snapshot before any write
+                                sink = self._result.warnings if self._result is not None else self._snapshot_warnings
+                                if warning not in sink:
+                                    sink.append(warning)
                         return exact[0], ""
-                    changed = [key.replace("_", " ") for key in wanted_signature
-                               if actual_signature.get(key) != wanted_signature[key]]
                     last_mismatch = "still differs in " + ", ".join(changed)
             elif len(exact) > 1:
                 last_mismatch = f"returned {len(exact)} exact-name matches"
@@ -1508,6 +1547,10 @@ class Reconciler:
         owned = is_owned_policy(full, self.defaults.owner_tag)
         adopted = self._adopted(server, sr)
         current_sig, desired_sig = policy_signature(full), policy_signature(desired)
+        if self.drift and full.get("targets") is not None and current_sig["fqdn_rules"] is None:
+            sr.policy = Outcome("unverified", f"policy {policy_id} targets carry no FQDN/IP rules block; cannot confirm "
+                                              "which servers it grants access to or safely update", policy_id)
+            return
         diff: list[str] = []
         checked = ["name"]
         if renamed:
@@ -1521,13 +1564,15 @@ class Reconciler:
             "time_zone": "time zone differs", "principals": "principals differ",
             "principal_details": "principal directory details differ",
             "delegation": "delegation classification differs", "conditions": "access conditions differ",
-            "fqdn_rules": "FQDN rules differ", "behavior": "connection behavior differs",
+            "fqdn_rules": "FQDN rules differ", "target_extras": "extra target rules differ",
+            "behavior": "connection behavior differs",
         }
         notes: list[str] = []
         for key in compare_keys:
             if current_sig.get(key) is None:
                 continue
-            checked.append("targets" if key == "fqdn_rules" else key.replace("_", " "))
+            if key != "target_extras":      # compared like every block, but "targets" is listed once
+                checked.append("targets" if key == "fqdn_rules" else key.replace("_", " "))
             if current_sig[key] != desired_sig[key]:
                 managed, tenant_only = self._partition(key, plain(current_sig[key]), plain(desired_sig[key]))
                 if managed:
@@ -1535,6 +1580,16 @@ class Reconciler:
                 if tenant_only:
                     notes.append(_tenant_only_values(key, tenant_only))
         status = policy_status(full)
+        if not status and full is existing:
+            # a list projection without metadata.status: settle it with one full read, as for a missing block
+            try:
+                full = self._full_policy(existing, force=True)
+            except SIAApiError as exc:
+                sr.policy = self._exception_outcome(
+                    "failed", f"could not read existing policy {policy_id}", exc,
+                    stage="policy lookup", object_name=sr.policy_name, ref=policy_id)
+                return
+            status = policy_status(full)
         if self.set_policy_status is not None and status != self.set_policy_status:
             diff.append(f"status is {status or 'unknown'}, requested {self.set_policy_status}")
         if self.update and adopted and not owned:
@@ -1552,7 +1607,7 @@ class Reconciler:
             ok_status = "exists" if status == "Active" or (status == "Suspended" and suspended_requested) else "inactive"
             note = "" if owned else " (unmanaged: no owner tag; pass --adopt to take ownership)"
             hint = "" if "targets" in checked else "; add --drift to compare targets"
-            full_hint = "; targets checked" if self.drift else ""
+            full_hint = "; targets checked" if self.drift and "targets" in checked else ""
             sr.policy = Outcome(ok_status, f"policy {policy_id} up to date ({', '.join(checked)} checked{hint})"
                                            f"{full_hint}{note}{status_note}", policy_id, notes=tuple(notes))
             return

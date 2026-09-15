@@ -1,6 +1,7 @@
 """Offline fakes: an in-memory tenant standing in for SIAClient/UAPClient/IdentityClient/PVWAClient, and a fake requests.Session."""
 from __future__ import annotations
 
+import html
 import json
 import re
 from typing import Any
@@ -68,6 +69,8 @@ class FakeSIA:
         self.raise_on_settings: SIAApiError | None = None
         self.raise_on_bulk: SIAApiError | None = None
         self.raise_on_update_target_set: SIAApiError | None = None
+        self.echo_strong_account_id = False      # listings spell the account link strong_account_id, not secret_id
+        self.omit_target_set_fields: set[str] = set()   # fields the listing projection does not carry
         self._counter = 0
 
     def probe(self):
@@ -112,6 +115,10 @@ class FakeSIA:
             items = [t for t in items if t.get("secret_id") == strong_account_id]
         if name:
             items = [t for t in items if t["name"].lower() == name.lower()]
+        if self.echo_strong_account_id:
+            items = [{("strong_account_id" if key == "secret_id" else key): value for key, value in t.items()} for t in items]
+        if self.omit_target_set_fields:
+            items = [{key: value for key, value in t.items() if key not in self.omit_target_set_fields} for t in items]
         return items
 
     def bulk_create_target_sets(self, mapping):
@@ -153,6 +160,9 @@ class FakeUAP:
         self.echo_session_overrides = False  # with echo_defaults: the flags a tenant with policy-level session
                                              # settings derives from the request (override* true when the setting
                                              # was sent, overrideRecording false)
+        self.echo_null_blocks = False        # with echo_defaults: an empty time frame echoes as null, not {}
+        self.echo_html_escaped = False       # every read echoes metadata.name/description HTML-escaped (the SDK
+                                             # escapes both before sending)
         self.conflict_on_create: set[str] = set()   # policy names whose creation answers 409
         self._counter = 0
 
@@ -168,7 +178,14 @@ class FakeUAP:
         if self.partial_list:
             for p in items:
                 p.pop("targets", None)
-        return items
+        return [self._escaped(p) for p in items]
+
+    def _escaped(self, policy):
+        if self.echo_html_escaped:
+            for key in ("name", "description"):
+                if policy["metadata"].get(key):
+                    policy["metadata"][key] = html.escape(policy["metadata"][key])
+        return policy
 
     def find_policies_for_fqdn(self, fqdn):
         return self.list_policies(text=fqdn, filter_query="(targetCategory eq 'VM')")
@@ -177,7 +194,7 @@ class FakeUAP:
         self.calls.append(("get_policy", policy_id))
         for p in self.policies:
             if p["metadata"].get("policyId") == policy_id:
-                copy = json.loads(json.dumps(p))
+                copy = self._escaped(json.loads(json.dumps(p)))
                 if self.statuses_sequence:
                     copy["metadata"]["status"] = {"status": self.statuses_sequence.pop(0), "statusDescription": "connector unreachable"}
                 return self._with_echoed_defaults(copy) if self.echo_defaults else copy
@@ -186,6 +203,8 @@ class FakeUAP:
     def _with_echoed_defaults(self, policy):
         """Fields the tool never sends but the API returns as null/empty for an unset value."""
         policy["metadata"]["timeFrame"] = {"fromTime": None, "toTime": None, **(policy["metadata"].get("timeFrame") or {})}
+        if self.echo_null_blocks and not any(value for value in policy["metadata"]["timeFrame"].values()):
+            policy["metadata"]["timeFrame"] = None
         conditions = policy.setdefault("conditions", {})
         window = conditions.setdefault("accessWindow", {})
         window.setdefault("fromHour", None)
@@ -212,7 +231,7 @@ class FakeUAP:
                 copy = json.loads(json.dumps(p))
                 if self.partial_list:
                     copy.pop("targets", None)
-                return copy
+                return self._escaped(copy)
         return None
 
     def create_policy(self, payload):

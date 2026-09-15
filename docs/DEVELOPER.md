@@ -260,11 +260,24 @@ required" (`_approval_unset`) and a session-override flag carrying the value the
 managed values (`tenant -> requested`) through `_policy_change_values()`, settings an operator recognises by their
 `_LEAF_LABELS` name and every other leaf by its path; notes name tenant-only leaves through `_tenant_only_values()`,
 so nothing is ever silent.
-Names are compared HTML-unescaped. Status is handled separately: normal updates preserve the live value;
+Names and descriptions are compared HTML-unescaped (CyberArk's SDK escapes both before sending, and a tenant may
+echo either escaped). FQDN rules compare by the FQDN they target, whether the tenant stores the full name or splits
+host and DNS domain; everything else under `targets` (`target_extras`: IP rules, other location categories) is
+compared too and is always managed, because every target rule grants access. Principal ids and GROUP directory ids
+are casefolded (GUIDs); a directory display name is a label and is not compared. Known policy statuses are matched
+case-insensitively and returned in canonical spelling. Status is handled separately: normal updates preserve the live value;
 `--set-policy-status Active|Suspended` requires `--update` and deliberately includes it in preview/update behavior.
 
 `target_set_signature()` compares the account ID/type, target-set type, description, certificate validation and
 provisioning format during full drift checks. Without `--drift`, the account link remains the lightweight check.
+The account link is read under `secret_id`, `secretId` or `strong_account_id` and is never unknown; every other
+field a response does not carry is `None` -- unknown, not a default. `target_set_differences()` skips unknown
+descriptive fields (type, secret type, description), compares the two configured settings against what the platform
+applies when unset (`TARGET_SET_UNKNOWN_DEFAULTS`: certificate validation false, no provisioning format) so a
+configured value is set even on a tenant that omits unset fields, and on read-back accepts a field the listing
+never echoes with a once-per-run warning instead of failing every update. `type` and `secret_type` compare
+case-insensitively. A strong account found by name whose secret type differs from the CSV row's type is a failure
+that blocks its target sets and policies, never a warning.
 
 ### Template policy
 

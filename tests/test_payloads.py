@@ -423,7 +423,9 @@ def test_policy_signature_ignores_directory_fields_for_role_principals():
     assert policy_signature(full)["principal_details"] == [("r1", "ROLE", "", "")] == policy_signature(bare)["principal_details"]
     assert policy_signature(full)["principals"] == ["r1"]
     groups = {"principals": [{"id": "g1", "type": "Group", "sourceDirectoryId": "d1", "sourceDirectoryName": "Dir"}]}
-    assert policy_signature(groups)["principal_details"] == [("g1", "GROUP", "d1", "Dir")]
+    assert policy_signature(groups)["principal_details"] == [("g1", "GROUP", "d1", "")]     # display name: a label
+    renamed = {"principals": [{"id": "G1", "type": "GROUP", "sourceDirectoryId": "D1", "sourceDirectoryName": "Renamed"}]}
+    assert policy_signature(groups)["principal_details"] == policy_signature(renamed)["principal_details"]
     moved = {"principals": [{"id": "g1", "type": "GROUP", "sourceDirectoryId": "d2", "sourceDirectoryName": "Dir"}]}
     assert policy_signature(groups)["principal_details"] != policy_signature(moved)["principal_details"]
 

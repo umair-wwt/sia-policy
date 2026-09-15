@@ -377,6 +377,8 @@ do next**. The message distinguishes known causes from suggestions; `-v` adds sa
 | target set `failed: bulk create …` | SIA rejected the target set. | Usually the strong account is inactive or the wrong type. |
 | policy `status=Error` | SIA created the policy but flagged it. | Read the detail; compare with a hand-built policy (`show-policy`). |
 | policy `inactive … status=Suspended` | The existing policy is suspended. | Activate it in the portal, or preview and apply `--update --set-policy-status Active`. |
+| strong account `failed … is a <type>, but '<name>' is type=<csv type>` | The SIA secret found under that name is another kind of credential than the CSV row declares; target sets never bind to another kind of credential. | Fix the row's type, or rename one of the two, then `plan` again. |
+| `target-set listings on this tenant do not carry <field>` | The listing does not echo a field the tool wrote, so its value could not be read back. The update was accepted. | Nothing to fix; confirm the setting once in the portal. |
 | `Unable to create an Authorization Policy. Error(s): Field required (field: status)` | The tenant requires `metadata.status` on a policy create. | Fixed in the tool — it now sends `[defaults] policy_status` (`Active`). Upgrade if you see this. |
 | `Run aborted (fail-fast): …` | The first create was rejected. | Fix the cause, `plan`, `apply` again. |
 | `drift: … not managed by this tool` | `--update` on a hand-built object. | Add `--adopt <fqdn>` (for a shared target set, `--adopt <target set name>`). |

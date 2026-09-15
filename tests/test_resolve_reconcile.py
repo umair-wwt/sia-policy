@@ -526,14 +526,24 @@ def test_existing_account_missing_blocks_downstream():
     assert result.failures == 1 and not calls(sia, "create_secret") and not calls(uap, "create_policy")
 
 
-def test_existing_vault_account_found_by_platform_name_and_type_warning():
+def test_existing_vault_account_found_by_platform_name_fails_on_a_type_mismatch():
+    """A name match alone is not the account the CSV describes: a target set must never bind to another kind of
+    credential, so the row fails and its dependents are blocked."""
     sia = FakeSIA(secrets=[{"secret_id": "s-9", "secret_type": "ProvisionerUser", "secret_name": "SVC_SIA_RDP_sia-strongaccounts", "is_active": False}])
     rec, sia, _, _ = make(ONE, sia=sia)
     result = rec.run()
-    assert result.secrets["SA-corp-rdp"].status == "inactive" and result.secrets["SA-corp-rdp"].ref == "s-9"
-    assert any("CSV type=vault but SIA has ProvisionerUser" in w for w in result.warnings)
+    secret = result.secrets["SA-corp-rdp"]
+    assert secret.status == "failed" and secret.ref == "s-9"
+    assert "is a ProvisionerUser, but 'SA-corp-rdp' is type=vault (PCloudAccount)" in secret.detail
     assert result.servers[0].target_set.status == "blocked" and result.servers[0].policy.status == "blocked"
-    assert not calls(sia, "bulk_create_target_sets")
+    assert not calls(sia, "bulk_create_target_sets") and not calls(sia, "create_secret")
+
+
+def test_existing_vault_account_found_by_platform_name_is_inactive():
+    sia = FakeSIA(secrets=[{"secret_id": "s-9", "secret_type": "pcloudaccount", "secret_name": "SVC_SIA_RDP_sia-strongaccounts", "is_active": False}])
+    result = make(ONE, sia=sia)[0].run()
+    assert result.secrets["SA-corp-rdp"].status == "inactive" and result.secrets["SA-corp-rdp"].ref == "s-9"
+    assert result.servers[0].target_set.status == "blocked" and result.servers[0].policy.status == "blocked"
 
 
 def test_strong_account_without_identifier_blocks_dependent_changes():

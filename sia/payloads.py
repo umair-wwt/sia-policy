@@ -150,12 +150,13 @@ def ownership_marker(owner_tag: str) -> str:
 
 
 def is_owned_policy(policy: dict[str, Any], owner_tag: str) -> bool:
+    """The owner tag is an identifier: a tenant that normalises tag casing must not make a policy look unmanaged."""
     tags = (policy.get("metadata") or {}).get("policyTags") or []
-    return owner_tag in tags
+    return owner_tag.casefold() in {str(tag).casefold() for tag in tags}
 
 
 def is_owned_target_set(target_set: dict[str, Any], owner_tag: str) -> bool:
-    return ownership_marker(owner_tag) in str(target_set.get("description") or "")
+    return ownership_marker(owner_tag).casefold() in str(target_set.get("description") or "").casefold()
 
 
 # --- strong accounts (SIA VM secrets) -------------------------------------------------------------
@@ -534,12 +535,22 @@ def build_policy_update(existing: dict[str, Any], desired: dict[str, Any], *, st
     return preserve_unmanaged(existing, body) if preserve else body
 
 
+KNOWN_POLICY_STATUSES = ("Active", "Suspended", "Validating", "Error", "Warning", "Expired", "Inactive", "Draft")
+_CANONICAL_STATUS = {name.casefold(): name for name in KNOWN_POLICY_STATUSES}
+
+
 def policy_status(policy: dict[str, Any]) -> str:
-    """The read-only status ('Active', 'Validating', 'Error', ...) or '' when the object does not carry it."""
+    """The read-only status ('Active', 'Validating', 'Error', ...) or '' when the object does not carry it.
+
+    Known statuses are matched case-insensitively and returned in their canonical spelling (``ACTIVE`` -> ``Active``);
+    a status this tool does not know is returned as the tenant spells it, never reshaped.
+    """
     status = ((policy.get("metadata") or {}).get("status") or {})
-    if isinstance(status, str):
-        return status.capitalize()
-    return str(status.get("status") or "").capitalize()
+    raw = status if isinstance(status, str) else str(status.get("status") or "")
+    return _CANONICAL_STATUS.get(raw.strip().casefold(), raw.strip())
+
+
+ORDER_FREE_LISTS = ("assignGroups", "assignDomainGroups", "daysOfTheWeek", "approvers")   # sets the API may reorder
 
 
 def _normalized(value: Any, key: str = "") -> Any:
@@ -566,7 +577,7 @@ def _normalized(value: Any, key: str = "") -> Any:
         return tuple(sorted(entries))
     if isinstance(value, list):
         items = tuple(_normalized(item) for item in value)
-        return tuple(sorted(set(items), key=repr)) if key in ("assignGroups", "daysOfTheWeek") else items
+        return tuple(sorted(set(items), key=repr)) if key in ORDER_FREE_LISTS else items
     return value
 
 
@@ -607,8 +618,13 @@ def _managed_absent(full_path: str) -> bool:
 def leaf_differences(current: Any, desired: Any, path: str = "") -> list[tuple[str, Any, Any]]:
     """``(dotted path, current, desired)`` for every leaf that differs between two plain() values.
 
-    A side that lacks the key reports ``None`` -- unambiguous, because normalized values never contain null.
+    A side that lacks the key reports ``None`` -- unambiguous, because normalized values never contain null. An
+    empty block (``plain(())`` is ``[]``) against a populated one is walked leaf by leaf, so every extra key is named.
     """
+    if isinstance(current, dict) and desired == []:
+        desired = {}
+    elif isinstance(desired, dict) and current == []:
+        current = {}
     if isinstance(current, dict) and isinstance(desired, dict):
         out: list[tuple[str, Any, Any]] = []
         for name in sorted(set(current) | set(desired)):
@@ -627,11 +643,12 @@ def partition_differences(key: str, current: Any, desired: Any) -> tuple[list[Le
     cannot be a failed write: it is reported as a note and ``build_policy_update`` preserves it. Policy tags compare
     as a set: a tag the tool writes that the tenant lacks is managed, a tag only the tenant carries is tenant-only.
     """
-    if key == "tags":
-        current_tags, desired_tags = list(current or []), list(desired or [])
-        missing = [tag for tag in desired_tags if tag not in current_tags]
-        extra = [tag for tag in current_tags if tag not in desired_tags]
-        return ([("", current_tags, desired_tags)] if missing else []), [(str(tag), tag, None) for tag in extra]
+    if key == "tags":       # identifiers: a tenant that normalises their case has not changed them
+        current_tags, desired_tags = [str(tag) for tag in current or []], [str(tag) for tag in desired or []]
+        current_fold, desired_fold = {t.casefold() for t in current_tags}, {t.casefold() for t in desired_tags}
+        missing = [tag for tag in desired_tags if tag.casefold() not in current_fold]
+        extra = [tag for tag in current_tags if tag.casefold() not in desired_fold]
+        return ([("", current_tags, desired_tags)] if missing else []), [(tag, tag, None) for tag in extra]
     managed: list[LeafDifference] = []
     tenant_only: list[LeafDifference] = []
     for path, old, new in leaf_differences(current, desired):
@@ -679,22 +696,31 @@ def preserve_unmanaged(existing: Mapping[str, Any], body: dict[str, Any]) -> dic
     existing_tags = (existing.get("metadata") or {}).get("policyTags") if isinstance(existing, Mapping) else None
     if isinstance(existing_tags, list) and isinstance(out.get("metadata"), dict):
         tags = list(out["metadata"].get("policyTags") or [])
-        out["metadata"]["policyTags"] = tags + [tag for tag in existing_tags if isinstance(tag, str) and tag not in tags]
+        known = {str(tag).casefold() for tag in tags}
+        out["metadata"]["policyTags"] = tags + [tag for tag in existing_tags
+                                                if isinstance(tag, str) and tag.casefold() not in known]
     return out
 
 
 def _principal_detail(principal: dict[str, Any]) -> tuple[str, str, str, str]:
-    """(id, TYPE, directory id, directory name) as compared for drift.
+    """(id, TYPE, directory id, "") as compared for drift.
 
-    The type is upper-cased (tenants echo ``Role`` as readily as ``ROLE``). For ROLE principals the source-directory
-    fields are optional in the Access Control Policies API -- a tenant may omit, echo or rewrite them -- so they are
-    left out of the comparison.
+    Ids are GUIDs whose case carries no meaning, so they are casefolded. The type is upper-cased (tenants echo ``Role``
+    as readily as ``ROLE``). For GROUP principals the source directory is compared by id only: its display name is a
+    label the tenant may rewrite. For ROLE principals both directory fields are optional in the Access Control
+    Policies API -- a tenant may omit, echo or rewrite them -- so they are left out of the comparison.
     """
     kind = str(principal.get("type") or "").upper()
+    principal_id = str(principal.get("id") or "").casefold()
     if kind == "ROLE":
-        return (str(principal.get("id") or ""), kind, "", "")
-    return (str(principal.get("id") or ""), kind, str(principal.get("sourceDirectoryId") or ""),
-            str(principal.get("sourceDirectoryName") or ""))
+        return (principal_id, kind, "", "")
+    return (principal_id, kind, str(principal.get("sourceDirectoryId") or "").casefold(), "")
+
+
+def _rule_fqdn(pattern: Any, domain: Any) -> str:
+    """The FQDN a rule targets, whether the tenant stores the full name or splits host and DNS domain."""
+    host, dns = str(pattern or "").strip().lower(), str(domain or "").strip().lower()
+    return host if "." in host or not dns else f"{host}.{dns}"
 
 
 def policy_signature(policy: dict[str, Any]) -> dict[str, Any]:
@@ -709,18 +735,32 @@ def policy_signature(policy: dict[str, Any]) -> dict[str, Any]:
     if policy.get("principals") is not None:
         principal_details = sorted(_principal_detail(p) for p in policy.get("principals") or [])
         principals = [item[0] for item in principal_details]
-    rules_block = (policy.get("targets") or {}).get("FQDN/IP") if policy.get("targets") is not None else None
+    targets = policy.get("targets")
+    rules_block = (targets or {}).get("FQDN/IP") if targets is not None else None
     normalized_rules = None
-    if rules_block is not None:
+    target_extras = None
+    if isinstance(rules_block, Mapping):
         rules = rules_block.get("fqdnRules") or []
         normalized_rules = sorted(
-            (str(r.get("operator", "")).upper(), str(r.get("computernamePattern", "")).lower(), str(r.get("domain") or "").lower())
+            (str(r.get("operator", "")).upper(), _rule_fqdn(r.get("computernamePattern"), r.get("domain")),
+             str(r.get("domain") or "").lower())
             for r in rules
         )
+    if targets is not None:
+        # Everything under targets other than the FQDN rules: IP rules, other location categories. The tool writes
+        # none of it, but every target rule grants access, so it is compared and always managed (never a note).
+        extras: dict[str, Any] = {category: block for category, block in (targets or {}).items() if category != "FQDN/IP"}
+        if isinstance(rules_block, Mapping):
+            rest = {name: value for name, value in rules_block.items() if name != "fqdnRules"}
+            if rest:
+                extras["FQDN/IP"] = rest
+        target_extras = _normalized(extras)
     return {
         "name": html.unescape(str(meta.get("name") or "")) if "name" in meta else None,
-        "description": str(meta.get("description") or "") if "description" in meta else None,
-        "time_frame": _normalized(meta.get("timeFrame")) if "timeFrame" in meta else None,
+        # CyberArk's SDK HTML-escapes both metadata strings before sending, so a tenant may echo either escaped
+        "description": html.unescape(str(meta.get("description") or "")) if "description" in meta else None,
+        # a GET may echo an unset time frame as null; the tool sends {} and both mean "no time frame"
+        "time_frame": _normalized(meta.get("timeFrame") or {}) if "timeFrame" in meta else None,
         "entitlement": _normalized(meta.get("policyEntitlement")) if "policyEntitlement" in meta else None,
         "tags": tuple(sorted(str(tag) for tag in (meta.get("policyTags") or []))) if "policyTags" in meta else None,
         "time_zone": str(meta.get("timeZone") or "") if "timeZone" in meta else None,
@@ -729,28 +769,80 @@ def policy_signature(policy: dict[str, Any]) -> dict[str, Any]:
         "delegation": str(policy.get("delegationClassification") or "") if "delegationClassification" in policy else None,
         "conditions": _normalized(policy.get("conditions")) if "conditions" in policy else None,
         "fqdn_rules": normalized_rules,
+        "target_extras": target_extras,
         "behavior": _normalized(policy.get("behavior")) if "behavior" in policy else None,
     }
 
 
+TARGET_SET_SECRET_KEYS = ("secret_id", "secretId", "strong_account_id", "strongAccountId")   # the API spells it three ways
+
+
+def _present(mapping: Mapping[str, Any], *names: str) -> Any:
+    """The first of ``names`` the mapping carries (even as null), or ``MISSING`` when it carries none."""
+    for name in names:
+        if name in mapping:
+            return mapping[name]
+    return MISSING
+
+
+MISSING = object()
+
+
 def target_set_signature(target_set: dict[str, Any]) -> dict[str, Any]:
-    """Normalized view of every target-set field this tool writes, tolerant of API key casing."""
-    cert = target_set.get("enable_certificate_validation", target_set.get("enableCertificateValidation", False))
-    provision = target_set.get("provision_format", target_set.get("provisionFormat", ""))
+    """Normalized view of every target-set field this tool writes, tolerant of API key casing.
+
+    The account link (``secret_id``) is always present, "" when the object has none: it is what a target set is for.
+    Every other field the response does not carry at all is ``None`` -- unknown, not a default: list projections and
+    tenants differ in what they echo, and an absent field must never read as ``false`` or ``""``. Callers compare only
+    the fields both sides carry (see ``target_set_differences``).
+    """
+    def text(value: Any, *, fold: bool = False) -> str | None:
+        if value is MISSING:
+            return None
+        text_value = str(value or "").strip()
+        return text_value.casefold() if fold else text_value
+
+    cert = _present(target_set, "enable_certificate_validation", "enableCertificateValidation")
     return {
-        "type": str(target_set.get("type") or "Target"),
-        "secret_type": str(target_set.get("secret_type") or target_set.get("secretType") or ""),
-        "secret_id": str(target_set.get("secret_id") or target_set.get("secretId") or ""),
-        "description": str(target_set.get("description") or ""),
-        "certificate_validation": bool(cert),
-        "provision_format": str(provision or ""),
+        "type": text(_present(target_set, "type") if "type" in target_set else "Target", fold=True),
+        "secret_type": text(_present(target_set, "secret_type", "secretType"), fold=True),
+        "secret_id": str(next((target_set[k] for k in TARGET_SET_SECRET_KEYS if target_set.get(k)), "") or ""),
+        "description": text(_present(target_set, "description")),
+        "certificate_validation": None if cert is MISSING else bool(cert),
+        "provision_format": text(_present(target_set, "provision_format", "provisionFormat")),
     }
+
+
+# What the platform applies for a field the tool configures when a target set does not carry it. A drift check
+# compares the tool's opinion against these, so a configured setting is set even on a tenant that omits unset
+# fields; descriptive fields (type, secret_type, description) are simply unknown when absent and never drift.
+TARGET_SET_UNKNOWN_DEFAULTS: dict[str, Any] = {"certificate_validation": False, "provision_format": ""}
+
+
+def target_set_differences(current: dict[str, Any], desired: dict[str, Any], keys: tuple[str, ...], *,
+                           unknown_defaults: Mapping[str, Any] | None = None) -> list[str]:
+    """Signature keys whose values differ. A field the current object does not carry is unknown: skipped, unless
+    ``unknown_defaults`` names the value the platform applies for it (drift checks pass TARGET_SET_UNKNOWN_DEFAULTS;
+    a read-back passes nothing, because a listing that does not echo a field cannot verify it either way)."""
+    defaults = unknown_defaults or {}
+    changed: list[str] = []
+    for key in keys:
+        current_value, desired_value = current.get(key), desired.get(key)
+        if current_value is None:
+            if key not in defaults:
+                continue
+            current_value = defaults[key]
+        if desired_value is None:
+            desired_value = defaults.get(key)
+        if current_value != desired_value:
+            changed.append(key)
+    return changed
 
 
 def exact_fqdns(policy: dict[str, Any]) -> list[str]:
     """FQDNs targeted by EXACTLY rules (lower-cased); used to recognise a managed policy that was renamed."""
     rules = (((policy.get("targets") or {}).get("FQDN/IP") or {}).get("fqdnRules")) or []
-    return [str(r.get("computernamePattern", "")).lower() for r in rules
+    return [_rule_fqdn(r.get("computernamePattern"), r.get("domain")) for r in rules
             if str(r.get("operator", "")).upper() == "EXACTLY" and r.get("computernamePattern")]
 
 
