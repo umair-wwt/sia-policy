@@ -3,7 +3,8 @@
 
 Commands:
   preflight               authenticate, detect the SIA API families, read tenant settings and counts (read-only)
-  show-policy NAME        print an existing policy as JSON (use on a UI-created policy to confirm conventions)
+  show-policy NAME        print an existing policy as JSON (use on a UI-created policy to confirm conventions);
+                          --save FILE also records it, scrubbed, as a tenant fixture for the test suite
   plan  --input DIR       dry run: what would be created / already exists / drifted
   apply --input DIR       create missing objects (idempotent); --update also fixes drift on managed/adopted objects
   verify --input DIR      PASS/FAIL per row: every object present and the policy Active (read-only)
@@ -46,10 +47,10 @@ from sia.diagnostics import Diagnostic, diagnose, render_diagnostic, sanitize
 from sia.connect import build_rows, login_suffix, write_connection_outputs
 from sia.http import HttpClient, RateLimiter, SIAApiError
 from sia.inputs import LIST_SEPARATOR, InputError, Inputs, StrongAccountRow, inline_inputs, load_inputs
-from sia.payloads import policy_name_for
+from sia.payloads import is_owned_policy, policy_name_for, target_set_field_report, tenant_only_fields
 from sia.pvwa import PVWAClient
 from sia.reconcile import LOOKUP_MODES, MAX_WORKERS, STAGES, ReconcileError, Reconciler
-from sia.redact import RedactingFilter, redact, register_secret
+from sia.redact import RedactingFilter, redact, register_secret, scrub_identity
 from sia.report import exit_code, print_summary, print_verify, result_dict, write_reports, write_verify_csv
 from sia.resolve import PrincipalResolver, pick
 from sia.runtime import Session, prompt_secret
@@ -161,6 +162,9 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("show-policy", help="print an existing UAP policy as JSON")
     sp.add_argument("name")
     sp.add_argument("--from-list", action="store_true", help="print the (partial) object the list endpoint returns instead of the full policy")
+    sp.add_argument("--save", metavar="FILE",
+                    help="also write the policy to FILE with names, ids, hosts and domains replaced by placeholders: a tenant "
+                         "fixture for tests/fixtures/tenants/ (review it before committing)")
 
     def add_input_flags(p: argparse.ArgumentParser) -> None:
         p.add_argument("--input", default="input", help="directory with servers.csv[, domains.csv, strong_accounts.csv, groups.csv]")
@@ -316,12 +320,42 @@ def cmd_preflight(ctx: Context, checks: list[dict] | None = None, *, verbose: bo
             return
         types = Counter(str(pick(i, "type", default="?")) for i in items)
         print(f"Targets:  OK  {len(items)} target sets ({dict(types)})")
+        if items:
+            # Schema probe: what this tenant's listing carries beyond, and short of, the fields the tool writes.
+            unknown, missing = target_set_field_report(items[0])
+            name = pick(items[0], "name", default="?")
+            if unknown:
+                print(f"          NOTE: target set {name!r} carries fields this tool does not manage: {', '.join(unknown)}")
+            if missing:
+                message = (f"the target-set listing does not carry {', '.join(missing)}: values written for them cannot be "
+                           "read back, so updates accept them unverified")
+                print(f"          NOTE: {message}")
+                checks.append({"name": "Target-set schema", "status": "warning", "message": message})
 
     def policies() -> None:
         items = ctx.uap.list_policies()
         statuses = Counter(str(((i.get("metadata") or {}).get("status") or {}).get("status", "?")) for i in items)
-        owned = sum(1 for i in items if ctx.cfg.defaults.owner_tag in ((i.get("metadata") or {}).get("policyTags") or []))
-        print(f"Policies: OK  {len(items)} VM access policies ({dict(statuses)}); {owned} tagged {ctx.cfg.defaults.owner_tag!r}")
+        owned = [i for i in items if is_owned_policy(i, ctx.cfg.defaults.owner_tag)]
+        print(f"Policies: OK  {len(items)} VM access policies ({dict(statuses)}); {len(owned)} tagged {ctx.cfg.defaults.owner_tag!r}")
+        sample = owned[0] if owned else (items[0] if items else None)
+        if sample is None:
+            return
+        # Schema probe: read one full policy and run the read-back comparison against the body the tool would send,
+        # so a tenant that echoes fields the tool never writes is seen here, read-only, and not during the first apply.
+        policy_id = pick(sample.get("metadata") or {}, "policyId", "policy_id")
+        full = ctx.uap.get_policy(str(policy_id)) if policy_id else sample
+        unknown, recognised = tenant_only_fields(full, ctx.cfg.defaults)
+        name = (full.get("metadata") or {}).get("name")
+        if unknown:
+            message = (f"policy {name!r} carries fields this tool does not write: {', '.join(unknown)}. A read-back reports "
+                       "them as notes and --update preserves them (fields under targets are drift); nothing to fix. "
+                       "Record the tenant with: show-policy NAME --save tests/fixtures/tenants/<tenant>.json")
+            print(f"          NOTE: {message}")
+            checks.append({"name": "Policy schema", "status": "warning", "message": message})
+        if recognised:
+            print(f"          echoes this tool already understands on {name!r}: {', '.join(recognised)}")
+        if not unknown and not recognised:
+            print(f"          policy {name!r} carries only fields this tool writes")
 
     def directories() -> None:
         method = ctx.cfg.auth.identity_auth
@@ -364,13 +398,21 @@ def cmd_preflight(ctx: Context, checks: list[dict] | None = None, *, verbose: bo
     return EXIT_OK if ok else EXIT_FAILURES
 
 
-def cmd_show_policy(ctx: Context, name: str, from_list: bool = False) -> int:
+def cmd_show_policy(ctx: Context, name: str, from_list: bool = False, save: str | None = None) -> int:
     found = ctx.uap.find_policy_by_name(name)
     if not found:
         raise ReconcileError(f"policy {name!r} not found; check its exact name and the selected tenant")
     policy_id = pick(found.get("metadata") or {}, "policyId", "policy_id")
     policy = found if from_list or not policy_id else ctx.uap.get_policy(str(policy_id))
-    print(json.dumps(sanitize(policy), indent=2, sort_keys=True))
+    document = sanitize(policy)
+    print(json.dumps(document, indent=2, sort_keys=True))
+    if save:
+        # A fixture keeps the tenant's shape (every key, every value type, every field the tool does not know) and
+        # nothing that identifies the customer; tests/test_tenant_fixtures.py replays it against the tool's own body.
+        target = Path(save)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(json.dumps(scrub_identity(document), indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        print(f"Saved a scrubbed fixture to {target}; review it, then commit it under tests/fixtures/tenants/.", file=sys.stderr)
     return EXIT_OK
 
 
@@ -887,7 +929,7 @@ def execute(args: argparse.Namespace, session: Session) -> int:
                     print(json.dumps(sanitize({"ok": code == 0, "mode": "preflight", "exit_code": code, "checks": checks}), indent=2))
                 return code
             if args.command == "show-policy":
-                return cmd_show_policy(ctx, args.name, args.from_list)
+                return cmd_show_policy(ctx, args.name, args.from_list, getattr(args, "save", None))
             if args.command == "verify":
                 with redirect_stdout(sys.stderr if args.json else sys.stdout):
                     code = cmd_verify(ctx, args)

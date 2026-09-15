@@ -1,10 +1,34 @@
 """Tenant variations the tool must absorb: the same object echoed with different casing, spelling, nulls or
 projections is not drift, and a materially different one still is."""
+import json
+
 import pytest
 
 from sia.payloads import exact_fqdns, policy_signature, policy_status, target_set_signature
 from tests.fakes import FakeSIA, FakeUAP
 from tests.test_resolve_reconcile import GROUP_DEFAULTS, ONE, VAULT, VAULT_SIA_NAME, WEB01_FQDN, calls, inputs, make, srv
+
+
+def test_the_schema_probe_names_fields_the_tool_does_not_write():
+    from sia.payloads import target_set_field_report, tenant_only_fields
+    from tests.test_resolve_reconcile import DEFAULTS
+    rec, sia, uap, _ = make(ONE)
+    assert rec.run().failures == 0
+    assert tenant_only_fields(uap.policies[0], DEFAULTS) == ([], [])          # the tool's own body: nothing extra
+    policy = json.loads(json.dumps(uap.policies[0]))
+    policy["conditions"].update({"overrideIdleTime": True, "overrideMaxSessionDuration": True, "overrideRecording": False,
+                                 "accessApproval": {"required": False, "approvers": []}, "sessionRecording": False})
+    policy["metadata"]["timeFrame"] = {"fromTime": None, "toTime": None}
+    policy["behavior"]["connectAs"]["rdp"]["localEphemeralUser"]["allowMappingLocalDrives"] = False
+    policy["targets"]["FQDN/IP"]["ipRules"] = [{"operator": "IN_RANGE", "ipAddresses": ["10.0.0.0/8"]}]
+    unknown, recognised = tenant_only_fields(policy, DEFAULTS)
+    assert unknown == ["behavior.connectAs.rdp.localEphemeralUser.allowMappingLocalDrives", "conditions.sessionRecording",
+                       "targets.FQDN/IP"]
+    assert recognised == ["conditions.accessApproval", "conditions.overrideIdleTime", "conditions.overrideMaxSessionDuration",
+                          "conditions.overrideRecording"]
+    listed = {"id": "t", "name": "x", "type": "Target", "strong_account_id": "s", "someFlag": True}
+    assert target_set_field_report(listed) == (["someFlag"], ["secret type", "description", "certificate validation",
+                                                              "provision format"])
 
 
 def test_html_escaped_name_and_description_converge():

@@ -660,6 +660,28 @@ destination whose final ACL could not be confirmed. Terminal messages must prese
 
 Code must stay Python 3.11-compatible (no 3.12-only f-string nesting, no PEP 695 syntax).
 
+### Tenant echo ledger
+
+Everything the tool knows about how real tenants read policies back, in one place. When a tenant surprises the tool,
+add the row **and the fixture first** (`show-policy NAME --save tests/fixtures/tenants/<tenant>.json`; the failing
+`tests/test_tenant_fixtures.py` case is the bug report), then fix the comparison.
+
+| Echo the tenant produces | First seen | Handled by | Fixture |
+|---|---|---|---|
+| `null` / `""` / `[]` for unset fields (`timeFrame.fromTime`, `accessWindow.fromHour`, `connectAs.ssh`, `assignDomainGroups`) | c94bda1 (pre-emptive), confirmed on every tenant since | `_normalized` drops them | `tests/fakes.py` `echo_defaults` (none recorded) |
+| `timeFrame: null` where `{}` was sent | 10fabbc (review) | `policy_signature` reads `timeFrame or {}` | `echo_null_blocks` (none recorded) |
+| `conditions.accessApproval = {"required": false, "approvers": []}` on a dual-control tenant | 2ed839b (production) | `_approval_unset` | `echo_dual_control` (none recorded) |
+| `conditions.overrideIdleTime` / `overrideMaxSessionDuration` / `overrideRecording`, derived from the settings sent | ba82036 (production, tenant acm4404) | `SESSION_OVERRIDE_FLAGS`, `_session_override_echo` | `echo_session_overrides`; record with `show-policy DC1UTCYBVAP0006_admin_SIA --save tests/fixtures/tenants/acm4404.json` |
+| HTML-escaped `metadata.name` and `metadata.description` (the SDK escapes both) | 161476a (names), 10fabbc (descriptions) | `html.unescape` in `policy_signature`, `names_match` | `echo_html_escaped` (none recorded) |
+| Any other field the tool never writes | 25e8a66 | `partition_differences`: a note, preserved on update | -- |
+| Target-set account link spelled `strong_account_id` | 10fabbc (the tool's own bulk payload spells it so) | `TARGET_SET_SECRET_KEYS` | `echo_strong_account_id` |
+| Target-set listing projections that omit fields | 10fabbc | `target_set_signature` unknown = `None`, `target_set_differences` | `omit_target_set_fields` |
+| Case-sensitive server-side name filters (the likely cause of the acm4404 "matched nothing" warning) | 691012d | `_distrust_name_filters` names the stored spelling, list mode for the rest of the run | `case_sensitive_filters` |
+| `/api/secrets/public/v2` applies its filter after the page limit; empty pages carry live cursors | a3f99b3, 5b430f0 (production, adp-amrs-uat) | `_repeated_page`, page counts, `lookup_search_max_rows = 50` | -- |
+
+The preflight schema probe (`tenant_only_fields`, `target_set_field_report`) prints what a tenant carries beyond this
+table before the first bulk `apply`.
+
 ## 10. Extending the tool
 
 | Change | Where |

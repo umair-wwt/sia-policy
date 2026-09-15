@@ -9,6 +9,7 @@ from typing import Any
 from sia.clients import SIACapabilities
 from sia.http import SIAApiError
 from sia.clients import PerAccountTargetSetListingRequired
+from sia.payloads import SESSION_OVERRIDE_FLAGS, implied_session_overrides
 
 CDS_UUID = "09B9A9B0-6CE8-465F-AB03-65766D33B05E"
 AD_UUID = "5F8C4E2A-0000-4000-8000-000000000AD1"
@@ -54,6 +55,42 @@ class FakeIdentity:
         self.role_directories.append(list(directory_uuids))
         needle = search.lower()
         return [r for r in self.roles if needle in r["Name"].lower()]
+
+
+_REPLAYED_BLOCKS = (("conditions",), ("behavior",), ("metadata", "timeFrame"), ("metadata", "policyEntitlement"))
+
+
+def replay_echo(policy: dict[str, Any], recorded: dict[str, Any]) -> dict[str, Any]:
+    """The tool's ``policy`` as the tenant that produced ``recorded`` would read it back: every leaf the recording
+    carries that the body lacks is copied in (nulls included -- they are the echo), while the derived
+    session-override flags take the value the body implies, as the tenant derives them from what was sent."""
+    def copy_missing(source, target, path):
+        for key, value in source.items():
+            if key in target and isinstance(value, dict) and isinstance(target[key], dict):
+                copy_missing(value, target[key], path + (key,))
+            elif key not in target:
+                target[key] = json.loads(json.dumps(value))
+    for block in _REPLAYED_BLOCKS:
+        source, target = recorded, policy
+        for segment in block[:-1]:
+            source = source.get(segment) if isinstance(source, dict) else None
+            target = target.setdefault(segment, {}) if isinstance(target, dict) else None
+        if not isinstance(source, dict) or not isinstance(target, dict):
+            continue
+        recorded_block = source.get(block[-1])
+        if recorded_block is None and block[-1] not in source:
+            continue
+        if isinstance(recorded_block, dict):
+            copy_missing(recorded_block, target.setdefault(block[-1], {}), block)
+        elif block[-1] not in target or not target[block[-1]]:
+            target[block[-1]] = recorded_block                  # the tenant echoes this block as null (or a scalar)
+    conditions = policy.get("conditions")
+    if isinstance(conditions, dict):
+        implied = implied_session_overrides(conditions)
+        for flag in SESSION_OVERRIDE_FLAGS:
+            if flag in (recorded.get("conditions") or {}):
+                conditions[flag] = implied[flag]
+    return policy
 
 
 class FakeSIA:
@@ -167,6 +204,9 @@ class FakeUAP:
         self.echo_null_blocks = False        # with echo_defaults: an empty time frame echoes as null, not {}
         self.echo_html_escaped = False       # every read echoes metadata.name/description HTML-escaped (the SDK
                                              # escapes both before sending)
+        self.echo_fixture: dict[str, Any] | None = None   # with echo_defaults: replay a recorded tenant policy
+                                             # (tests/fixtures/tenants/*.json) -- every leaf it carries that the
+                                             # tool's body lacks is echoed, derived flags follow the body
         self.conflict_on_create: set[str] = set()   # policy names whose creation answers 409
         self._counter = 0
 
@@ -206,6 +246,8 @@ class FakeUAP:
 
     def _with_echoed_defaults(self, policy):
         """Fields the tool never sends but the API returns as null/empty for an unset value."""
+        if self.echo_fixture is not None:
+            policy = replay_echo(policy, self.echo_fixture)
         policy["metadata"]["timeFrame"] = {"fromTime": None, "toTime": None, **(policy["metadata"].get("timeFrame") or {})}
         if self.echo_null_blocks and not any(value for value in policy["metadata"]["timeFrame"].values()):
             policy["metadata"]["timeFrame"] = None

@@ -788,6 +788,58 @@ def _present(mapping: Mapping[str, Any], *names: str) -> Any:
 MISSING = object()
 
 
+_PROBE_ROW = dict(fqdn="probe.fixture.example.com", strong_account="probe", principals=("probe",), policy_name=None,
+                  assign_groups=None, domain=None, description=None, line=0)
+_PROBE_PRINCIPAL = {"id": "probe", "name": "probe", "type": "ROLE"}
+_BLOCK_PREFIXES = {"conditions": "conditions", "behavior": "behavior", "time_frame": "metadata.timeFrame",
+                   "entitlement": "metadata.policyEntitlement", "target_extras": "targets"}
+
+
+def tenant_only_fields(policy: dict[str, Any], defaults: Defaults) -> tuple[list[str], list[str]]:
+    """``(unknown, recognised)`` fields a tenant's policy carries that this tool never writes, by JSON path.
+
+    The reference is the body ``build_policy`` would send for a probe row under the current defaults; every leaf the
+    policy carries beyond it is tenant-side. ``recognised`` are the echoes this tool already understands (a
+    dual-control block, the derived session-override flags); ``unknown`` is everything else -- what a read-back would
+    report as a note (or as drift, under ``targets``). Read-only: the preflight schema probe runs this on one existing
+    policy so a tenant's extra fields are seen before the first bulk apply, not during it."""
+    reference = build_policy(ServerRow(**_PROBE_ROW), [dict(_PROBE_PRINCIPAL)], defaults)
+    tenant_sig, reference_sig = policy_signature(policy), policy_signature(reference)
+    unknown: list[str] = []
+    for key, prefix in _BLOCK_PREFIXES.items():
+        tenant_plain, reference_plain = plain(tenant_sig.get(key)), plain(reference_sig.get(key))
+        if not isinstance(tenant_plain, dict):
+            continue
+        for path, _old, new in leaf_differences(tenant_plain, reference_plain if isinstance(reference_plain, (dict, list)) else {}):
+            if new is None and path:
+                unknown.append(f"{prefix}.{path}")
+    conditions = policy.get("conditions") if isinstance(policy.get("conditions"), Mapping) else {}
+    recognised = sorted(f"conditions.{name}" for name in conditions
+                        if (name in SESSION_OVERRIDE_FLAGS or name == "accessApproval") and f"conditions.{name}" not in unknown
+                        and conditions.get(name) is not None)
+    return sorted(unknown), recognised
+
+
+TARGET_SET_KNOWN_KEYS = frozenset({
+    "id", "targetSetId", "target_set_id", "name", "type", "description", "secret_type", "secretType",
+    "enable_certificate_validation", "enableCertificateValidation", "provision_format", "provisionFormat",
+    *TARGET_SET_SECRET_KEYS,
+})
+TARGET_SET_WRITTEN_FIELDS = {          # what build_target_set_update sends, by the names a listing may use
+    "secret type": ("secret_type", "secretType"), "description": ("description",),
+    "certificate validation": ("enable_certificate_validation", "enableCertificateValidation"),
+    "provision format": ("provision_format", "provisionFormat"),
+}
+
+
+def target_set_field_report(target_set: Mapping[str, Any]) -> tuple[list[str], list[str]]:
+    """``(unknown keys, written fields the object does not carry)`` for one listed target set: the first are fields
+    this tool never writes, the second are values a read-back could not verify (see ``target_set_differences``)."""
+    unknown = sorted(str(key) for key in target_set if str(key) not in TARGET_SET_KNOWN_KEYS)
+    missing = [label for label, names in TARGET_SET_WRITTEN_FIELDS.items() if not any(name in target_set for name in names)]
+    return unknown, missing
+
+
 def target_set_signature(target_set: dict[str, Any]) -> dict[str, Any]:
     """Normalized view of every target-set field this tool writes, tolerant of API key casing.
 

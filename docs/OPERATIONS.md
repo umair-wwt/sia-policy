@@ -143,7 +143,10 @@ not supported by SIA; keep DCs out of the list.
 SIA tenants can encode a few details differently, so check the tool's assumptions against a real policy once:
 
 1. Run `python sia_onboard.py preflight`. Note the **SIA API** line and pin the two path families in `config.toml`
-   (`[http] secrets_api` / `targetsets_api`) so later runs do not have to detect them.
+   (`[http] secrets_api` / `targetsets_api`) so later runs do not have to detect them. Read the **Policies** and
+   **Targets** `NOTE:` lines: they name the fields this tenant carries that the tool does not write (reported as
+   notes on every read-back, preserved on `--update`) and the target-set fields its listing does not echo (accepted
+   unverified on update). Nothing there needs fixing, but it tells you what the first `apply` will say.
 2. In the portal, create **one** ZSP policy for **one** server by hand, the way you want the generated ones to look.
 3. Run `python sia_onboard.py show-policy "<its name>"` and `show-policy "<its name>" --from-list`. In the first
    JSON, `targets.fqdnRules` should be `{"operator": "EXACTLY", "computernamePattern": "<fqdn>", "domain": "<dns domain>"}`
@@ -151,7 +154,11 @@ SIA tenants can encode a few details differently, so check the tool's assumption
    `sourceDirectoryName` / `sourceDirectoryId` should match a directory `preflight` listed; for a role those two
    fields are optional and the tool tolerates either answer.
    The second output shows what the list endpoint returns (a partial object); whether it carries `principals`
-   decides how cheap re-runs are (section 6). Send both to the maintainer if anything looks different.
+   decides how cheap re-runs are (section 6). Then record the tenant: `show-policy "<its name>" --save
+   tests/fixtures/tenants/<tenant>.json` writes the policy with names, ids, hosts and domains replaced by
+   placeholders and every field kept; review the file and commit it (or attach it to the report). The test suite
+   replays every recorded tenant against the tool's own body, so a shape the tool does not understand fails a test
+   before it fails a run.
 4. `plan` and `apply` with a one-server CSV, test the RDP login as a member of the role (watch the temporary user
    appear in *Computer Management › Users* and disappear after logoff), run `verify`, run `apply` again
    (everything must say `exists`).

@@ -267,6 +267,35 @@ def test_show_policy(workspace, capsys, monkeypatch):
     assert "targets" not in printed and not [c for c in uap.calls if c[0] == "get_policy"]
 
 
+def test_show_policy_save_writes_a_scrubbed_fixture(workspace, capsys, monkeypatch, tmp_path):
+    policy = {"metadata": {"name": "Ref", "policyId": "p1", "description": "R&D", "policyTags": ["automated"],
+                           "createdBy": {"user": "someone@corp", "time": "2025-05-01T10:00:00Z"}},
+              "principals": [{"id": "abc-123", "name": "Corp Admins", "type": "GROUP", "sourceDirectoryId": "D-1",
+                              "sourceDirectoryName": "corp.example.com"}],
+              "targets": {"FQDN/IP": {"fqdnRules": [{"operator": "EXACTLY", "computernamePattern": "web01.corp.example.com",
+                                                     "domain": "corp.example.com"}],
+                                      "ipRules": [{"operator": "IN_RANGE", "ipAddresses": ["10.20.30.0/24"]}]}},
+              "conditions": {"idleTime": 10, "overrideIdleTime": True, "someFutureField": {"x": 1}},
+              "behavior": {"connectAs": {"rdp": {"localEphemeralUser": {"assignGroups": ["CORP\\Server Admins"]}}}}}
+    shared_context(monkeypatch, uap=FakeUAP([policy]))
+    target = tmp_path / "fixtures" / "acme.json"
+    assert run(workspace, "show-policy", "Ref", "--save", str(target)) == 0
+    printed = json.loads(capsys.readouterr().out)
+    assert printed["metadata"]["name"] == "Ref"                                   # stdout is still the raw policy
+    saved = json.loads(target.read_text(encoding="utf-8"))
+    assert saved["metadata"]["name"] == "fixture-policy" and saved["metadata"]["policyTags"] == ["automated"]
+    assert saved["metadata"]["createdBy"] == {"user": "fixture-user", "time": "2026-01-01T00:00:00Z"}
+    principal = saved["principals"][0]
+    assert principal == {"id": "principal-1", "name": "fixture-principal-1", "type": "GROUP",
+                         "sourceDirectoryId": "directory-1", "sourceDirectoryName": "fixture-directory"}
+    rules = saved["targets"]["FQDN/IP"]
+    assert rules["fqdnRules"][0] == {"operator": "EXACTLY", "computernamePattern": "host1.fixture.example.com",
+                                     "domain": "fixture.example.com"}
+    assert rules["ipRules"][0] == {"operator": "IN_RANGE", "ipAddresses": ["10.0.1.0/24"]}
+    assert saved["conditions"] == {"idleTime": 10, "overrideIdleTime": True, "someFutureField": {"x": 1}}
+    assert saved["behavior"]["connectAs"]["rdp"]["localEphemeralUser"]["assignGroups"] == ["group-1"]
+
+
 def test_vault_stage_runs_when_pvwa_configured(workspace, capsys, monkeypatch):
     text = (workspace / "config.toml").read_text().replace('base_url = ""             # e.g. "https://pvwa.corp.example.com"',
                                                              'base_url = "https://pvwa.corp.example.com"')

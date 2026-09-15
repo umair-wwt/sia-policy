@@ -109,6 +109,80 @@ def sanitize(value: Any) -> Any:
     return sanitize(str(value))
 
 
+_TIME_LIKE = re.compile(r"^\d{4}-\d{2}-\d{2}[T ]")
+
+
+def scrub_identity(document: Any) -> Any:
+    """A policy GET with its identifying values replaced by stable placeholders and every key, value type and
+    unrecognised field kept: what a committed tenant fixture (``tests/fixtures/tenants/``) may contain.
+
+    Names, descriptions, ids, principals, directories, hosts, domains and IP ranges identify a customer; the *shape*
+    of the object -- which keys the tenant echoes and with which value types -- is the observation worth keeping.
+    Tags, time zones and settings are kept as they are: review the file before committing it.
+    """
+    counters: dict[str, int] = {}
+    memo: dict[tuple[str, str], int] = {}
+
+    def number(kind: str, value: str) -> int:
+        key = (kind, value)
+        if key not in memo:
+            counters[kind] = counters.get(kind, 0) + 1
+            memo[key] = counters[kind]
+        return memo[key]
+
+    def scrub_string(value: str, path: tuple[str, ...]) -> str:
+        key = path[-1] if path else ""
+        parent = tuple(segment for segment in path if segment != "[]")
+        if parent[:2] in (("metadata", "name"),):
+            return "fixture-policy"
+        if parent[:2] == ("metadata", "description"):
+            return "fixture description"
+        if parent[:2] in (("metadata", "policyId"), ("metadata", "policy_id")):
+            return "00000000-0000-4000-8000-000000000001"
+        if len(parent) >= 2 and parent[0] == "metadata" and parent[1] in ("createdBy", "updatedOn"):
+            return "2026-01-01T00:00:00Z" if _TIME_LIKE.match(value) else "fixture-user"
+        if parent and parent[0] == "principals":
+            if key == "id":
+                return f"principal-{number('principal', value)}"
+            if key == "name":
+                return f"fixture-principal-{number('principal-name', value)}"
+            if key == "sourceDirectoryId":
+                return f"directory-{number('directory', value)}"
+            if key == "sourceDirectoryName":
+                return "fixture-directory"
+        if parent and parent[0] == "targets":
+            if key == "computernamePattern":
+                if value.startswith("*"):
+                    return "*.fixture.example.com"
+                index = number("host", value)
+                return f"host{index}.fixture.example.com" if "." in value else f"host{index}"
+            if key == "domain":
+                return "fixture.example.com"
+            if key != "operator" and any(segment.lower().startswith("ip") for segment in parent[1:]):
+                return f"10.0.{number('ip', value)}.0/24"
+        if parent and parent[0] == "conditions" and "approvers" in parent:
+            if key == "id":
+                return f"approver-{number('approver', value)}"
+            return "fixture-approver" if key == "name" else value
+        if parent and parent[0] == "behavior":
+            if key == "username":
+                return "fixture-user"
+            if parent[-1] in ("assignGroups", "assignDomainGroups"):
+                return f"group-{number('group', value)}"
+        return value
+
+    def walk(value: Any, path: tuple[str, ...]) -> Any:
+        if isinstance(value, Mapping):
+            return {str(key): walk(item, path + (str(key),)) for key, item in value.items()}
+        if isinstance(value, list):
+            return [walk(item, path + ("[]",)) for item in value]
+        if isinstance(value, str) and value:
+            return scrub_string(value, path)
+        return value
+
+    return walk(document, ())
+
+
 class RedactingFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
         try:
