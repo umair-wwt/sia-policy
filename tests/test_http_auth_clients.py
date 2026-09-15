@@ -324,7 +324,10 @@ def test_probe_falls_back_to_legacy_and_propagates_real_errors():
     client, _ = http_with([FakeResponse(404, "nope"), FakeResponse(200, {"target_sets": []})])
     caps = SIAClient(client, "https://x").probe()
     assert caps.secrets_api == "legacy" and caps.targetsets_api == "legacy" and caps.targetsets_list_unfiltered
-    client, _ = http_with([FakeResponse(403, "forbidden")])
+    # an unexpected public answer tries the legacy family first; only when that fails too does the probe give up
+    client, _ = http_with([FakeResponse(403, "forbidden"), FakeResponse(200, {"secrets": []}), FakeResponse(200, {"target_sets": []})])
+    assert SIAClient(client, "https://x").probe().secrets_api == "legacy"
+    client, _ = http_with([FakeResponse(403, "forbidden"), FakeResponse(404, "no legacy either")])
     with pytest.raises(SIAApiError, match="403"):
         SIAClient(client, "https://x").probe()
     client, _ = http_with([FakeResponse(200, []), FakeResponse(404, "a"), FakeResponse(404, "b")])

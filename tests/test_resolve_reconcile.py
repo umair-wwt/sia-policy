@@ -18,6 +18,9 @@ WEB_ADMINS_ROLE = {"id": "role-SIA-Web-Admins", "name": "SIA-Web-Admins", "type"
                    "sourceDirectoryId": CDS_UUID, "sourceDirectoryName": "CyberArk Cloud Directory"}
 OWNER = "sia-policy-automation"
 OWNED_FILTER = "((targetCategory eq 'VM') and (policyTags eq 'sia-policy-automation'))"
+VM_FILTER = "(targetCategory eq 'VM')"
+# An empty owned-tag read is confirmed against one VM listing before any row is planned as a create.
+EMPTY_OWNED_READS = [("list_policies", (None, OWNED_FILTER)), ("list_policies", (None, VM_FILTER))]
 MARK = "[managed-by:sia-policy-automation]"
 VAULT_SIA_NAME = "svc_sia_rdp_SIA-StrongAccounts"
 WEB01_FQDN, WEB02_FQDN, DMZ_FQDN = "web01.corp.example.com", "web02.corp.example.com", "dmz01.dmz.example.com"
@@ -160,7 +163,7 @@ def test_plan_on_empty_tenant_writes_nothing():
     assert VAULT_SIA_NAME in result.secrets["SA-corp-rdp"].detail
     assert all(sr.target_set.status == "planned" and sr.policy.status == "planned" for sr in result.servers)
     assert [c[0] for c in sia.calls] == ["list_secrets", "list_target_sets"]
-    assert uap.calls == [("list_policies", (None, OWNED_FILTER))]   # only our own policies are listed
+    assert uap.calls == EMPTY_OWNED_READS   # only our own policies are listed; an empty read is confirmed once
 
 
 def test_search_lookup_reads_per_server():
@@ -264,13 +267,13 @@ def test_two_policies_per_server_share_account_and_target_set():
 def test_snapshot_once_then_preview_and_apply():
     rec, sia, uap, _ = make(dry_run=True)
     rec.snapshot()
-    reads = len(sia.calls)
+    reads, uap_reads = len(sia.calls), len(uap.calls)
     preview = rec.reconcile(dry_run=True)
     assert preview.mode == "plan" and all(sr.policy.status == "planned" for sr in preview.servers)
     result = rec.reconcile(dry_run=False)
     assert result.mode == "apply" and all(sr.policy.status == "created" for sr in result.servers) and result.failures == 0
     assert [c[0] for c in sia.calls[reads:]] == ["create_secret", "create_secret", "bulk_create_target_sets", "bulk_create_target_sets"]
-    assert all(c[0] != "list_policies" for c in uap.calls[1:])
+    assert all(c[0] != "list_policies" for c in uap.calls[uap_reads:])
 
 
 def test_checkpoint_and_resume(tmp_path):
@@ -442,9 +445,9 @@ def test_an_unreliable_name_filter_stops_the_rest_of_the_run_from_filtering():
 
     # Target sets and policies fall back to their unfiltered reads, so the existing target set is still seen.
     assert calls(sia, "list_target_sets") == [(None, None)]
-    assert uap.calls == [("list_policies", (None, OWNED_FILTER))]
+    assert uap.calls == EMPTY_OWNED_READS
     assert result.servers[0].target_set.status == "exists"
-    assert not sia.capabilities.name_filter_reliable
+    assert not sia.capabilities.name_filter_reliable and result.lookup_mode == "list"
     assert "name filter unreliable" in sia.capabilities.describe()
 
 
@@ -483,7 +486,7 @@ def test_a_blind_target_set_filter_does_not_become_a_bulk_create():
     assert calls(sia, "list_target_sets") == [(None, WEB01_FQDN), (None, None)]
     assert not sia.capabilities.name_filter_reliable
     assert any("target set" in w and WEB01_FQDN in w and "--lookup list" in w for w in result.warnings)
-    assert calls(uap, "list_policies") == [(None, OWNED_FILTER)]     # policies no longer trust q= either
+    assert calls(uap, "list_policies") == [(None, OWNED_FILTER), (None, VM_FILTER)]   # policies no longer trust q= either
 
 
 def test_the_confirming_listing_adds_to_the_filtered_reads_rather_than_replacing_them():
@@ -508,7 +511,7 @@ def test_a_blind_policy_search_makes_the_snapshot_list_policies():
     uap.search_reliable = False      # what UAPClient records once a q= lookup had to be confirmed by the listing
     rec, _, uap, _ = make(ONE, uap=uap, dry_run=True, lookup="search")
     rec.run()
-    assert calls(uap, "list_policies") == [(None, OWNED_FILTER)]
+    assert calls(uap, "list_policies") == [(None, OWNED_FILTER), (None, VM_FILTER)]
 
 
 def test_progress_is_logged(caplog):
@@ -917,13 +920,28 @@ def test_unmanaged_policy_update_requires_adopt():
 
 
 def test_create_conflict_is_reclassified_not_failed():
-    """A same-name policy hidden from the owner-tag listing answers 409 on create: compare it instead of failing."""
-    uap = FakeUAP([{**MANUAL, "principals": [{"id": "role-SIA-Web-Admins"}]}])
-    rec, sia, uap, _ = make(ONE, uap=uap)
+    """A same-name policy that appears between the snapshot and the create answers 409: compare it instead of failing."""
+    class LateManualUAP(FakeUAP):
+        def create_policy(self, payload):
+            if payload["metadata"]["name"] == WEB01_FQDN and not self.policies:
+                self.policies.append({**MANUAL, "principals": [{"id": "role-SIA-Web-Admins"}]})
+            return super().create_policy(payload)       # the name exists now: 409
+
+    rec, sia, uap, _ = make(ONE, uap=LateManualUAP())
     result = rec.run()
     sr = result.servers[0]
     assert sr.policy.status == "exists" and "unmanaged" in sr.policy.detail and result.failures == 0 and not result.aborted
     assert len(calls(uap, "create_policy")) == 1 and calls(uap, "find_policy_by_name") == [WEB01_FQDN] and len(uap.policies) == 1
+
+
+def test_a_same_name_policy_the_owner_filter_hides_is_seen_before_any_create():
+    """The empty owned-tag read is confirmed against the VM listing, so an unmanaged same-name policy shows up in the
+    preview as exists/unmanaged instead of surfacing only as a 409 at apply time."""
+    uap = FakeUAP([{**MANUAL, "principals": [{"id": "role-SIA-Web-Admins"}]}])
+    result = make(ONE, uap=uap)[0].run()
+    sr = result.servers[0]
+    assert sr.policy.status == "exists" and "unmanaged" in sr.policy.detail and result.failures == 0
+    assert not calls(uap, "create_policy") and result.warnings == []
 
 
 def test_renamed_managed_policy_is_recognised_by_fqdn():

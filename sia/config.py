@@ -167,7 +167,7 @@ class HttpConfig:
     max_retries: int = 4
     status_polls: int = 5                      # GETs after creating a policy while it is still "Validating" (1..10)
     max_requests_per_second: float = 0.0       # global rate limit shared by all workers; 0 = off
-    lookup_search_max_rows: int = 2000         # --lookup auto: search per server up to this many servers, else list
+    lookup_search_max_rows: int = 50           # --lookup auto: search per server up to this many servers, else list
     policy_page_size: int = 50                 # rows per GET /api/policies page; raise it if policy reads are slow
     secrets_api: str = "auto"                  # auto | public (/api/secrets/public/v1+v2) | legacy (/api/secrets)
     targetsets_api: str = "auto"               # auto | legacy (/api/targetsets) | discovery (/api/discovery/targetsets)

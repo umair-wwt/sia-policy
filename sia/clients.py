@@ -117,6 +117,17 @@ def _repeated_page(page: list[dict[str, Any]], signature: str, seen_pages: set[s
     return bool(page) and signature in seen_pages
 
 
+_LONG_WALK_PAGES = 20
+
+
+def _note_walk(log: logging.Logger, label: str, pages: int, objects: int, *, filtered: bool) -> None:
+    """Say so when one listing walked many pages: a slow snapshot is otherwise a single unbroken gap in the log."""
+    if pages >= _LONG_WALK_PAGES:
+        hint = (" The server applies its filter after the page limit, so a filtered read pages through the whole store; "
+                "pin [http] lookup_search_max_rows = 0 to read the listing once per run instead." if filtered else "")
+        log.info("%s walked %d pages for %d objects.%s", label, pages, objects, hint)
+
+
 def _pagination_error(method: str, url: str, detail: str) -> SIAApiError:
     return SIAApiError(method, url, 200, detail, cause="incomplete_pagination",
                        mutation_state="not_applicable")
@@ -204,6 +215,7 @@ class SIAClient:
         self._targetsets_pref = targetsets_api
         self._caps: SIACapabilities | None = capabilities
         self._log = logger or logging.getLogger("sia.clients")
+        self.pages_read = 0                 # listing pages fetched so far; the snapshot reports them per stage
 
     # ---------------------------------------------------------------- probe
     @property
@@ -229,9 +241,21 @@ class SIAClient:
                 self._secret_items(response, json_or_error(response))
                 caps.secrets_api = "public"
             except SIAApiError as exc:
-                if not exc.not_found:
+                if exc.not_found:
+                    caps.secrets_api = "legacy"
+                elif exc.status in (400, 403):
+                    # Not proof that public is the wrong family, but the legacy family may simply be the one this
+                    # tenant serves: try it before the whole run fails on a probe.
+                    try:
+                        legacy = self._http.get(f"{self._base}{LEGACY_SECRETS}",
+                                                params={"secret_type": ",".join(SECRET_TYPES)})
+                        self._secret_items(legacy, json_or_error(legacy))
+                    except SIAApiError:
+                        raise exc from None
+                    self._log.info("public strong-account API answered %s; this tenant serves the legacy family", exc.status)
+                    caps.secrets_api = "legacy"
+                else:
                     raise
-                caps.secrets_api = "legacy"
         if self._targetsets_pref in ("legacy", "discovery"):
             caps.targetsets_api = self._targetsets_pref
         else:
@@ -283,9 +307,16 @@ class SIAClient:
     def list_secrets(self, *, name: str | None = None, max_pages: int = MAX_LIST_PAGES) -> list[dict[str, Any]]:
         """All strong accounts of the VM types (optionally only those whose name matches `name`)."""
         if self._secrets_family() == "legacy":
-            response = self._http.get(f"{self._base}{LEGACY_SECRETS}",
-                                      params={"secret_type": ",".join(SECRET_TYPES)})
-            items = self._secret_items(response, json_or_error(response))
+            url = f"{self._base}{LEGACY_SECRETS}"
+            response = self._http.get(url, params={"secret_type": ",".join(SECRET_TYPES)})
+            body = json_or_error(response)
+            items = self._secret_items(response, body)
+            self.pages_read += 1
+            if _continuation(response, body, ("b64_last_evaluated_key", "b64LastEvaluatedKey"), "strong-account list"):
+                # This tool reads the legacy listing as one page. A token means there is more: no missing-object
+                # decision may rest on a truncated inventory (RECOVERY.md), so stop rather than create duplicates.
+                raise _pagination_error("GET", url, "legacy strong-account listing returned a continuation token; "
+                                                    "the inventory is incomplete (pin [http] secrets_api = \"public\")")
             if name:
                 items = [s for s in items if str(s.get("secret_name") or s.get("secretName") or "").casefold() == name.casefold()]
             return _dedupe_by(items, lambda s: s.get("secret_id") or s.get("secretId"))
@@ -308,6 +339,7 @@ class SIAClient:
         seen_tokens: set[str] = set()
         seen_pages: set[str] = set()
         url = f"{self._base}{PUBLIC_SECRETS_V2}"
+        pages = 0
         for _ in range(max_pages):
             page_params = dict(params)
             if start_key:
@@ -320,10 +352,13 @@ class SIAClient:
                     return None
                 raise
             page = self._secret_items(response, body)
+            pages += 1
+            self.pages_read += 1
             new_key = _continuation(response, body,
                                     ("b64_last_evaluated_key", "b64LastEvaluatedKey"), "strong-account list")
             if not new_key:
                 items.extend(page)
+                _note_walk(self._log, "strong-account listing", pages, len(items), filtered=bool(params.get("secret_name")))
                 return _dedupe_by(items, lambda s: s.get("secret_id") or s.get("secretId"))
             signature = _page_signature(page)
             if _repeated_page(page, signature, seen_pages):
@@ -347,6 +382,7 @@ class SIAClient:
         for _ in range(max_pages):
             response = self._http.get(url, params={**params, "count": str(SECRETS_PAGE), "offset": str(offset)})
             page = self._secret_items(response, json_or_error(response))
+            self.pages_read += 1
             signature = _page_signature(page)
             if len(page) == SECRETS_PAGE and signature in seen_pages:
                 raise _pagination_error("GET", url, "strong-account offset pagination repeated a page")
@@ -493,6 +529,7 @@ class UAPClient:
         # tenant: on a large tenant the page size, not the number of matches, decides how many round trips that costs.
         self._page_size = int(page_size) if page_size else self.PAGE_SIZE
         self._log = logger or logging.getLogger("sia.clients")
+        self.pages_read = 0                 # listing pages fetched so far; the snapshot reports them per stage
         # The confirming read behind find_policy_by_name, kept for the life of the client (one per command), and
         # whether q= is still worth sending first.
         self._listing: list[dict[str, Any]] | None = None
@@ -508,6 +545,7 @@ class UAPClient:
         seen_tokens: set[str] = set()
         seen_pages: set[str] = set()
         url = f"{self._base}/api/policies"
+        pages = 0
         for _ in range(max_pages):
             params: dict[str, Any] = {"limit": self._page_size}
             if filter_query:
@@ -520,9 +558,12 @@ class UAPClient:
             body = json_or_error(response)
             page = _list_field(response, body, ("results",), "policy list", _policy_problem,
                                allow_bare=False)
+            pages += 1
+            self.pages_read += 1
             new_token = _continuation(response, body, ("nextToken", "next_token"), "policy list")
             if not new_token:
                 results.extend(page)
+                _note_walk(self._log, "policy listing", pages, len(results), filtered=bool(filter_query or text))
                 return _dedupe_by(results, lambda p: (p.get("metadata") or {}).get("policyId")
                                   or (p.get("metadata") or {}).get("policy_id"))
             signature = _page_signature(page)

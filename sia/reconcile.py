@@ -330,18 +330,24 @@ class Reconciler:
         # Windows servers may share one target set (a Domain set covers a whole AD domain), so look them up by
         # target-set name rather than by FQDN.
         target_set_names = list(dict.fromkeys(s.target_set_key for s, _ in self._rows if not s.is_ssh))
+        # The dict key is lower-cased; the tenant's name filter may not be, so it is sent the CSV's own spelling.
+        target_set_spellings = {s.target_set_key: (s.target_set_name or s.fqdn) for s, _ in self._rows if not s.is_ssh}
         accounts = self._active_accounts()
         self._lookup_mode = self._choose_lookup(len(fqdns))
         # Per-stage timings: a slow tenant read is otherwise a single unbroken gap in the log, with nothing to say
         # which of the four reads spent the time.
         timings: list[str] = []
         for label, read in (("secrets", lambda: self._snapshot_secrets(accounts)),
-                            ("target sets", lambda: self._snapshot_target_sets(target_set_names, accounts)),
+                            ("target sets", lambda: self._snapshot_target_sets(target_set_names, accounts,
+                                                                              target_set_spellings)),
                             ("policies", lambda: self._snapshot_policies(fqdns)),
                             ("principals", self._snapshot_principals)):
             started = time.monotonic()
+            pages_before = self._pages_read()
             read()
-            timings.append(f"{label} {time.monotonic() - started:.1f}s")
+            pages = self._pages_read() - pages_before
+            elapsed = f"{time.monotonic() - started:.1f}s"
+            timings.append(f"{label} {elapsed}/{pages} page{'s' if pages != 1 else ''}" if pages else f"{label} {elapsed}")
         self._log.info("Tenant snapshot (%s lookup): %d strong accounts, %d target sets, %d policies read for %d rows "
                        "(%d resumed) [%s]",
                        self._lookup_mode, len(self._secrets), len(self._target_sets), len(self._policies), len(self._rows),
@@ -507,26 +513,45 @@ class Reconciler:
         caps = getattr(self.sia, "capabilities", None)
         return str(getattr(caps, "secrets_api", "") or "")
 
+    def _pages_read(self) -> int:
+        return int(getattr(self.sia, "pages_read", 0) or 0) + int(getattr(self.uap, "pages_read", 0) or 0)
+
     def _filters_trusted(self) -> bool:
         """Whether this tenant's server-side name filters agree with an unfiltered listing."""
         caps = getattr(self.sia, "capabilities", None)
         return True if caps is None else bool(getattr(caps, "name_filter_reliable", True))
 
-    def _distrust_name_filters(self, kind: str, recovered: list[str]) -> None:
+    def _distrust_name_filters(self, kind: str, recovered: list[str], listed: dict[str, str] | None = None) -> None:
         """A name filter missed objects the unfiltered listing serves: from here on nothing in this run is treated
-        as missing on the strength of a filtered read, and the operator is told to pin list mode."""
+        as missing on the strength of a filtered read, and the rest of the run uses list mode (one listing per
+        object kind instead of a filtered walk per object). When every miss is a spelling the tenant stores in
+        another case, the warning says so instead of blaming the tenant's filter."""
         caps = getattr(self.sia, "capabilities", None)
         if caps is not None:
             caps.name_filter_reliable = False
+        self._lookup_mode = "list"
+        plural = len(recovered) != 1
+        pairs = {name: (listed or {}).get(name) for name in recovered}
+        case_only = bool(recovered) and all(
+            stored is not None and stored != name and stored.casefold() == name.casefold() for name, stored in pairs.items())
+        if case_only:
+            shown = ", ".join(f"{name!r} is stored as {pairs[name]!r}" for name in recovered[:3])
+            if len(recovered) > 3:
+                shown += f" and {len(recovered) - 3} more"
+            self._snapshot_warnings.append(
+                f"this tenant's name filter is case-sensitive: {kind}{'s' if plural else ''} {shown}; the unfiltered "
+                f"listing found {'them' if plural else 'it'}, the rest of this run uses list mode, and nothing is treated "
+                "as missing on the strength of a name-filtered read. Match the tenant's spelling in your CSV, or pin "
+                "--lookup list (or [http] lookup_search_max_rows = 0).")
+            return
         shown = ", ".join(repr(n) for n in recovered[:3])
         if len(recovered) > 3:
             shown += f" and {len(recovered) - 3} more"
-        plural = len(recovered) != 1
         self._snapshot_warnings.append(
             f"this tenant matched nothing when filtering by name for {kind}{'s' if plural else ''} {shown}, but its "
-            f"unfiltered listing serves {'them' if plural else 'it'}; nothing else in this run is treated as missing "
-            "on the strength of a name-filtered read. Pin --lookup list (or [http] lookup_search_max_rows = 0) for "
-            "this tenant.")
+            f"unfiltered listing serves {'them' if plural else 'it'}; the rest of this run uses list mode, and nothing "
+            "is treated as missing on the strength of a name-filtered read. Pin --lookup list (or [http] "
+            "lookup_search_max_rows = 0) for this tenant.")
 
     def _list_all_secrets(self) -> list[dict[str, Any]]:
         """Share one complete listing between secret discovery and account-scoped target-set discovery."""
@@ -551,13 +576,16 @@ class Reconciler:
                 listed = SecretIndex(listing)
                 recovered = sorted({a.sia_name for a in accounts
                                     if not self._secrets.has(a.sia_name) and listed.has(a.sia_name)})
+                spellings = {str(s.get("secret_name") or s.get("secretName") or "").casefold():
+                             str(s.get("secret_name") or s.get("secretName") or "") for s in listing}
+                stored = {name: spellings.get(name.casefold(), name) for name in recovered}
                 # Union, not replacement: the per-name reads are evidence too, and a listing endpoint that already
                 # misbehaves (empty pages with live cursors) is not the only source of truth. The index collapses
                 # an object seen by both reads through its id.
                 for secret in listing:
                     self._secrets.add(secret)
                 if recovered:
-                    self._distrust_name_filters("strong account", recovered)
+                    self._distrust_name_filters("strong account", recovered, stored)
         else:
             self._secrets = SecretIndex(self._list_all_secrets())
         # Ambiguity must be discovered before any account or target-set write.
@@ -579,15 +607,18 @@ class Reconciler:
                     raise
                 self._principal_errors[name.casefold()] = exc
 
-    def _snapshot_target_sets(self, names: list[str], accounts: list[StrongAccountRow]) -> None:
+    def _snapshot_target_sets(self, names: list[str], accounts: list[StrongAccountRow],
+                              spellings: dict[str, str] | None = None) -> None:
         self._target_sets = {}
         if not names:
             return
+        spellings = spellings or {}
+        wanted = set(names)
         caps = getattr(self.sia, "capabilities", None)
         unfiltered = True if caps is None else bool(caps.targetsets_list_unfiltered)
         items: list[dict[str, Any]] = []
         if self._lookup_mode == "search" and unfiltered and self._filters_trusted():
-            for chunk in self._parallel(names, lambda n: self.sia.list_target_sets(name=n)):
+            for chunk in self._parallel(names, lambda n: self.sia.list_target_sets(name=spellings.get(n, n))):
                 items.extend(chunk)
             # As for strong accounts, an empty name-filtered read is not proof of absence: confirm every wanted
             # name still missing against one unfiltered listing before it becomes a bulk create, which on a set
@@ -595,14 +626,15 @@ class Reconciler:
             missing = set(names) - {str(pick(ts, "name", default="")).lower() for ts in items}
             if missing:
                 listing = self.sia.list_target_sets()
-                recovered = [ts for ts in listing
-                             if str(pick(ts, "name", default="")).lower() in missing]
+                stored = {str(pick(ts, "name", default="")).lower(): str(pick(ts, "name")) for ts in listing
+                          if str(pick(ts, "name", default="")).lower() in missing}
                 # Keep conflicting evidence for names already found, too: discarding it would bypass the
                 # identity/signature ambiguity check below.
                 items.extend(listing)
-                if recovered:
-                    self._distrust_name_filters("target set",
-                                                sorted({str(pick(ts, "name")) for ts in recovered}, key=str.lower))
+                if stored:
+                    requested = sorted(spellings.get(key, key) for key in stored)
+                    self._distrust_name_filters(
+                        "target set", requested, {spellings.get(key, key): value for key, value in stored.items()})
         elif unfiltered:
             items = self.sia.list_target_sets()
         else:
@@ -625,15 +657,21 @@ class Reconciler:
                     items.extend(chunk)
         for ts in items:
             name = str(pick(ts, "name", default="")).lower()
-            if name:
-                previous = self._target_sets.get(name)
-                if previous is not None:
-                    old_id = pick(previous, "id", "targetSetId", "target_set_id")
-                    new_id = pick(ts, "id", "targetSetId", "target_set_id")
-                    distinct_ids = old_id is not None and new_id is not None and str(old_id) != str(new_id)
-                    if distinct_ids or target_set_signature(previous) != target_set_signature(ts):
-                        raise ReconcileError(f"ambiguous target set {name!r}: the tenant returned conflicting identities or definitions; resolve them before applying")
-                self._target_sets[name] = ts
+            if not name:
+                continue
+            previous = self._target_sets.get(name)
+            if previous is not None:
+                old_id = pick(previous, "id", "targetSetId", "target_set_id")
+                new_id = pick(ts, "id", "targetSetId", "target_set_id")
+                same_object = old_id is not None and new_id is not None and str(old_id) == str(new_id)
+                if same_object:
+                    ts = ts if len(ts) >= len(previous) else previous     # two projections of one object: keep the fuller
+                elif name not in wanted:
+                    ts = previous          # an object this run never touches: never a reason to abort the run
+                elif (old_id is not None and new_id is not None) or target_set_signature(previous) != target_set_signature(ts):
+                    raise ReconcileError(f"ambiguous target set {name!r}: the tenant returned conflicting identities or "
+                                         "definitions; resolve them before applying")
+            self._target_sets[name] = ts
 
     def _snapshot_policies(self, fqdns: list[str]) -> None:
         self._owned_by_fqdn = None
@@ -650,7 +688,7 @@ class Reconciler:
                 for policy in chunk:
                     pid = str(pick(policy.get("metadata") or {}, "policyId", "policy_id", default="")) or str(id(policy))
                     seen.setdefault(pid, policy)
-            found_names = self._policies_by_name(list(seen.values()))
+            found_names = self._policies_by_name(list(seen.values()), {sr.policy_name.casefold() for _, sr in self._rows})
             if any(sr.policy_name.casefold() not in found_names for _, sr in self._rows):
                 # q= can fail independently of SIA's filters. A renamed owned policy cannot trigger the
                 # same-name 409 recovery, so confirm before deciding to create and rebuild both indexes below.
@@ -661,8 +699,10 @@ class Reconciler:
         else:
             filter_query = UAP_VM_FILTER if self.adopt_all else owned_vm_filter(self.defaults.owner_tag)
             self._policy_list = self.uap.list_policies(filter_query=filter_query)
-        self._policies = self._policies_by_name(self._policy_list)
+            if not self._policy_list and self._rows and filter_query != UAP_VM_FILTER:
+                self._confirm_empty_owned_listing(filter_query)
         wanted = {sr.policy_name.casefold() for _, sr in self._rows}
+        self._policies = self._policies_by_name(self._policy_list, wanted)
         required = ("principals", "targets", "conditions", "behavior")
         incomplete = []
         for name in sorted(wanted):
@@ -871,7 +911,10 @@ class Reconciler:
         return sanitize_template(template)
 
     @staticmethod
-    def _policies_by_name(policies: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    def _policies_by_name(policies: list[dict[str, Any]], wanted: set[str] | None = None) -> dict[str, dict[str, Any]]:
+        """Policies keyed by casefolded name. Two objects under one name are ambiguous only when this run wants that
+        name (``wanted``; None = every name); a duplicate elsewhere in the tenant keeps its first object and never
+        aborts a run that does not touch it."""
         out: dict[str, dict[str, Any]] = {}
         for policy in policies:
             name = (policy.get("metadata") or {}).get("name")
@@ -882,9 +925,31 @@ class Reconciler:
                     old_id = pick(previous.get("metadata") or {}, "policyId", "policy_id")
                     new_id = pick(policy.get("metadata") or {}, "policyId", "policy_id")
                     if not old_id or not new_id or str(old_id) != str(new_id):
-                        raise ReconcileError(f"ambiguous policy name {name!r}: multiple tenant object IDs; resolve them before applying")
+                        if wanted is None or key in wanted:
+                            raise ReconcileError(f"ambiguous policy name {name!r}: multiple tenant object IDs; resolve them before applying")
+                        continue
                 out[key] = policy
         return out
+
+    def _confirm_empty_owned_listing(self, filter_query: str) -> None:
+        """An empty owned-tag read may be right (nothing created yet) or a filter the tenant evaluates differently
+        (tag casing, an unsupported operator). One VM listing settles it before any row is planned as a create:
+        owned policies it carries prove the filter wrong, and policies under wanted names are kept either way."""
+        wanted = {sr.policy_name.casefold() for _, sr in self._rows}
+        listing = self.uap.list_policies(filter_query=UAP_VM_FILTER)
+        owned = [p for p in listing if is_owned_policy(p, self.defaults.owner_tag)]
+        named = [p for p in listing
+                 if html.unescape(str((p.get("metadata") or {}).get("name") or "")).casefold() in wanted]
+        if owned:
+            self._snapshot_warnings.append(
+                f"the owned-policy filter ({filter_query}) returned nothing, but the VM listing carries {len(owned)} "
+                f"polic{'y' if len(owned) == 1 else 'ies'} tagged {self.defaults.owner_tag!r}: this tenant does not "
+                "evaluate the tag filter as expected, so the listing was used instead. Pin --lookup list if this recurs.")
+        seen: dict[str, dict[str, Any]] = {}
+        for policy in owned + named:
+            pid = str(pick(policy.get("metadata") or {}, "policyId", "policy_id", default="")) or str(id(policy))
+            seen.setdefault(pid, policy)
+        self._policy_list = list(seen.values())
 
     def _full_policy(self, policy: dict[str, Any], *, force: bool = False) -> dict[str, Any]:
         if "targets" in policy and not force:
@@ -1121,6 +1186,8 @@ class Reconciler:
             self._result.secrets[account.name] = self._blocked_by_abort()
             return
         except SIAApiError as exc:
+            if self._is_conflict(exc) and self._adopt_existing_secret(account, what, exc):
+                return
             self._result.secrets[account.name] = self._exception_outcome(
                 self._error_status(exc), "create failed", exc,
                 stage="strong account create", object_name=account.name)
@@ -1137,6 +1204,27 @@ class Reconciler:
         with self._lock:
             self._secrets.add(created)
             self._refs[account.name] = (sid, stype)
+
+    def _adopt_existing_secret(self, account: StrongAccountRow, what: str, exc: SIAApiError) -> bool:
+        """A create that answered "already exists" (a race, or a 429 retried after the write had landed): the
+        account is there, so read it and report exists instead of a failure that blocks every dependent row."""
+        assert self._result is not None
+        try:
+            found = self.sia.find_secret(account.sia_name)
+        except SIAApiError:
+            return False
+        if not found:
+            return False
+        sid, stype = secret_id_of(found), secret_type_of(found) or account.secret_type or ""
+        if not sid or not stype:
+            return False
+        self._result.secrets[account.name] = Outcome(
+            "exists", f"{stype} secret {sid} ({account.sia_name}) already existed when creating {what} "
+                      f"(the create answered {exc.status})", sid)
+        with self._lock:
+            self._secrets.add(found)
+            self._refs[account.name] = (sid, stype)
+        return True
 
     # -------------------------------------------------------- target sets
     def _rows_by_target_set(self) -> dict[str, list[tuple[ServerRow, ServerResult]]]:

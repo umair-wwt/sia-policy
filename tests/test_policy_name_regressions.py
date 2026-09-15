@@ -93,6 +93,7 @@ def test_reconciler_recovers_409_for_an_html_escaped_name_through_real_uap_clien
     existing["metadata"]["policyTags"] = ["manual"]
     responses = [
         FakeResponse(200, {"results": []}),  # The owner-tag snapshot excludes this unmanaged policy.
+        FakeResponse(200, {"results": []}),  # ... and the VM listing confirming the empty read misses it too (a race).
         FakeResponse(409, {"message": "policy name already exists"}),
     ]
     if search_miss:

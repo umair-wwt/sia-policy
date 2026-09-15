@@ -109,7 +109,10 @@ timeout_seconds = 60
 max_retries = 4
 status_polls = 5          # read-backs after creating a policy while it is still "Validating", 2 s apart (1..10)
 max_requests_per_second = 0    # global rate limit shared by all --workers (0 = none); raise --workers only with a limit
-lookup_search_max_rows = 2000  # --lookup auto: read per server (search) up to this many servers, else one filtered list
+# --lookup auto: read per server (search) up to this many servers, else one listing per object kind. Search pays one
+# filtered read per object, and SIA applies its filters after the page limit, so on a tenant with many objects each
+# search walks the whole store: keep this small (0 = always list). A filtered miss switches the run to list mode.
+lookup_search_max_rows = 50
 # Policies read per request. UAP applies its filter after the page limit, so a filtered read pages through every
 # policy in the tenant: raise this if the snapshot's "policies" timing is slow on a tenant with many policies.
 # UAP may reject a value above its own maximum, which fails every policy read at snapshot time: raise it in steps.

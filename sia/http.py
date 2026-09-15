@@ -18,6 +18,9 @@ import threading
 import time
 from typing import Any, Callable, Iterable
 
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
+
 import requests
 
 from .redact import sanitize
@@ -220,9 +223,19 @@ class HttpClient:
 
     @classmethod
     def _retry_delay(cls, resp: requests.Response, attempt: int) -> float:
-        retry_after = resp.headers.get("Retry-After")
-        if retry_after and retry_after.isdigit():
+        """Honour Retry-After as seconds or as the HTTP-date gateways and WAFs send; otherwise back off."""
+        retry_after = (resp.headers.get("Retry-After") or "").strip()
+        if retry_after.isdigit():
             return min(float(retry_after), 60.0)
+        if retry_after:
+            try:
+                when = parsedate_to_datetime(retry_after)
+            except (TypeError, ValueError, IndexError):
+                when = None
+            if when is not None:
+                if when.tzinfo is None:
+                    when = when.replace(tzinfo=timezone.utc)
+                return min(max(0.0, (when - datetime.now(timezone.utc)).total_seconds()), 60.0)
         return cls._backoff(attempt)
 
     def get(self, url: str, **kw) -> requests.Response:

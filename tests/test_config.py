@@ -36,7 +36,7 @@ def test_example_config_loads():
     assert spec is not None and (spec.name, spec.type, spec.safe, spec.account_name, spec.username, spec.account_domain) == (
         "ADM-{hostname}", "vault", "SIA-LocalAdmins", "{hostname}-Administrator", "Administrator", "local")
     assert cfg.http.max_retries == 4 and cfg.http.status_polls == 5
-    assert cfg.http.max_requests_per_second == 0 and cfg.http.lookup_search_max_rows == 2000
+    assert cfg.http.max_requests_per_second == 0 and cfg.http.lookup_search_max_rows == 50
     assert cfg.http.secrets_api == "auto" and cfg.http.targetsets_api == "auto"
     assert cfg.defaults.description_template == "Automated: {protocol} ZSP access to {fqdn}"
     assert cfg.connect.login_suffix == "" and cfg.connect.gateway_host == "" and cfg.connect.network == ""

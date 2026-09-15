@@ -294,6 +294,17 @@ still overrides the cloned value.
 
 ## 4. Scale mechanisms
 
+**Filtered reads are evidence, not proof.** A server-side name filter that misses an object the unfiltered
+listing serves flips `SIACapabilities.name_filter_reliable`, switches the rest of the run to list mode, and warns;
+when every miss is the same name in another case, the warning names the tenant's spelling
+(`_distrust_name_filters`). An empty owned-tag policy read is confirmed against one VM listing before any row is
+planned as a create (`_confirm_empty_owned_listing`): owned policies it carries prove the tag filter wrong, policies
+under wanted names are kept either way. Two objects under one name are ambiguous only when this run wants that name;
+two projections of one object (same id) keep the fuller one. The legacy strong-account listing refuses a
+continuation token (its inventory would be incomplete). Every listing walk counts its pages (`pages_read`, reported
+per stage in the snapshot log line) and logs a walk of 20 pages or more with the hint to pin list mode; a secret
+create that answers "already exists" is read back and reported as `exists`.
+
 **Lookup strategies (`snapshot()`).** `--lookup search` reads per server, in parallel: `find_secret(sia_name)` per
 account, `list_target_sets(name=fqdn)` per server (or per strong account when the tenant requires
 `strongAccountId`), and `find_policies_for_fqdn(q)` for every FQDN plus every custom policy name that does not

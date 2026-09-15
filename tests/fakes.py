@@ -69,6 +69,7 @@ class FakeSIA:
         self.raise_on_settings: SIAApiError | None = None
         self.raise_on_bulk: SIAApiError | None = None
         self.raise_on_update_target_set: SIAApiError | None = None
+        self.case_sensitive_filters = False      # server-side name filters match the stored spelling exactly
         self.echo_strong_account_id = False      # listings spell the account link strong_account_id, not secret_id
         self.omit_target_set_fields: set[str] = set()   # fields the listing projection does not carry
         self._counter = 0
@@ -86,13 +87,16 @@ class FakeSIA:
         self.calls.append(("list_secrets", name))
         items = [dict(s) for s in self.secrets]
         if name:
-            items = [s for s in items if s["secret_name"].lower() == name.lower()]
+            items = [s for s in items if self._name_matches(s["secret_name"], name)]
         return items
+
+    def _name_matches(self, stored, wanted):
+        return stored == wanted if self.case_sensitive_filters else stored.lower() == wanted.lower()
 
     def find_secret(self, name):
         self.calls.append(("find_secret", name))
         for s in self.secrets:
-            if s["secret_name"].lower() == name.lower():
+            if self._name_matches(s["secret_name"], name):
                 return dict(s)
         return None
 
@@ -114,7 +118,7 @@ class FakeSIA:
         if strong_account_id:
             items = [t for t in items if t.get("secret_id") == strong_account_id]
         if name:
-            items = [t for t in items if t["name"].lower() == name.lower()]
+            items = [t for t in items if self._name_matches(t["name"], name)]
         if self.echo_strong_account_id:
             items = [{("strong_account_id" if key == "secret_id" else key): value for key, value in t.items()} for t in items]
         if self.omit_target_set_fields:
