@@ -244,9 +244,16 @@ partial list object is `None`; `--drift` / `--update` fetches the full object be
 Null and empty values a GET echoes for unset fields are dropped, and an `accessApproval` that only says "not
 required" (`{"required": false, "approvers": []}`, `{"required": false}`, `null`) is unset: tenants with dual
 control echo it for every policy created without the key, and CyberArk's SDKs omit it for that state.
-`required: true` or any approver is a real difference. Drift lines and read-back mismatches name values
-(`tenant -> requested`) through `_policy_change_values()`, which lists the settings an operator recognises by name
-and every other differing leaf of the block by its path, so a field the tool does not manage is never silent.
+`required: true` or any approver is a real difference. The session-override flags (`overrideIdleTime`,
+`overrideMaxSessionDuration`, `overrideRecording`: a policy-level override of the tenant's session settings that
+CyberArk is rolling out per tenant, absent from the SDK condition models) are never sent; a tenant with the feature
+derives them from the request, so `SESSION_OVERRIDE_FLAGS` drops a flag that carries the derived value
+(`overrideIdleTime` true exactly when `idleTime` is set, likewise `maxSessionDuration`; `overrideRecording` false)
+and keeps one that contradicts its setting, reported as `idle time override: false -> true` (the policy is not
+applying the idle time that was sent) or `recording override: true -> false`. Drift lines and read-back mismatches
+name values (`tenant -> requested`) through `_policy_change_values()`, which lists the settings an operator
+recognises by name and every other differing leaf of the block by its path, so a field the tool does not manage is
+never silent.
 Names are compared HTML-unescaped. Status is handled separately: normal updates preserve the live value;
 `--set-policy-status Active|Suspended` requires `--update` and deliberately includes it in preview/update behavior.
 
@@ -260,7 +267,8 @@ connection profile (RDP `localEphemeralUser`/`domainEphemeralUser`, or SSH `user
 `sanitize_template()` keeps only `conditions` ∩ {accessWindow, maxSessionDuration, idleTime, accessApproval},
 `behavior.connectAs.rdp` ∩ the two profile keys, `behavior.connectAs.ssh.username`, `metadata.timeZone`,
 `metadata.policyTags`, `delegationClassification` (`accessApproval` only when it requires approval or names
-approvers; null/empty echoes such as `fromHour: null` are dropped, not sent back). `build_policy()` then uses the
+approvers; null/empty echoes such as `fromHour: null` are dropped, not sent back; the `override*` session flags a
+tenant adds are never copied, the tenant derives them again). `build_policy()` then uses the
 profile matching the row's
 protocol and fails the row if the template lacks it; a per-row `assign_groups` (rdp) or `ssh_username` (ssh)
 still overrides the cloned value.
@@ -514,6 +522,10 @@ replaces the object, so omitting them would reset them to the platform default.
                                                             "enableEphemeralUserReconnect": false}}}}
 }
 ```
+
+A tenant with policy-level session settings reads this body back with `overrideIdleTime: true`,
+`overrideMaxSessionDuration: true` and `overrideRecording: false` added to `conditions`. The tool never sends them;
+`SESSION_OVERRIDE_FLAGS` in `payloads.py` explains how they are compared.
 
 The principal is an Identity **role** by default (`[defaults] principal_type = "role"`): `id` is the role's `_ID` from
 DirectoryServiceQuery, and the two source-directory fields are optional for ROLE in the Access Control Policies API —

@@ -17,6 +17,13 @@ from .inputs import ServerRow, StrongAccountRow, effective_policy_name
 TARGET_SET_TYPE_TARGET = "Target"
 MAX_POLICY_TAGS = 20
 APPROVED_CONDITION_KEYS = ("accessWindow", "maxSessionDuration", "idleTime", "accessApproval")
+# Policy-level session-setting overrides (rolling out per SIA tenant; absent from the SDK condition models). A tenant
+# with the feature derives them from the request -- a policy that sends idleTime reads back overrideIdleTime: true,
+# one that sends maxSessionDuration reads back overrideMaxSessionDuration: true, and with no recording setting sent
+# overrideRecording: false -- so the tool never sends them (a tenant without the feature may reject unknown keys) and
+# compares each against the setting it is derived from. Recognised on read only.
+SESSION_OVERRIDE_FLAGS: dict[str, str | None] = {
+    "overrideIdleTime": "idleTime", "overrideMaxSessionDuration": "maxSessionDuration", "overrideRecording": None}
 # metadata.status is REQUIRED on create (ArkUAPMetadata.status has no default); the platform then owns the value,
 # reporting Validating/Error/Warning back. Only these two are meaningful to ask for.
 POLICY_STATUSES = ("Active", "Suspended")
@@ -77,6 +84,24 @@ def _approval_unset(value: Any) -> bool:
     if not isinstance(value, Mapping):
         return False
     return not value.get("required") and not value.get("approvers")
+
+
+def implied_session_overrides(conditions: Mapping[str, Any] | None) -> dict[str, bool]:
+    """The session-override flags a tenant derives for a conditions block: true for a setting the block carries."""
+    conditions = conditions if isinstance(conditions, Mapping) else {}
+    return {flag: setting is not None and conditions.get(setting) not in (None, "")
+            for flag, setting in SESSION_OVERRIDE_FLAGS.items()}
+
+
+def _session_override_echo(flag: str, value: Any, conditions: Mapping[str, Any]) -> bool:
+    """True when an ``override*`` flag carries the value the tenant derives from the same ``conditions`` (null, or
+    ``overrideIdleTime``/``overrideMaxSessionDuration`` true exactly when ``idleTime``/``maxSessionDuration`` is set,
+    ``overrideRecording`` false), so it equals absent like ``_approval_unset``. A flag that contradicts its sibling
+    (``overrideIdleTime: false`` beside an idle time, ``overrideRecording: true``) means the policy is not applying
+    what was sent and stays a difference."""
+    if value is None:
+        return True
+    return isinstance(value, bool) and value == implied_session_overrides(conditions)[flag]
 
 
 def _without_unset(value: Any) -> Any:
@@ -389,7 +414,8 @@ def sanitize_template(template: dict[str, Any]) -> dict[str, Any]:
 
     Null/empty echoes of unset settings are dropped rather than sent back, and ``accessApproval`` is copied only when
     it actually requires approval or names approvers: the "not required" form is what a dual-control tenant echoes
-    for every policy, and a tenant without the feature may reject the key."""
+    for every policy, and a tenant without the feature may reject the key. The ``override*`` session flags a tenant
+    adds are never copied either: the tenant derives them again from the settings that are sent."""
     source = template if isinstance(template, Mapping) else {}
     raw_meta = source.get("metadata")
     meta = raw_meta if isinstance(raw_meta, Mapping) else {}
@@ -519,12 +545,16 @@ def _normalized(value: Any, key: str = "") -> Any:
     (``accessWindow.fromHour``, ``timeFrame.fromTime``, ``connectAs.rdp.domainEphemeralUser`` ...) while the tool
     simply leaves them out, and both mean the same setting, not drift. An ``accessApproval`` that only says "not
     required" is dropped for the same reason (see ``_approval_unset``); ``required: true`` or any approver counts.
+    A session-override flag that carries the value the tenant derives from the setting beside it is dropped too
+    (see ``SESSION_OVERRIDE_FLAGS``); one that contradicts that setting counts.
     """
     if isinstance(value, dict):
         entries = []
         for name, item in value.items():
             if str(name) == "accessApproval" and _approval_unset(item):
                 continue
+            if str(name) in SESSION_OVERRIDE_FLAGS and _session_override_echo(str(name), item, value):
+                continue    # ``value`` is the conditions block itself: the setting the flag derives from is beside it
             normalized = _normalized(item, str(name))
             if normalized is None or normalized == "" or normalized == ():
                 continue

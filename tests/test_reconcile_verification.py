@@ -304,6 +304,68 @@ def test_policy_create_converges_on_a_dual_control_tenant(tmp_path):
     assert len(calls(uap, "create_policy")) == 1 and not calls(uap, "update_policy")
 
 
+def test_policy_create_converges_on_a_tenant_that_overrides_session_settings(tmp_path):
+    """A tenant with policy-level session settings reads every policy back with overrideIdleTime and
+    overrideMaxSessionDuration true (those settings were sent) and overrideRecording false (none was)."""
+    uap = FakeUAP()
+    uap.echo_defaults = uap.echo_session_overrides = True
+    checkpoint = Checkpoint(tmp_path / "checkpoint.jsonl")
+    rec, sia, uap, _ = make(ONE, uap=uap, checkpoint=checkpoint)
+    result = rec.run()
+    outcome = result.servers[0].policy
+
+    assert outcome.status == "created" and outcome.ref == "pol-1"
+    assert result.failures == 0 and checkpoint.done_count() == 1
+    (payload,) = calls(uap, "create_policy")
+    assert not any(key.startswith("override") for key in payload["conditions"])
+    assert not calls(uap, "update_policy")
+
+    uap.partial_list = True                   # the real list endpoint carries no targets: --drift fetches the echo
+    again = make(ONE, sia=sia, uap=uap, drift=True)[0].run()
+    assert again.servers[0].policy.status == "exists" and "targets checked" in again.servers[0].policy.detail
+    assert len(calls(uap, "create_policy")) == 1 and not calls(uap, "update_policy")
+
+
+def test_policy_update_converges_on_a_tenant_that_overrides_session_settings():
+    seed, sia, uap, _ = make(ONE)
+    assert seed.run().failures == 0
+    uap.policies[0]["conditions"]["idleTime"] = 99
+    uap.echo_defaults = uap.echo_session_overrides = uap.partial_list = True
+    result = make(ONE, sia=sia, uap=uap, update=True, drift=True)[0].run()
+    outcome = result.servers[0].policy
+
+    assert outcome.status == "updated"
+    assert "access conditions differ (idle minutes: 99 -> 10)" in outcome.detail and "override" not in outcome.detail
+    ((_policy_id, update),) = calls(uap, "update_policy")
+    assert not any(key.startswith("override") for key in update["conditions"])
+
+
+class SessionOverrideContradictingUAP(FakeUAP):
+    """Stores every new policy with its idle-time override switched off and a recording override switched on."""
+
+    def create_policy(self, payload):
+        policy_id = super().create_policy(payload)
+        self.policies[-1]["conditions"].update(
+            {"overrideIdleTime": False, "overrideMaxSessionDuration": True, "overrideRecording": True})
+        return policy_id
+
+
+def test_policy_create_is_unverified_when_a_session_override_contradicts_the_request(tmp_path):
+    checkpoint = Checkpoint(tmp_path / "checkpoint.jsonl")
+    result = make(ONE, uap=SessionOverrideContradictingUAP(), checkpoint=checkpoint)[0].run()
+    outcome = result.servers[0].policy
+
+    assert outcome.status == "unverified" and outcome.ref == "pol-1"
+    assert ("read-back still differs in conditions (idle time override: false -> true; "
+            "recording override: true -> false)") in outcome.detail
+    differences = outcome.diagnostic["details"]["differences"]["conditions"]
+    assert differences["changed"] == ["overrideIdleTime", "overrideRecording"]
+    assert differences["tenant"]["overrideIdleTime"] is False and differences["tenant"]["overrideRecording"] is True
+    assert "overrideMaxSessionDuration" not in differences["tenant"]    # agrees with maxSessionDuration: an echo
+    assert not any(key.startswith("override") for key in differences["requested"])
+    assert result.failures == 1 and checkpoint.done_count() == 0
+
+
 class ApprovalEnforcingUAP(FakeUAP):
     """Stores every new policy with dual control switched on, whatever the request said."""
 

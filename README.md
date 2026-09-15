@@ -300,7 +300,8 @@ Summary: n/a=1, planned=8
 target sets, policies) and prints the same table with `created`. Run it again and everything says `exists`.
 Anything that differs from your list is shown as `drift`, never changed silently. Add `--drift` to fetch complete
 policies and compare every managed field the tool writes: descriptions, tags, time frame, time zone, principals
-(directory metadata for group principals only), entitlement, delegation, conditions, targets, and RDP/SSH behavior
+(directory metadata for group principals only), entitlement, delegation, conditions (the session-override flags a
+tenant derives from them are not drift), targets, and RDP/SSH behavior
 including local groups and reconnect. Target-set type, account, description, certificate validation and provisioning format are also compared.
 `--update` implies this full comparison.
 

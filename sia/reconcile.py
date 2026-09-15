@@ -49,7 +49,7 @@ from .payloads import (
     build_bulk_target_sets, build_policy, build_policy_update, build_secret_payload, build_target_set,
     build_target_set_update, build_vault_account, exact_fqdns, is_owned_policy, is_owned_target_set, leaf_differences,
     normalize_field, plain, policy_name_for, policy_signature, policy_status, sanitize_template, target_set_name_for,
-    validate_template, target_set_signature,
+    validate_template, target_set_signature, implied_session_overrides,
 )
 from .redact import register_secret
 from .resolve import PrincipalResolver, ResolveError, SecretIndex, pick, secret_id_of, secret_type_of
@@ -60,6 +60,11 @@ BULK_CHUNK = 50
 MAX_WORKERS = 16
 POLICY_STATUS_POLL_SECONDS = 2.0
 MAX_CHANGE_ENTRIES = 8            # named values per differing policy field in a drift or read-back message
+# Condition leaves outside the named settings that still deserve an operator's name. Compared on the normalized block
+# only (payloads.SESSION_OVERRIDE_FLAGS drops a flag carrying the value the tenant derives), never raw: do not move
+# them into _policy_change_values' paths, whose raw comparison would print a consistent echo beside every real change.
+_LEAF_LABELS = {"overrideIdleTime": "idle time override", "overrideMaxSessionDuration": "max session override",
+                "overrideRecording": "recording override"}
 BAD = ("failed", "blocked", "inactive", "uncertain", "unverified")
 NON_SYSTEMATIC_4XX = (404, 409, 429)
 NOT_APPLICABLE = "n/a"
@@ -102,8 +107,9 @@ def _policy_change_values(key: str, current: dict, desired: dict,
                           current_sig: dict | None = None, desired_sig: dict | None = None) -> str:
     """Compact, named before/after values (tenant -> requested) for one differing signature key.
 
-    Settings an operator recognises are named first; every other differing leaf of the block follows by its path,
-    so a field the tool does not manage (a condition a newer tenant adds, an extra RDP setting) is never silent.
+    Settings an operator recognises are named first; every other differing leaf of the block follows by its path
+    (or its ``_LEAF_LABELS`` name), so a field the tool does not manage (a condition a newer tenant adds, an extra
+    RDP setting) is never silent. A session-override flag the tenant derives shows the value the request implies.
     """
     if key == "principals":
         before, after = _principal_summary(current), _principal_summary(desired)
@@ -146,11 +152,14 @@ def _policy_change_values(key: str, current: dict, desired: dict,
     current_sig = policy_signature(current) if current_sig is None else current_sig
     desired_sig = policy_signature(desired) if desired_sig is None else desired_sig
     old_value, new_value = plain(current_sig.get(key)), plain(desired_sig.get(key))
+    implied = implied_session_overrides(desired.get("conditions")) if key == "conditions" else {}
     if isinstance(old_value, dict) and isinstance(new_value, dict):
         for path, old, new in leaf_differences(old_value, new_value):
             if path in covered or any(path.startswith(prefix + ".") for prefix in covered):
                 continue
-            changed.append(f"{path}: {short(old)} -> {short(new)}")
+            if new is None and path in implied:
+                new = implied[path]         # the tool never writes the flag; the tenant derives it from the setting
+            changed.append(f"{_LEAF_LABELS.get(path, path)}: {short(old)} -> {short(new)}")
     elif not changed and old_value != new_value:
         changed.append(f"{short(old_value)} -> {short(new_value)}")
     if len(changed) > MAX_CHANGE_ENTRIES:

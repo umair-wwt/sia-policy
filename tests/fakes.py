@@ -150,6 +150,9 @@ class FakeUAP:
         self.echo_defaults = False           # True: GET echoes unset optional fields as null/empty (like the real API)
         self.echo_dual_control = False       # with echo_defaults: accessApproval echoes as {"required": False,
                                              # "approvers": []}, as a dual-control tenant does for every policy
+        self.echo_session_overrides = False  # with echo_defaults: the flags a tenant with policy-level session
+                                             # settings derives from the request (override* true when the setting
+                                             # was sent, overrideRecording false)
         self.conflict_on_create: set[str] = set()   # policy names whose creation answers 409
         self._counter = 0
 
@@ -188,6 +191,10 @@ class FakeUAP:
         window.setdefault("fromHour", None)
         window.setdefault("toHour", None)
         conditions.setdefault("accessApproval", {"required": False, "approvers": []} if self.echo_dual_control else None)
+        if self.echo_session_overrides:
+            conditions.setdefault("overrideIdleTime", conditions.get("idleTime") is not None)
+            conditions.setdefault("overrideMaxSessionDuration", conditions.get("maxSessionDuration") is not None)
+            conditions.setdefault("overrideRecording", False)
         connect_as = policy.setdefault("behavior", {}).setdefault("connectAs", {})
         rdp = connect_as.get("rdp")
         if isinstance(rdp, dict):

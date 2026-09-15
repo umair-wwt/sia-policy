@@ -84,8 +84,9 @@ Checkpoints contain only fully completed rows; reports can also show partial row
 Policy creates/updates and target-set updates must read back the intended fields before they count as complete.
 An `Active` policy alone does not confirm that its requested role or group was saved. Reads retry within
 `[http] status_polls`; persistent differences remain `unverified` and are not recorded as completed checkpoints.
-The detail names each differing field with its tenant and requested values; null/empty echoes and a dual-control
-`accessApproval` that only says "not required" are not differences.
+The detail names each differing field with its tenant and requested values; null/empty echoes, a dual-control
+`accessApproval` that only says "not required", and the session-override flags (`overrideIdleTime`,
+`overrideMaxSessionDuration`, `overrideRecording`) a tenant derives from the settings that were sent are not differences.
 
 ## 2. How a user connects
 
@@ -379,7 +380,7 @@ do next**. The message distinguishes known causes from suggestions; `-v` adds sa
 | `drift: … not managed by this tool` | `--update` on a hand-built object. | Add `--adopt <fqdn>` (for a shared target set, `--adopt <target set name>`). |
 | `SSLError` / `CERTIFICATE_VERIFY_FAILED` | A proxy is re-signing TLS with a certificate the tool does not trust. | `[http] system_trust` (on by default) verifies against the computer's own trust store, which normally already holds the proxy root. If it still fails, confirm `sia doctor` names that store under `TLS trust` (`Windows certificate store` or `macOS keychain`) — when it reports `certifi` instead, install `truststore` (`python -m pip install .`). Otherwise export the proxy's root CA and pass `--ca-bundle FILE` (or set `[http] ca_bundle`), which takes precedence. Do **not** disable verification to get past this on a real tenant. |
 | `uncertain` / `… may or may not have been applied` | A request failed on the network after a write may have reached the service. | Do not repeat the write blindly. Run `plan --drift` and inspect current tenant state. |
-| `read-back still differs in <field> (<name>: <tenant> -> <requested>)` | The tenant stored something other than what was sent, or echoes a field the tool does not manage. Null/empty echoes and an `accessApproval` that only says `required: false` are already ignored. | Run `plan --drift -v` to compare with full values; `show-policy NAME` prints the raw object. If the field is one you never set, report it with that output. |
+| `read-back still differs in <field> (<name>: <tenant> -> <requested>)` | The tenant stored something other than what was sent, or echoes a field the tool does not manage. Null/empty echoes, an `accessApproval` that only says `required: false`, and the `override*` session flags a tenant derives from the settings that were sent are already ignored. `idle time override: false -> true` / `max session override: false -> true` means the tenant is not applying the policy's own idle time / session duration; `recording override: true -> false` is a per-policy recording override the tool does not manage. | Run `plan --drift -v` to compare with full values; `show-policy NAME` prints the raw object. For an override flag, check the policy's session settings in the portal. If the field is one you never set, report it with that output. |
 | `unverified` | The API response/read-back did not prove a usable object or requested status. | Run `plan --drift` (`-v` shows the values a read-back mismatch compared); confirm the referenced object before applying again. |
 | `checkpoint … reconciling it again` | A version, record, fingerprint or completed-stage reference is missing/mismatched. | Let the read-only snapshot reconcile it; do not treat the old checkpoint as live proof. |
 | `interrupted … re-run apply with --resume` | You stopped the run. | Run the same command with `--resume`. |

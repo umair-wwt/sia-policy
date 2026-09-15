@@ -58,17 +58,29 @@ def test_drift_names_condition_values_outside_the_known_settings():
     policy = uap.policies[0]
     policy["conditions"]["accessApproval"] = {"required": True}
     policy["conditions"]["someFutureField"] = {"x": 1}
+    # two session-override flags that agree with their settings (an echo) and one recording override that does not
+    policy["conditions"].update({"overrideIdleTime": True, "overrideMaxSessionDuration": True, "overrideRecording": True})
     result = make(ONE, sia=sia, uap=uap, drift=True, dry_run=True)[0].run()
     outcome = result.servers[0].policy
     assert outcome.status == "drift"
     assert ('access conditions differ (accessApproval: {"required": true} -> absent; '
-            'someFutureField: {"x": 1} -> absent)') in outcome.detail
+            'recording override: true -> false; someFutureField: {"x": 1} -> absent)') in outcome.detail
 
 
 def test_dual_control_echo_is_not_drift():
     rec, sia, uap, _ = make(ONE)
     assert rec.run().failures == 0
     uap.echo_defaults = uap.echo_dual_control = uap.partial_list = True
+    result = make(ONE, sia=sia, uap=uap, drift=True)[0].run()
+    assert result.servers[0].policy.status == "exists" and calls(uap, "get_policy")
+    result = make(ONE, sia=sia, uap=uap, update=True, drift=True)[0].run()
+    assert result.servers[0].policy.status == "exists" and not calls(uap, "update_policy")
+
+
+def test_session_override_echo_is_not_drift():
+    rec, sia, uap, _ = make(ONE)
+    assert rec.run().failures == 0
+    uap.echo_defaults = uap.echo_session_overrides = uap.partial_list = True
     result = make(ONE, sia=sia, uap=uap, drift=True)[0].run()
     assert result.servers[0].policy.status == "exists" and calls(uap, "get_policy")
     result = make(ONE, sia=sia, uap=uap, update=True, drift=True)[0].run()

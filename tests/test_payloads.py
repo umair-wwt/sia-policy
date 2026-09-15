@@ -9,6 +9,7 @@ from sia.payloads import (
     build_secret_payload, build_target_set, build_target_set_update, build_vault_account, description_for, exact_fqdns,
     is_owned_policy, is_owned_target_set, leaf_differences, names_match, normalize_field, ownership_marker, plain,
     policy_name_for, policy_signature, policy_status, render, sanitize_template, split_fqdn, validate_template,
+    SESSION_OVERRIDE_FLAGS,
 )
 
 DEFAULTS = Defaults(time_zone="America/New_York")
@@ -447,6 +448,53 @@ def test_policy_signature_keeps_a_real_access_approval(configured):
     assert policy_signature(desired)["conditions"] != policy_signature(tenant)["conditions"]
     off = {"conditions": {**desired["conditions"], "accessApproval": {"required": False, "approvers": []}}}
     assert policy_signature(off)["conditions"] != policy_signature(tenant)["conditions"]
+
+
+SENT_CONDITIONS = {"accessWindow": {"daysOfTheWeek": [0, 1]}, "maxSessionDuration": 2, "idleTime": 10}
+
+
+@pytest.mark.parametrize("sent", [
+    SENT_CONDITIONS,
+    {"accessWindow": {"daysOfTheWeek": [0, 1]}, "maxSessionDuration": 2},      # a template without an idle time
+    {"accessWindow": {"daysOfTheWeek": [0, 1]}},
+])
+def test_policy_signature_treats_derived_session_override_flags_as_absent(sent):
+    """A tenant with policy-level session settings derives the override flags from the settings that were sent."""
+    echoed = {**sent, "overrideIdleTime": "idleTime" in sent, "overrideMaxSessionDuration": "maxSessionDuration" in sent,
+              "overrideRecording": False}
+    assert policy_signature({"conditions": sent})["conditions"] == policy_signature({"conditions": echoed})["conditions"]
+    assert not set(plain(normalize_field(echoed))) & set(SESSION_OVERRIDE_FLAGS)
+    nulls = {**sent, "overrideIdleTime": None, "overrideMaxSessionDuration": None, "overrideRecording": None}
+    assert policy_signature({"conditions": sent})["conditions"] == policy_signature({"conditions": nulls})["conditions"]
+
+
+def test_policy_signature_treats_a_null_idle_time_with_its_flag_off_as_unset():
+    desired = {"conditions": {"accessWindow": {"daysOfTheWeek": [0, 1]}, "maxSessionDuration": 2}}
+    echoed = {"conditions": {**desired["conditions"], "idleTime": None, "overrideIdleTime": False,
+                             "overrideMaxSessionDuration": True, "overrideRecording": False}}
+    assert policy_signature(desired)["conditions"] == policy_signature(echoed)["conditions"]
+
+
+@pytest.mark.parametrize("planted", [
+    {"overrideIdleTime": False}, {"overrideMaxSessionDuration": False}, {"overrideRecording": True},
+    {"overrideIdleTime": "true"},
+])
+def test_policy_signature_keeps_a_session_override_flag_that_contradicts_its_setting(planted):
+    """overrideIdleTime: false beside an idle time means the policy is not applying it, and a recording override is a
+    setting the tool does not manage. Both must stay visible."""
+    tenant = {"conditions": {**SENT_CONDITIONS, **planted}}
+    assert policy_signature({"conditions": SENT_CONDITIONS})["conditions"] != policy_signature(tenant)["conditions"]
+    assert set(planted) <= set(plain(normalize_field(tenant["conditions"])))
+    on_without_setting = {"conditions": {"accessWindow": {"daysOfTheWeek": [0, 1]}, "overrideIdleTime": True}}
+    bare = {"conditions": {"accessWindow": {"daysOfTheWeek": [0, 1]}}}
+    assert policy_signature(bare)["conditions"] != policy_signature(on_without_setting)["conditions"]
+
+
+def test_sanitize_template_never_copies_session_override_flags():
+    echoed = json.loads(json.dumps(TEMPLATE))
+    echoed["conditions"].update({"overrideIdleTime": True, "overrideMaxSessionDuration": True, "overrideRecording": True})
+    assert validate_template(echoed) == []
+    assert not set(sanitize_template(echoed)["conditions"]) & set(SESSION_OVERRIDE_FLAGS)
 
 
 def test_sanitize_template_copies_access_approval_only_when_it_means_something():
