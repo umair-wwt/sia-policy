@@ -47,9 +47,9 @@ from .http import SIAApiError
 from .inputs import Inputs, ServerRow, StrongAccountRow
 from .payloads import (
     build_bulk_target_sets, build_policy, build_policy_update, build_secret_payload, build_target_set,
-    build_target_set_update, build_vault_account, exact_fqdns, is_owned_policy, is_owned_target_set, leaf_differences,
-    normalize_field, plain, policy_name_for, policy_signature, policy_status, sanitize_template, target_set_name_for,
-    validate_template, target_set_signature, implied_session_overrides,
+    build_target_set_update, build_vault_account, exact_fqdns, implied_session_overrides, is_owned_policy,
+    is_owned_target_set, partition_differences, plain, policy_name_for, policy_signature, policy_status,
+    sanitize_template, target_set_name_for, target_set_signature, validate_template,
 )
 from .redact import register_secret
 from .resolve import PrincipalResolver, ResolveError, SecretIndex, pick, secret_id_of, secret_type_of
@@ -60,11 +60,22 @@ BULK_CHUNK = 50
 MAX_WORKERS = 16
 POLICY_STATUS_POLL_SECONDS = 2.0
 MAX_CHANGE_ENTRIES = 8            # named values per differing policy field in a drift or read-back message
-# Condition leaves outside the named settings that still deserve an operator's name. Compared on the normalized block
-# only (payloads.SESSION_OVERRIDE_FLAGS drops a flag carrying the value the tenant derives), never raw: do not move
-# them into _policy_change_values' paths, whose raw comparison would print a consistent echo beside every real change.
-_LEAF_LABELS = {"overrideIdleTime": "idle time override", "overrideMaxSessionDuration": "max session override",
-                "overrideRecording": "recording override"}
+# Names an operator recognises for the leaves of a policy signature block (``<signature key>.<leaf path>``); every
+# other leaf is named by its path. Values are compared on the normalized blocks (payloads.policy_signature), never raw.
+_LEAF_LABELS = {
+    "description": "description", "time_zone": "time zone", "tags": "tags",
+    "conditions.maxSessionDuration": "max session hours", "conditions.idleTime": "idle minutes",
+    "conditions.accessWindow.daysOfTheWeek": "access days", "conditions.accessWindow.fromHour": "from hour",
+    "conditions.accessWindow.toHour": "to hour",
+    "conditions.overrideIdleTime": "idle time override", "conditions.overrideMaxSessionDuration": "max session override",
+    "conditions.overrideRecording": "recording override",
+    "behavior.connectAs.ssh.username": "SSH username",
+}
+for _profile in ("localEphemeralUser", "domainEphemeralUser"):
+    _LEAF_LABELS[f"behavior.connectAs.rdp.{_profile}.assignGroups"] = "local groups"
+    _LEAF_LABELS[f"behavior.connectAs.rdp.{_profile}.enableEphemeralUserReconnect"] = "reconnect"
+_BLOCK_LABELS = {"conditions": "access conditions", "behavior": "connection behavior", "time_frame": "time frame",
+                 "entitlement": "policy entitlement", "tags": "policy tags"}
 BAD = ("failed", "blocked", "inactive", "uncertain", "unverified")
 NON_SYSTEMATIC_4XX = (404, 409, 429)
 NOT_APPLICABLE = "n/a"
@@ -96,75 +107,65 @@ class PolicyReadBack(NamedTuple):
     status: str
     description: str
     mismatch: str                 # "" once every managed field converged, else "still differs in ..." with values
-    differences: dict[str, Any]   # {signature key: {"tenant": ..., "requested": ..., "changed": [paths]}}
+    differences: dict[str, Any]   # {signature key: {"tenant": ..., "requested": ..., "changed": [paths], "unmanaged": [paths]}}
+    notes: tuple[str, ...]        # leaves only the tenant carries, one note per block (never a failure)
 
 
 def _unset(value: Any) -> bool:
     return value is None or value == "" or value == [] or value == {}
 
 
-def _policy_change_values(key: str, current: dict, desired: dict,
-                          current_sig: dict | None = None, desired_sig: dict | None = None) -> str:
-    """Compact, named before/after values (tenant -> requested) for one differing signature key.
+def _short(value: Any) -> str:
+    if value is None:
+        return "absent"
+    text = json.dumps(value, ensure_ascii=False)
+    return text if len(text) <= 100 else text[:97] + "..."
 
-    Settings an operator recognises are named first; every other differing leaf of the block follows by its path
-    (or its ``_LEAF_LABELS`` name), so a field the tool does not manage (a condition a newer tenant adds, an extra
-    RDP setting) is never silent. A session-override flag the tenant derives shows the value the request implies.
+
+def _leaf_label(key: str, path: str) -> str | None:
+    """An operator's name for a leaf, its path when it has none, and no label at all for a whole-block value."""
+    full = f"{key}.{path}" if path else key
+    label = _LEAF_LABELS.get(full)
+    return label if label is not None else (path or None)
+
+
+def _policy_change_values(key: str, current: dict, desired: dict,
+                          current_sig: dict | None = None, desired_sig: dict | None = None,
+                          managed: list[tuple[str, Any, Any]] | None = None) -> str:
+    """Compact, named before/after values (tenant -> requested) for the managed differences of one signature key.
+
+    Only leaves the tool writes are listed (see ``partition_differences``): settings an operator recognises by their
+    ``_LEAF_LABELS`` name, every other leaf by its path, so a value the tenant changed is never silent. A session
+    override flag the tool is silent about shows the value the request implies. Leaves only the tenant carries are
+    rendered by ``_tenant_only_values`` instead.
     """
     if key == "principals":
         before, after = _principal_summary(current), _principal_summary(desired)
         return f" ({', '.join(before) or 'none'} -> {', '.join(after) or 'none'})" if before != after else ""
-    paths = {
-        "description": [("description", ("metadata", "description"))],
-        "time_zone": [("time zone", ("metadata", "timeZone"))],
-        "tags": [("tags", ("metadata", "policyTags"))],
-        "conditions": [("max session hours", ("conditions", "maxSessionDuration")),
-                       ("idle minutes", ("conditions", "idleTime")),
-                       ("access days", ("conditions", "accessWindow", "daysOfTheWeek")),
-                       ("from hour", ("conditions", "accessWindow", "fromHour")),
-                       ("to hour", ("conditions", "accessWindow", "toHour"))],
-        "behavior": [("SSH username", ("behavior", "connectAs", "ssh", "username"))],
-    }.get(key, [])
-    if key == "behavior":
-        for profile in ("localEphemeralUser", "domainEphemeralUser"):
-            paths += [("local groups", ("behavior", "connectAs", "rdp", profile, "assignGroups")),
-                      ("reconnect", ("behavior", "connectAs", "rdp", profile, "enableEphemeralUserReconnect"))]
-
-    def get(policy, path):
-        for segment in path:
-            policy = policy.get(segment) if isinstance(policy, dict) else None
-        return policy
-
-    def short(value):
-        if value is None:
-            return "absent"
-        text = json.dumps(value, ensure_ascii=False)
-        return text if len(text) <= 100 else text[:97] + "..."
-
-    changed: list[str] = []
-    covered: list[str] = []
-    for label, path in paths:
-        covered.append(".".join(path[1:]))
-        old, new = get(current, path), get(desired, path)
-        if (_unset(old) and _unset(new)) or normalize_field(old, path[-1]) == normalize_field(new, path[-1]):
-            continue                    # null/empty echoes and order-only differences are not changes
-        changed.append(f"{label}: {short(old)} -> {short(new)}")
-    current_sig = policy_signature(current) if current_sig is None else current_sig
-    desired_sig = policy_signature(desired) if desired_sig is None else desired_sig
-    old_value, new_value = plain(current_sig.get(key)), plain(desired_sig.get(key))
+    if managed is None:
+        current_sig = policy_signature(current) if current_sig is None else current_sig
+        desired_sig = policy_signature(desired) if desired_sig is None else desired_sig
+        managed, _ = partition_differences(key, plain(current_sig.get(key)), plain(desired_sig.get(key)))
     implied = implied_session_overrides(desired.get("conditions")) if key == "conditions" else {}
-    if isinstance(old_value, dict) and isinstance(new_value, dict):
-        for path, old, new in leaf_differences(old_value, new_value):
-            if path in covered or any(path.startswith(prefix + ".") for prefix in covered):
-                continue
-            if new is None and path in implied:
-                new = implied[path]         # the tool never writes the flag; the tenant derives it from the setting
-            changed.append(f"{_LEAF_LABELS.get(path, path)}: {short(old)} -> {short(new)}")
-    elif not changed and old_value != new_value:
-        changed.append(f"{short(old_value)} -> {short(new_value)}")
+    changed: list[str] = []
+    for path, old, new in managed:
+        if new is None and path in implied:
+            new = implied[path]         # the tool never writes the flag; the tenant derives it from the setting
+        label = _leaf_label(key, path)
+        changed.append(f"{label}: {_short(old)} -> {_short(new)}" if label else f"{_short(old)} -> {_short(new)}")
     if len(changed) > MAX_CHANGE_ENTRIES:
         changed = changed[:MAX_CHANGE_ENTRIES] + [f"+{len(changed) - MAX_CHANGE_ENTRIES} more"]
     return " (" + "; ".join(changed) + ")" if changed else ""
+
+
+def _tenant_only_values(key: str, tenant_only: list[tuple[str, Any, Any]]) -> str:
+    """One note naming the leaves of a block that only the tenant carries, with their values:
+    ``access conditions: tenant also carries accessApproval={"required": true}``."""
+    label = _BLOCK_LABELS.get(key, key.replace("_", " "))
+    shown = [path if key == "tags" else f"{path}={_short(old)}" for path, old, _ in tenant_only]
+    if len(shown) > MAX_CHANGE_ENTRIES:
+        shown = shown[:MAX_CHANGE_ENTRIES] + [f"+{len(shown) - MAX_CHANGE_ENTRIES} more"]
+    return f"{label}: tenant also carries {', '.join(shown)}"
 
 
 @dataclass
@@ -173,6 +174,7 @@ class Outcome:
     detail: str = ""
     ref: str | None = None
     diagnostic: dict[str, Any] | None = None
+    notes: tuple[str, ...] = ()   # leaves only the tenant carries; informational, never part of the verdict
 
     @property
     def bad(self) -> bool:
@@ -709,7 +711,7 @@ class Reconciler:
 
     @staticmethod
     def _applied_unverified(detail: str, *, stage: str, object_name: str, ref: str,
-                            details: dict[str, Any] | None = None) -> Outcome:
+                            details: dict[str, Any] | None = None, notes: tuple[str, ...] = ()) -> Outcome:
         """A write was accepted, but its read-back did not prove that the requested state converged.
 
         ``details`` (the read-back's tenant/requested values) goes into the diagnostic: the JSON report always
@@ -722,7 +724,36 @@ class Reconciler:
             code="SIA-API-RESPONSE", message=detail, stage=stage, object_name=object_name,
             mutation_state="applied", actions=tuple(actions), details=dict(details or {}),
         ).to_dict()
-        return Outcome("unverified", detail, ref, diagnostic)
+        return Outcome("unverified", detail, ref, diagnostic, notes=tuple(notes))
+
+    @staticmethod
+    def _converged(status: str, detail: str, ref: str, notes: tuple[str, ...], *, stage: str, object_name: str,
+                   details: dict[str, Any] | None = None) -> Outcome:
+        """A write whose read-back converged on every field the tool sent. Leaves only the tenant carries ride along
+        as notes with an informational diagnostic (JSON report, ``--verbose``), never as a failure."""
+        if not notes:
+            return Outcome(status, detail, ref)
+        diagnostic = Diagnostic(
+            code="SIA-TENANT-FIELDS", severity="info", message="; ".join(notes), stage=stage, object_name=object_name,
+            mutation_state="applied", details=dict(details or {}),
+            actions=("Nothing to fix: fields the tool never sends are preserved on update and reported as notes.",
+                     "To silence a field set [defaults] ignore_readback_keys; to fail on unknown fields set "
+                     "[defaults] readback_extra_keys = \"fail\".",
+                     "`show-policy NAME` prints the raw policy; --verbose or the JSON report shows the values."),
+        ).to_dict()
+        return Outcome(status, detail, ref, diagnostic, notes=tuple(notes))
+
+    def _partition(self, key: str, tenant: Any, requested: Any) -> tuple[list, list]:
+        """``partition_differences`` under this run's configuration: ``[defaults] ignore_readback_keys`` drops
+        tenant-only leaves by ``<signature key>.<path>``; ``readback_extra_keys = "fail"`` makes the rest managed."""
+        managed, tenant_only = partition_differences(key, tenant, requested)
+        ignored = tuple(self.defaults.ignore_readback_keys)
+        tenant_only = [leaf for leaf in tenant_only
+                       if not any(f"{key}.{leaf[0]}" == item or f"{key}.{leaf[0]}".startswith(item + ".")
+                                  for item in ignored)]
+        if self.defaults.readback_extra_keys == "fail":
+            return managed + tenant_only, []
+        return managed, tenant_only
 
     def _tick(self, stage: str, total: int) -> None:
         if not self.progress_every:
@@ -1400,7 +1431,8 @@ class Reconciler:
             stage="policy read-back", object_name=sr.policy_name, ref=policy_id)
         expected_status = self.set_policy_status or self.defaults.policy_status
         try:
-            _read_back, status, description, mismatch, differences = self._poll_policy(policy_id, desired, expected_status)
+            _read_back, status, description, mismatch, differences, notes = self._poll_policy(
+                policy_id, desired, expected_status)
         except SIAApiError as exc:
             sr.policy = self._exception_outcome(
                 "unverified", f"policy {policy_id} may have been created, but read-back failed", exc,
@@ -1421,9 +1453,11 @@ class Reconciler:
                 f"{detail}{suffix}; " + "; ".join(problems),
                 stage="policy read-back", object_name=sr.policy_name, ref=policy_id,
                 details={"policy_id": policy_id, "status": status, "requested_status": expected_status,
-                         "differences": differences})
+                         "differences": differences}, notes=notes)
         else:
-            sr.policy = Outcome("created", detail, policy_id)
+            sr.policy = self._converged("created", detail, policy_id, notes, stage="policy read-back",
+                                        object_name=sr.policy_name,
+                                        details={"policy_id": policy_id, "differences": differences})
         self._checkpoint_row(server, sr)
 
     @staticmethod
@@ -1489,12 +1523,17 @@ class Reconciler:
             "delegation": "delegation classification differs", "conditions": "access conditions differ",
             "fqdn_rules": "FQDN rules differ", "behavior": "connection behavior differs",
         }
+        notes: list[str] = []
         for key in compare_keys:
             if current_sig.get(key) is None:
                 continue
             checked.append("targets" if key == "fqdn_rules" else key.replace("_", " "))
             if current_sig[key] != desired_sig[key]:
-                diff.append(labels[key] + _policy_change_values(key, full, desired, current_sig, desired_sig))
+                managed, tenant_only = self._partition(key, plain(current_sig[key]), plain(desired_sig[key]))
+                if managed:
+                    diff.append(labels[key] + _policy_change_values(key, full, desired, current_sig, desired_sig, managed))
+                if tenant_only:
+                    notes.append(_tenant_only_values(key, tenant_only))
         status = policy_status(full)
         if self.set_policy_status is not None and status != self.set_policy_status:
             diff.append(f"status is {status or 'unknown'}, requested {self.set_policy_status}")
@@ -1515,16 +1554,16 @@ class Reconciler:
             hint = "" if "targets" in checked else "; add --drift to compare targets"
             full_hint = "; targets checked" if self.drift else ""
             sr.policy = Outcome(ok_status, f"policy {policy_id} up to date ({', '.join(checked)} checked{hint})"
-                                           f"{full_hint}{note}{status_note}", policy_id)
+                                           f"{full_hint}{note}{status_note}", policy_id, notes=tuple(notes))
             return
         summary = "; ".join(diff)
         if not (self.update and policy_id):
             hint = " (use --update to fix)" if owned else f" (unmanaged; use --update --adopt {server.fqdn} to take over)"
-            sr.policy = Outcome("drift", f"policy {policy_id}: {summary}{hint}{status_note}", policy_id)
+            sr.policy = Outcome("drift", f"policy {policy_id}: {summary}{hint}{status_note}", policy_id, notes=tuple(notes))
             return
         if not (owned or adopted):
             sr.policy = Outcome("drift", f"policy {policy_id}: {summary}; not managed by this tool (no {self.defaults.owner_tag!r} tag) "
-                                         f"-- pass --adopt {server.fqdn} to take ownership", policy_id)
+                                         f"-- pass --adopt {server.fqdn} to take ownership", policy_id, notes=tuple(notes))
             return
         if self._abort_reason:
             sr.policy = self._blocked_by_abort()
@@ -1535,11 +1574,14 @@ class Reconciler:
             status_change = ""
             if self.set_policy_status is None and status not in ("Active", "Suspended"):
                 status_change = f"; status {status or 'unknown'} -> {expected_status}"
-            sr.policy = Outcome("planned", f"would update policy {policy_id}: {summary}{status_change}", policy_id)
+            sr.policy = Outcome("planned", f"would update policy {policy_id}: {summary}{status_change}", policy_id,
+                                notes=tuple(notes))
             return
         # Validating, Warning and Error are platform-owned observations, not valid requested states. A corrective
         # update asks for the configured stable state; Active/Suspended are preserved unless explicitly overridden.
-        update_payload = build_policy_update(full, desired, status=expected_status)
+        # Leaves only the tenant carries travel with the PUT (a PUT replaces the object) unless the tenant is strict.
+        update_payload = build_policy_update(full, desired, status=expected_status,
+                                             preserve=self.defaults.readback_extra_keys != "fail")
         try:
             self.check_cancelled()
             sr.policy = Outcome("uncertain", "Policy update started; response not yet confirmed", policy_id)
@@ -1558,8 +1600,9 @@ class Reconciler:
             "Policy update accepted; read-back not yet complete",
             stage="policy read-back", object_name=sr.policy_name, ref=policy_id)
         try:
-            _read_back, read_status, description, mismatch, differences = self._poll_policy(
+            _read_back, read_status, description, mismatch, differences, read_notes = self._poll_policy(
                 policy_id, update_payload, expected_status)
+            notes += [note for note in read_notes if note not in notes]
         except SIAApiError as exc:
             sr.policy = self._exception_outcome(
                 "unverified", f"policy {policy_id} update was accepted, but read-back failed", exc,
@@ -1579,15 +1622,17 @@ class Reconciler:
                 f"{detail}{suffix}; " + "; ".join(problems),
                 stage="policy read-back", object_name=sr.policy_name, ref=policy_id,
                 details={"policy_id": policy_id, "status": read_status, "requested_status": expected_status,
-                         "differences": differences})
+                         "differences": differences}, notes=tuple(notes))
         elif read_status not in ("Active", "Suspended"):
             suffix = f": {description}" if description else ""
             sr.policy = self._applied_unverified(
-                f"{detail}{suffix}", stage="policy read-back", object_name=sr.policy_name, ref=policy_id)
+                f"{detail}{suffix}", stage="policy read-back", object_name=sr.policy_name, ref=policy_id, notes=tuple(notes))
         elif self.set_policy_status is None and read_status == "Suspended" and not self.suspended_ok:
-            sr.policy = Outcome("inactive", f"{detail}; fields were updated but the existing suspended state was preserved", policy_id)
+            sr.policy = Outcome("inactive", f"{detail}; fields were updated but the existing suspended state was preserved",
+                                policy_id, notes=tuple(notes))
         else:
-            sr.policy = Outcome("updated", detail, policy_id)
+            sr.policy = self._converged("updated", detail, policy_id, tuple(notes), stage="policy read-back",
+                                        object_name=sr.policy_name, details={"policy_id": policy_id})
 
     def _poll_policy(self, policy_id: str, desired: dict[str, Any], expected_status: str) -> PolicyReadBack:
         """Poll until a policy's status and normalized writable fields both match the submitted payload.
@@ -1598,6 +1643,7 @@ class Reconciler:
         status, description = "unknown", ""
         mismatch = "returned no policy state"
         differences: dict[str, Any] = {}
+        notes: list[str] = []
         desired_signature = policy_signature(desired)
         for attempt in range(self.status_polls):
             try:
@@ -1629,18 +1675,31 @@ class Reconciler:
                 status, description = "unknown", ""
                 mismatch = "returned a malformed policy object"
                 differences = {}
+                notes = []
             else:
-                changed = [key for key in desired_signature if actual_signature.get(key) != desired_signature[key]]
                 differences = {}
-                for key in changed:
+                changed_keys: list[str] = []
+                notes = []
+                for key in desired_signature:
+                    if actual_signature.get(key) == desired_signature[key]:
+                        continue
                     tenant, requested = plain(actual_signature.get(key)), plain(desired_signature[key])
+                    managed, tenant_only = self._partition(key, tenant, requested)
                     differences[key] = {"tenant": tenant, "requested": requested,
-                                        "changed": [path for path, _, _ in leaf_differences(tenant, requested) if path]}
+                                        "changed": [path for path, _, _ in managed if path],
+                                        "unmanaged": [path for path, _, _ in tenant_only]}
+                    if managed:
+                        changed_keys.append(key)
+                        differences[key]["values"] = _policy_change_values(
+                            key, policy, desired, actual_signature, desired_signature, managed)
+                    if tenant_only:
+                        notes.append(_tenant_only_values(key, tenant_only))
                 mismatch = "still differs in " + ", ".join(
-                    key.replace("_", " ") + _policy_change_values(key, policy, desired, actual_signature, desired_signature)
-                    for key in changed) if changed else ""
+                    key.replace("_", " ") + differences[key]["values"] for key in changed_keys) if changed_keys else ""
+                for key in changed_keys:
+                    differences[key].pop("values", None)
             if status.lower() == "error" or (status == expected_status and not mismatch):
                 break
             if attempt < self.status_polls - 1:
                 self._sleep(POLICY_STATUS_POLL_SECONDS)
-        return PolicyReadBack(policy, status, description, mismatch, differences)
+        return PolicyReadBack(policy, status, description, mismatch, differences, tuple(notes))

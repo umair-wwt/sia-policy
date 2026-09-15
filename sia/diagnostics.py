@@ -204,6 +204,14 @@ HELP_CATALOGUE: dict[str, dict[str, Any]] = {
                     "For a mutation, run `sia plan` to reconcile before trying it again."),
         "keywords": ("json", "response", "format", "schema"),
     },
+    "SIA-TENANT-FIELDS": {
+        "summary": "The tenant carries policy fields this tool does not manage; the write itself converged.",
+        "actions": ("Nothing to fix: fields the tool never sends are preserved on update and reported as notes.",
+                    "To silence a field set [defaults] ignore_readback_keys; to fail on unknown fields set "
+                    "[defaults] readback_extra_keys = \"fail\".",
+                    "`show-policy NAME` prints the raw policy; --verbose or the JSON report shows the values."),
+        "keywords": ("note", "tenant", "unmanaged", "extra", "fields", "echo"),
+    },
     "SIA-DISCOVERY-INCOMPLETE": {
         "summary": "The service did not return a complete inventory; discovery stopped.",
         "actions": ("No missing-object decisions can be made from this partial inventory.",

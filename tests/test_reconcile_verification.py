@@ -340,6 +340,71 @@ def test_policy_update_converges_on_a_tenant_that_overrides_session_settings():
     assert not any(key.startswith("override") for key in update["conditions"])
 
 
+def test_policy_update_preserves_fields_only_the_tenant_carries():
+    """A PUT replaces the object: leaves the tool never writes travel with the update instead of being reset."""
+    seed, sia, uap, _ = make(ONE)
+    assert seed.run().failures == 0
+    policy = uap.policies[0]
+    policy["conditions"]["idleTime"] = 99                          # a value the tool wrote, changed in the portal
+    policy["conditions"]["someFutureField"] = {"x": 1}             # a field the tool never writes
+    policy["metadata"]["policyTags"].append("cost-center:42")      # a tag added in the portal
+    result = make(ONE, sia=sia, uap=uap, update=True, drift=True)[0].run()
+    outcome = result.servers[0].policy
+
+    assert outcome.status == "updated" and result.failures == 0
+    assert "access conditions differ (idle minutes: 99 -> 10)" in outcome.detail
+    assert "someFutureField" not in outcome.detail and "cost-center" not in outcome.detail
+    assert outcome.notes == ("policy tags: tenant also carries cost-center:42",       # notes follow the signature order
+                             'access conditions: tenant also carries someFutureField={"x": 1}')
+    ((_policy_id, payload),) = calls(uap, "update_policy")
+    assert payload["conditions"]["idleTime"] == 10 and payload["conditions"]["someFutureField"] == {"x": 1}
+    assert payload["metadata"]["policyTags"][-1] == "cost-center:42"
+    stored = uap.policies[0]
+    assert stored["conditions"]["someFutureField"] == {"x": 1} and "cost-center:42" in stored["metadata"]["policyTags"]
+
+
+def test_a_field_only_the_tenant_carries_is_a_note_not_drift():
+    seed, sia, uap, _ = make(ONE)
+    assert seed.run().failures == 0
+    uap.policies[0]["conditions"]["someFutureField"] = {"x": 1}
+    result = make(ONE, sia=sia, uap=uap, update=True, drift=True)[0].run()
+    outcome = result.servers[0].policy
+    assert outcome.status == "exists" and not calls(uap, "update_policy")
+    assert outcome.notes == ('access conditions: tenant also carries someFutureField={"x": 1}',)
+
+
+def test_strict_mode_resets_fields_only_the_tenant_carries():
+    seed, sia, uap, _ = make(ONE)
+    assert seed.run().failures == 0
+    uap.policies[0]["conditions"]["someFutureField"] = {"x": 1}
+    strict = replace(DEFAULTS, readback_extra_keys="fail")
+    result = make(ONE, sia=sia, uap=uap, update=True, drift=True, defaults=strict)[0].run()
+    outcome = result.servers[0].policy
+    assert outcome.status == "updated" and not outcome.notes
+    assert 'access conditions differ (someFutureField: {"x": 1} -> absent)' in outcome.detail
+    ((_policy_id, payload),) = calls(uap, "update_policy")
+    assert "someFutureField" not in payload["conditions"] and "someFutureField" not in uap.policies[0]["conditions"]
+
+
+def test_the_tools_own_silence_is_still_managed():
+    """Access hours the tool leaves out mean "full days", and a tag the tool writes must be present: the tenant
+    changing either is drift, not a note."""
+    seed, sia, uap, _ = make(ONE)
+    assert seed.run().failures == 0
+    window = uap.policies[0]["conditions"]["accessWindow"]
+    window.update({"fromHour": "07:00", "toHour": "19:00"})
+    result = make(ONE, sia=sia, uap=uap, drift=True, dry_run=True)[0].run()
+    outcome = result.servers[0].policy
+    assert outcome.status == "drift" and not outcome.notes
+    assert 'access conditions differ (from hour: "07:00" -> absent; to hour: "19:00" -> absent)' in outcome.detail
+
+    window.pop("fromHour"), window.pop("toHour")
+    uap.policies[0]["metadata"]["policyTags"].remove("automated")
+    outcome = make(ONE, sia=sia, uap=uap, drift=True, dry_run=True)[0].run().servers[0].policy
+    assert outcome.status == "drift"
+    assert 'policy tags differ (tags: ["sia-policy-automation"] -> ["automated", "sia-policy-automation"])' in outcome.detail
+
+
 class SessionOverrideContradictingUAP(FakeUAP):
     """Stores every new policy with its idle-time override switched off and a recording override switched on."""
 
@@ -351,15 +416,17 @@ class SessionOverrideContradictingUAP(FakeUAP):
 
 
 def test_policy_create_is_unverified_when_a_session_override_contradicts_the_request(tmp_path):
+    """overrideIdleTime: false beside the idle time that was sent means the policy is not applying it: a managed
+    difference. overrideRecording: true is a setting the tool never writes: a note."""
     checkpoint = Checkpoint(tmp_path / "checkpoint.jsonl")
     result = make(ONE, uap=SessionOverrideContradictingUAP(), checkpoint=checkpoint)[0].run()
     outcome = result.servers[0].policy
 
     assert outcome.status == "unverified" and outcome.ref == "pol-1"
-    assert ("read-back still differs in conditions (idle time override: false -> true; "
-            "recording override: true -> false)") in outcome.detail
+    assert "read-back still differs in conditions (idle time override: false -> true)" in outcome.detail
+    assert outcome.notes == ("access conditions: tenant also carries overrideRecording=true",)
     differences = outcome.diagnostic["details"]["differences"]["conditions"]
-    assert differences["changed"] == ["overrideIdleTime", "overrideRecording"]
+    assert differences["changed"] == ["overrideIdleTime"] and differences["unmanaged"] == ["overrideRecording"]
     assert differences["tenant"]["overrideIdleTime"] is False and differences["tenant"]["overrideRecording"] is True
     assert "overrideMaxSessionDuration" not in differences["tenant"]    # agrees with maxSessionDuration: an echo
     assert not any(key.startswith("override") for key in differences["requested"])
@@ -375,12 +442,33 @@ class ApprovalEnforcingUAP(FakeUAP):
         return policy_id
 
 
-def test_policy_create_is_unverified_when_the_tenant_enforces_approval(tmp_path):
+def test_policy_create_notes_a_field_only_the_tenant_carries(tmp_path):
+    """A dual-control tenant that enforces approval adds a field the tool never sent. The write converged on every
+    field the tool did send, so the row succeeds with a note instead of failing."""
     checkpoint = Checkpoint(tmp_path / "checkpoint.jsonl")
     result = make(ONE, uap=ApprovalEnforcingUAP(), checkpoint=checkpoint)[0].run()
     outcome = result.servers[0].policy
 
-    assert outcome.status == "unverified" and outcome.ref == "pol-1"
+    assert outcome.status == "created" and outcome.ref == "pol-1"
+    assert outcome.notes == ('access conditions: tenant also carries accessApproval={"required": true}',)
+    diagnostic = outcome.diagnostic
+    assert diagnostic["code"] == "SIA-TENANT-FIELDS" and diagnostic["severity"] == "info"
+    assert diagnostic["mutation_state"] == "applied"
+    differences = diagnostic["details"]["differences"]["conditions"]
+    assert differences["tenant"]["accessApproval"] == {"required": True}
+    assert differences["changed"] == [] and differences["unmanaged"] == ["accessApproval"]
+    json.dumps(diagnostic)                    # the JSON report carries it as-is
+    assert result.failures == 0 and checkpoint.done_count() == 1
+
+
+def test_policy_create_is_unverified_on_a_tenant_field_in_strict_mode(tmp_path):
+    """[defaults] readback_extra_keys = "fail" keeps the older verdict: anything the tool did not send is a difference."""
+    checkpoint = Checkpoint(tmp_path / "checkpoint.jsonl")
+    strict = replace(DEFAULTS, readback_extra_keys="fail")
+    result = make(ONE, uap=ApprovalEnforcingUAP(), checkpoint=checkpoint, defaults=strict)[0].run()
+    outcome = result.servers[0].policy
+
+    assert outcome.status == "unverified" and outcome.ref == "pol-1" and not outcome.notes
     assert 'read-back still differs in conditions (accessApproval: {"required": true} -> absent)' in outcome.detail
     diagnostic = outcome.diagnostic
     assert diagnostic["code"] == "SIA-API-RESPONSE" and diagnostic["mutation_state"] == "applied"
@@ -389,8 +477,13 @@ def test_policy_create_is_unverified_when_the_tenant_enforces_approval(tmp_path)
     assert "accessApproval" not in differences["requested"] and differences["changed"] == ["accessApproval"]
     assert diagnostic["details"]["status"] == "Active" and diagnostic["details"]["policy_id"] == "pol-1"
     assert any("show-policy" in action for action in diagnostic["actions"])
-    json.dumps(diagnostic)                    # the JSON report carries it as-is
     assert result.failures == 1 and checkpoint.done_count() == 0
+
+
+def test_ignore_readback_keys_silences_a_tenant_field():
+    quiet = replace(DEFAULTS, ignore_readback_keys=("conditions.accessApproval",))
+    outcome = make(ONE, uap=ApprovalEnforcingUAP(), defaults=quiet)[0].run().servers[0].policy
+    assert outcome.status == "created" and not outcome.notes and outcome.diagnostic is None
 
 
 def test_policy_update_readback_names_the_values_that_did_not_converge():

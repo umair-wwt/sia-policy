@@ -241,19 +241,25 @@ sorted tags, time zone, principal IDs/types (source-directory metadata for non-r
 ROLE and therefore ignored), delegation classification, conditions,
 FQDN rules, and complete RDP/SSH behavior (including local groups and reconnect). A top-level key missing from a
 partial list object is `None`; `--drift` / `--update` fetches the full object before using the complete signature.
-Null and empty values a GET echoes for unset fields are dropped, and an `accessApproval` that only says "not
-required" (`{"required": false, "approvers": []}`, `{"required": false}`, `null`) is unset: tenants with dual
-control echo it for every policy created without the key, and CyberArk's SDKs omit it for that state.
-`required: true` or any approver is a real difference. The session-override flags (`overrideIdleTime`,
-`overrideMaxSessionDuration`, `overrideRecording`: a policy-level override of the tenant's session settings that
-CyberArk is rolling out per tenant, absent from the SDK condition models) are never sent; a tenant with the feature
-derives them from the request, so `SESSION_OVERRIDE_FLAGS` drops a flag that carries the derived value
-(`overrideIdleTime` true exactly when `idleTime` is set, likewise `maxSessionDuration`; `overrideRecording` false)
-and keeps one that contradicts its setting, reported as `idle time override: false -> true` (the policy is not
-applying the idle time that was sent) or `recording override: true -> false`. Drift lines and read-back mismatches
-name values (`tenant -> requested`) through `_policy_change_values()`, which lists the settings an operator
-recognises by name and every other differing leaf of the block by its path, so a field the tool does not manage is
-never silent.
+Null and empty values a GET echoes for unset fields are dropped.
+
+Differences are then split by `partition_differences()` along the ownership boundary: **the tool manages the leaves
+it writes and preserves the leaves it does not.** A value the tool sent that the tenant stored differently, a leaf the
+tenant dropped, a list-shaped block (principals, FQDN rules; a tag the tool writes that the tenant lacks) or a leaf
+the tool is deliberately silent about (`MANAGED_ABSENT_LEAVES`: access-window hours, the derived `overrideIdleTime`
+/ `overrideMaxSessionDuration`; `MANAGED_ABSENT_PREFIXES`: anything under `targets`) is a *managed* difference:
+read-back `unverified`, drift, and a PUT under `--update`. A leaf only the tenant carries (a dual-control block, a
+session setting a newer tenant adds, a portal tag) is *tenant-only*: the write converged on everything the tool sent,
+so the row succeeds with a note (`Outcome.notes`; an informational `SIA-TENANT-FIELDS` diagnostic in the JSON report
+and under `--verbose`), `plan --drift` says `exists`, and `build_policy_update()` copies the leaf into the PUT body
+(`preserve_unmanaged()`) so an update never resets it. `[defaults] readback_extra_keys = "fail"` restores the strict
+verdicts (and stops preserving); `[defaults] ignore_readback_keys` silences named leaves by
+`<signature key>.<path>`. Known benign echoes stay silent without a note: an `accessApproval` that only says "not
+required" (`_approval_unset`) and a session-override flag carrying the value the tenant derives
+(`SESSION_OVERRIDE_FLAGS`); a flag contradicting its setting is managed. Drift lines and read-back mismatches name
+managed values (`tenant -> requested`) through `_policy_change_values()`, settings an operator recognises by their
+`_LEAF_LABELS` name and every other leaf by its path; notes name tenant-only leaves through `_tenant_only_values()`,
+so nothing is ever silent.
 Names are compared HTML-unescaped. Status is handled separately: normal updates preserve the live value;
 `--set-policy-status Active|Suspended` requires `--update` and deliberately includes it in preview/update behavior.
 

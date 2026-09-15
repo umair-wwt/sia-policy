@@ -81,6 +81,12 @@ strong_account_domain = "local"                               # "local" for a lo
 # Tag added to every generated policy (and marker in target-set descriptions). --update only touches objects
 # carrying it, unless you --adopt them. Letters, digits, '_', '.', '-'.
 owner_tag = "sia-policy-automation"
+# Policy fields a tenant carries that this tool never writes (a dual-control block, a session setting a newer tenant
+# adds, a tag set in the portal): "note" reports them as notes and --update preserves them; "fail" treats them as a
+# read-back failure and drift, as older versions did. ignore_readback_keys silences named fields by signature path,
+# e.g. ["conditions.overrideRecording", "behavior.connectAs.rdp.localEphemeralUser.allowMappingLocalDrives", "tags.cost-center:42"].
+readback_extra_keys = "note"
+ignore_readback_keys = []
 # Optional: name of an existing (UI-created) VM/RDP policy whose approved fields (conditions, RDP profile,
 # timeZone, tags) are cloned into every generated policy. Name/description/targets/principals are still generated.
 template_policy = ""

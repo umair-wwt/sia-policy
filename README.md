@@ -300,9 +300,9 @@ Summary: n/a=1, planned=8
 target sets, policies) and prints the same table with `created`. Run it again and everything says `exists`.
 Anything that differs from your list is shown as `drift`, never changed silently. Add `--drift` to fetch complete
 policies and compare every managed field the tool writes: descriptions, tags, time frame, time zone, principals
-(directory metadata for group principals only), entitlement, delegation, conditions (the session-override flags a
-tenant derives from them are not drift), targets, and RDP/SSH behavior
-including local groups and reconnect. Target-set type, account, description, certificate validation and provisioning format are also compared.
+(directory metadata for group principals only), entitlement, delegation, conditions, targets, and RDP/SSH behavior
+including local groups and reconnect. A field only the tenant carries (one the tool never writes) is a note, not
+drift, and `--update` preserves it. Target-set type, account, description, certificate validation and provisioning format are also compared.
 `--update` implies this full comparison.
 
 `policy_status` in TOML is used only when a policy is created. To activate or suspend existing managed policies,

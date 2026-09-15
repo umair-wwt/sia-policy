@@ -513,11 +513,14 @@ def build_policy(server: ServerRow, principals: list[dict[str, Any]], defaults: 
     }
 
 
-def build_policy_update(existing: dict[str, Any], desired: dict[str, Any], *, status: str | None = None) -> dict[str, Any]:
+def build_policy_update(existing: dict[str, Any], desired: dict[str, Any], *, status: str | None = None,
+                        preserve: bool = True) -> dict[str, Any]:
     """PUT /api/policies/{id} body: desired policy carrying the existing policyId.
 
     The existing status is carried over rather than reset to defaults.policy_status. A caller may explicitly request
-    Active or Suspended with ``status``; this is the only way an update changes policy status.
+    Active or Suspended with ``status``; this is the only way an update changes policy status. With ``preserve``
+    (the default) leaves only the tenant carries are copied over too (see ``preserve_unmanaged``); strict tenants
+    (``[defaults] readback_extra_keys = "fail"``) send the desired body as is.
     """
     meta = {**desired["metadata"], "policyId": existing["metadata"]["policyId"]}
     current = (existing.get("metadata") or {}).get("status")
@@ -527,7 +530,8 @@ def build_policy_update(existing: dict[str, Any], desired: dict[str, Any], *, st
         meta["status"] = {"status": status}
     elif current:
         meta["status"] = {"status": current} if isinstance(current, str) else current
-    return {**desired, "metadata": meta}
+    body = {**desired, "metadata": meta}
+    return preserve_unmanaged(existing, body) if preserve else body
 
 
 def policy_status(policy: dict[str, Any]) -> str:
@@ -583,6 +587,23 @@ def plain(normalized: Any) -> Any:
     return normalized
 
 
+LeafDifference = tuple[str, Any, Any]      # (dotted path within the block, tenant value, requested value)
+
+# --- the ownership boundary ----------------------------------------------------------------------
+# The tool manages the leaves it writes and preserves the leaves it does not. A leaf only the tenant carries is a
+# tenant-only difference (a note, never a failure) unless the tool's silence about it is deliberate:
+MANAGED_ABSENT_LEAVES = frozenset({
+    "conditions.accessWindow.fromHour", "conditions.accessWindow.toHour",       # no hours configured = full days
+    "conditions.overrideIdleTime", "conditions.overrideMaxSessionDuration",     # derived from what the tool sent
+})
+MANAGED_ABSENT_PREFIXES = ("targets", "target_extras")    # an extra IP rule or target category grants access
+
+
+def _managed_absent(full_path: str) -> bool:
+    return full_path in MANAGED_ABSENT_LEAVES or any(
+        full_path == prefix or full_path.startswith(prefix + ".") for prefix in MANAGED_ABSENT_PREFIXES)
+
+
 def leaf_differences(current: Any, desired: Any, path: str = "") -> list[tuple[str, Any, Any]]:
     """``(dotted path, current, desired)`` for every leaf that differs between two plain() values.
 
@@ -595,6 +616,71 @@ def leaf_differences(current: Any, desired: Any, path: str = "") -> list[tuple[s
             out.extend(leaf_differences(current.get(name), desired.get(name), child))
         return out
     return [] if current == desired else [(path, current, desired)]
+
+
+def partition_differences(key: str, current: Any, desired: Any) -> tuple[list[LeafDifference], list[LeafDifference]]:
+    """Split one signature block's leaf differences into ``(managed, tenant_only)`` along the ownership boundary.
+
+    ``managed``: a value the tool wrote that the tenant stored differently, a leaf the tenant dropped, a list-shaped
+    block (principals, FQDN rules) or a leaf the tool is deliberately silent about (``MANAGED_ABSENT_LEAVES``,
+    ``MANAGED_ABSENT_PREFIXES``). ``tenant_only``: a leaf only the tenant carries. The tool never wrote it, so it
+    cannot be a failed write: it is reported as a note and ``build_policy_update`` preserves it. Policy tags compare
+    as a set: a tag the tool writes that the tenant lacks is managed, a tag only the tenant carries is tenant-only.
+    """
+    if key == "tags":
+        current_tags, desired_tags = list(current or []), list(desired or [])
+        missing = [tag for tag in desired_tags if tag not in current_tags]
+        extra = [tag for tag in current_tags if tag not in desired_tags]
+        return ([("", current_tags, desired_tags)] if missing else []), [(str(tag), tag, None) for tag in extra]
+    managed: list[LeafDifference] = []
+    tenant_only: list[LeafDifference] = []
+    for path, old, new in leaf_differences(current, desired):
+        if new is None and path and not _managed_absent(f"{key}.{path}"):
+            tenant_only.append((path, old, new))
+        else:
+            managed.append((path, old, new))
+    return managed, tenant_only
+
+
+_PRESERVED_BLOCKS = {("conditions",): "conditions", ("behavior",): "behavior",
+                     ("metadata", "timeFrame"): "time_frame", ("metadata", "policyEntitlement"): "entitlement"}
+
+
+def _copy_missing_leaves(source: Mapping[str, Any], target: dict[str, Any], path: str) -> None:
+    for name, value in source.items():
+        full = f"{path}.{name}"
+        if value is None or value == "" or value == [] or value == {} or _managed_absent(full):
+            continue                    # null/empty echoes of unset settings; leaves the tool is silent about on purpose
+        if (name == "accessApproval" and _approval_unset(value)) or (
+                name in SESSION_OVERRIDE_FLAGS and _session_override_echo(name, value, source)):
+            continue                    # the benign echoes policy_signature already treats as unset (see _normalized)
+        if name not in target:
+            target[name] = copy.deepcopy(value)
+        elif isinstance(value, Mapping) and isinstance(target[name], dict):
+            _copy_missing_leaves(value, target[name], full)
+
+
+def preserve_unmanaged(existing: Mapping[str, Any], body: dict[str, Any]) -> dict[str, Any]:
+    """``body`` with every leaf only the tenant carries copied over from ``existing``.
+
+    A PUT replaces the object, so a leaf the tool does not write (a dual-control block, a session setting a newer
+    tenant adds, a portal tag) would otherwise be reset by every update. Leaves the tool sets always win; leaves it
+    is deliberately silent about (``MANAGED_ABSENT_LEAVES``) and null/empty echoes are not copied; tags are unioned.
+    """
+    out = copy.deepcopy(body)
+    for block_path, key in _PRESERVED_BLOCKS.items():
+        source: Any = existing
+        target: Any = out
+        for segment in block_path:
+            source = source.get(segment) if isinstance(source, Mapping) else None
+            target = target.get(segment) if isinstance(target, dict) else None
+        if isinstance(source, Mapping) and isinstance(target, dict):
+            _copy_missing_leaves(source, target, key)
+    existing_tags = (existing.get("metadata") or {}).get("policyTags") if isinstance(existing, Mapping) else None
+    if isinstance(existing_tags, list) and isinstance(out.get("metadata"), dict):
+        tags = list(out["metadata"].get("policyTags") or [])
+        out["metadata"]["policyTags"] = tags + [tag for tag in existing_tags if isinstance(tag, str) and tag not in tags]
+    return out
 
 
 def _principal_detail(principal: dict[str, Any]) -> tuple[str, str, str, str]:

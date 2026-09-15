@@ -762,15 +762,18 @@ def test_full_policy_drift_includes_schedule_tags_and_connection_behavior():
     policy["metadata"]["policyTags"].append("unexpected")
     policy["behavior"]["connectAs"]["rdp"]["localEphemeralUser"]["enableEphemeralUserReconnect"] = True
     result = make(ONE, sia=sia, uap=uap, drift=True)[0].run()
-    detail = result.servers[0].policy.detail
-    assert result.servers[0].policy.status == "drift"
-    assert "access conditions differ" in detail and "policy tags differ" in detail and "connection behavior differs" in detail
+    outcome = result.servers[0].policy
+    assert outcome.status == "drift"
+    assert "access conditions differ" in outcome.detail and "connection behavior differs" in outcome.detail
+    # a tag the tool never wrote is the tenant's: a note, not drift, and the update below keeps it
+    assert "policy tags differ" not in outcome.detail
+    assert outcome.notes == ("policy tags: tenant also carries unexpected",)
 
     result = make(ONE, sia=sia, uap=uap, update=True)[0].run()
     assert result.servers[0].policy.status == "updated"
     updated = uap.policies[0]
     assert updated["conditions"]["idleTime"] == DEFAULTS.idle_minutes
-    assert "unexpected" not in updated["metadata"]["policyTags"]
+    assert "unexpected" in updated["metadata"]["policyTags"]
     assert updated["behavior"]["connectAs"]["rdp"]["localEphemeralUser"]["enableEphemeralUserReconnect"] is False
 
 

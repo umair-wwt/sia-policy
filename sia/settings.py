@@ -157,6 +157,8 @@ _LABELS = {
     "root_domain": "CyberArk root domain",
     "fqdn": "FQDN",
     "policy_tags": "Policy tags",
+    "readback_extra_keys": "Fields only the tenant carries",
+    "ignore_readback_keys": "Tenant fields to ignore",
     "policy_status": "New policy status",
     "time_zone": "Time zone",
     "from_hour": "Access starts",
@@ -190,6 +192,10 @@ _HELP: dict[tuple[str, str], str] = {
     ("defaults", "provision_format"): "Temporary-user naming format. When set, it must contain <user>.",
     ("defaults", "template_policy"): "Existing policy whose approved settings are copied into generated policies.",
     ("defaults", "owner_tag"): "Tag that proves a policy or target set belongs to this tool.",
+    ("defaults", "readback_extra_keys"): "Policy fields a tenant carries that this tool never writes: note (reported and "
+                                         "preserved on update) or fail (treated as a read-back failure and drift).",
+    ("defaults", "ignore_readback_keys"): "Tenant-only policy fields to leave out of notes, by signature path such as "
+                                          "conditions.overrideRecording.",
     ("defaults", "ssh_username"): "Default certificate username for SSH server rows.",
     ("defaults", "principal_type"): "Kind of Identity principal a policy grants access to: role (tenant-wide, the default) "
                                     "or group (may need a directory pin in groups.csv).",

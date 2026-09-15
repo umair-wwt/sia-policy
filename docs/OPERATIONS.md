@@ -84,9 +84,11 @@ Checkpoints contain only fully completed rows; reports can also show partial row
 Policy creates/updates and target-set updates must read back the intended fields before they count as complete.
 An `Active` policy alone does not confirm that its requested role or group was saved. Reads retry within
 `[http] status_polls`; persistent differences remain `unverified` and are not recorded as completed checkpoints.
-The detail names each differing field with its tenant and requested values; null/empty echoes, a dual-control
-`accessApproval` that only says "not required", and the session-override flags (`overrideIdleTime`,
-`overrideMaxSessionDuration`, `overrideRecording`) a tenant derives from the settings that were sent are not differences.
+The detail names each differing field the tool writes with its tenant and requested values. A field only the tenant
+carries (a dual-control block, a session setting a newer tenant adds, a tag set in the portal) is a note, not a
+difference: the row succeeds, `plan --drift` says `exists`, and `--update` preserves the field. `[defaults]
+readback_extra_keys = "fail"` makes such fields failures and drift instead; `[defaults] ignore_readback_keys`
+silences named ones.
 
 ## 2. How a user connects
 
@@ -380,7 +382,8 @@ do next**. The message distinguishes known causes from suggestions; `-v` adds sa
 | `drift: … not managed by this tool` | `--update` on a hand-built object. | Add `--adopt <fqdn>` (for a shared target set, `--adopt <target set name>`). |
 | `SSLError` / `CERTIFICATE_VERIFY_FAILED` | A proxy is re-signing TLS with a certificate the tool does not trust. | `[http] system_trust` (on by default) verifies against the computer's own trust store, which normally already holds the proxy root. If it still fails, confirm `sia doctor` names that store under `TLS trust` (`Windows certificate store` or `macOS keychain`) — when it reports `certifi` instead, install `truststore` (`python -m pip install .`). Otherwise export the proxy's root CA and pass `--ca-bundle FILE` (or set `[http] ca_bundle`), which takes precedence. Do **not** disable verification to get past this on a real tenant. |
 | `uncertain` / `… may or may not have been applied` | A request failed on the network after a write may have reached the service. | Do not repeat the write blindly. Run `plan --drift` and inspect current tenant state. |
-| `read-back still differs in <field> (<name>: <tenant> -> <requested>)` | The tenant stored something other than what was sent, or echoes a field the tool does not manage. Null/empty echoes, an `accessApproval` that only says `required: false`, and the `override*` session flags a tenant derives from the settings that were sent are already ignored. `idle time override: false -> true` / `max session override: false -> true` means the tenant is not applying the policy's own idle time / session duration; `recording override: true -> false` is a per-policy recording override the tool does not manage. | Run `plan --drift -v` to compare with full values; `show-policy NAME` prints the raw object. For an override flag, check the policy's session settings in the portal. If the field is one you never set, report it with that output. |
+| `read-back still differs in <field> (<name>: <tenant> -> <requested>)` | The tenant stored a field the tool writes differently from what was sent, dropped it, or switched off a setting the tool relies on (`idle time override: false -> true` means the policy's own idle time is not applied). Fields the tool never writes are not differences: they appear as `note:` lines (`SIA-TENANT-FIELDS`) and `--update` preserves them. | Run `plan --drift -v` to compare with full values; `show-policy NAME` prints the raw object. For an override flag, check the policy's session settings in the portal. |
+| `note: <block>: tenant also carries <field>=<value>` | The tenant carries a policy field this tool does not manage (a dual-control block, a newer session setting, a portal tag). Nothing failed. | Nothing to fix. To silence a field permanently set `[defaults] ignore_readback_keys = ["conditions.<field>"]`; to treat such fields as failures set `[defaults] readback_extra_keys = "fail"`. |
 | `unverified` | The API response/read-back did not prove a usable object or requested status. | Run `plan --drift` (`-v` shows the values a read-back mismatch compared); confirm the referenced object before applying again. |
 | `checkpoint … reconciling it again` | A version, record, fingerprint or completed-stage reference is missing/mismatched. | Let the read-only snapshot reconcile it; do not treat the old checkpoint as live proof. |
 | `interrupted … re-run apply with --resume` | You stopped the run. | Run the same command with `--resume`. |

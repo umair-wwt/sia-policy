@@ -120,6 +120,11 @@ class Defaults:
     provision_format: str = ""
     template_policy: str = ""
     owner_tag: str = "sia-policy-automation"   # policy tag / description marker identifying objects this tool manages
+    # Fields a tenant carries on a policy that this tool never writes: "note" (reported, preserved on --update) or
+    # "fail" (a read-back failure and drift, as older versions treated them). ignore_readback_keys silences named
+    # leaves by signature path, e.g. "conditions.overrideRecording".
+    readback_extra_keys: str = "note"
+    ignore_readback_keys: tuple[str, ...] = ()
     ssh_username: str = ""                     # default certificate username for protocol=ssh rows
     # What kind of Identity principal a policy grants access to: role (default; tenant-wide, nothing to pin) or
     # group (may need a directory pin in groups.csv when the same name exists in several directories).
@@ -449,6 +454,12 @@ def validation_issues(cfg: Config) -> tuple[ValidationIssue, ...]:
     elif any(not item.strip() for item in d.assign_local_groups):
         issues.append(_issue("defaults", "assign_local_groups",
             "[defaults] assign_local_groups must not contain blank group names"))
+    if d.readback_extra_keys not in ("note", "fail"):
+        issues.append(_issue("defaults", "readback_extra_keys",
+            f"[defaults] readback_extra_keys must be \"note\" or \"fail\", got {d.readback_extra_keys!r}"))
+    if any(not item.strip() or "." not in item.strip() for item in d.ignore_readback_keys):
+        issues.append(_issue("defaults", "ignore_readback_keys",
+            "[defaults] ignore_readback_keys entries must be dotted signature paths such as \"conditions.someField\""))
     if any(not item.strip() for item in d.policy_tags):
         issues.append(_issue("defaults", "policy_tags", "[defaults] policy_tags must not contain blank tags"))
     if len(set(d.policy_tags)) != len(d.policy_tags):

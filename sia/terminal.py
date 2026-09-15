@@ -561,7 +561,7 @@ SETTING_GROUPS = {
     "tenant": ("Tenant connection", ("tenant",), ()),
     "access": ("Access and sessions", (), ("time_zone", "days_of_week", "from_hour", "to_hour", "max_session_hours", "idle_minutes", "assign_local_groups", "enable_reconnect", "policy_status")),
     "accounts": ("Server accounts", (), ("strong_account_template", "strong_account_type", "strong_account_safe_template", "strong_account_account_name_template", "strong_account_username_template", "strong_account_domain", "target_set_scope", "target_set_cert_validation")),
-    "policies": ("Policy names and principals", (), ("policy_name_template", "description_template", "policy_tags", "owner_tag", "template_policy", "principal_type", "principal_template", "provision_format", "ssh_username")),
+    "policies": ("Policy names and principals", (), ("policy_name_template", "description_template", "policy_tags", "owner_tag", "readback_extra_keys", "ignore_readback_keys", "template_policy", "principal_type", "principal_template", "provision_format", "ssh_username")),
     "network": ("Network and certificates", ("http",), ()),
     "sign-in": ("Authentication options", ("auth",), ()),
     "connect": ("Connection exports", ("connect",), ()),

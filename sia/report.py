@@ -70,7 +70,14 @@ def _outcome_dict(outcome: Outcome) -> dict[str, object]:
     data = dict(vars(outcome))
     if not data.get("diagnostic"):
         data.pop("diagnostic", None)
+    if not data.get("notes"):
+        data.pop("notes", None)
     return sanitize(data)
+
+
+def _detail_with_notes(outcome: Outcome) -> str:
+    """The detail cell of a CSV row, with any notes (fields only the tenant carries) folded in."""
+    return outcome.detail + (" | note: " + "; ".join(outcome.notes) if outcome.notes else "")
 
 
 def _diagnostic_from_outcome(stage: str, object_name: str, outcome: Outcome) -> Diagnostic | None:
@@ -153,7 +160,8 @@ def _print_result_diagnostics(result: RunResult, out: TextIO, max_rows: int, ver
 
 
 def _noteworthy(sr: ServerResult) -> bool:
-    return any(o.status not in _QUIET_STATUSES or "unmanaged" in o.detail for o in (sr.secret, sr.target_set, sr.policy))
+    return any(o.status not in _QUIET_STATUSES or "unmanaged" in o.detail or o.notes
+               for o in (sr.secret, sr.target_set, sr.policy))
 
 
 def _print_accounts(title: str, outcomes: dict[str, Outcome], out: TextIO, max_rows: int) -> None:
@@ -208,10 +216,11 @@ def print_summary(result: RunResult, out: TextIO | None = None, *, max_rows: int
                 seen_target_sets.add(sr.target_set_key)
                 items.insert(0, ("target set", sr.target_set))
             for label, outcome in items:
-                noteworthy = outcome.status in _DETAIL_STATUSES or "unmanaged" in outcome.detail
+                noteworthy = outcome.status in _DETAIL_STATUSES or "unmanaged" in outcome.detail or outcome.notes
                 if noteworthy and outcome.detail:
                     details.append(str(sanitize(
                         f"  {sr.fqdn} [{sr.policy_name}]: {label} {outcome.status} — {outcome.detail}")))
+                    details.extend(str(sanitize(f"      note: {note}")) for note in outcome.notes)
         if details:
             print("\nDetails:", file=out)
             print("\n".join(details[:max_rows]), file=out)
@@ -319,8 +328,9 @@ def write_reports(result: RunResult, report_dir: str | Path, *, json_max_rows: i
         writer.writerow(CSV_COLUMNS)
         for sr in result.servers:
             writer.writerow(sanitize([sr.fqdn, sr.strong_account, sr.target_set_name or sr.fqdn, sr.policy_name,
-                                      sr.secret.status, sr.secret.detail, sr.target_set.status, sr.target_set.detail,
-                                      sr.policy.status, sr.policy.detail, sr.policy.ref or ""]))
+                                      sr.secret.status, _detail_with_notes(sr.secret),
+                                      sr.target_set.status, _detail_with_notes(sr.target_set),
+                                      sr.policy.status, _detail_with_notes(sr.policy), sr.policy.ref or ""]))
         csv_text = csv_buffer.getvalue()
     except (TypeError, ValueError, csv.Error, KeyboardInterrupt) as exc:
         raise ReportWriteError(paths.json_path, exc, paths=paths) from exc

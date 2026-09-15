@@ -1,7 +1,7 @@
 import io
 from dataclasses import replace
 
-from sia.report import print_summary, print_verify, result_dict
+from sia.report import print_summary, print_verify, result_dict, write_reports
 from tests.fakes import FakeUAP
 from tests.test_reconcile_verification import ApprovalEnforcingUAP
 from tests.test_resolve_reconcile import DEFAULTS, ONE, calls, make
@@ -52,7 +52,9 @@ def test_malformed_vault_create_blocks_dependents():
     assert not calls(sia, "create_secret") and not calls(uap, "create_policy")
 
 
-def test_drift_names_condition_values_outside_the_known_settings():
+def test_drift_notes_condition_values_outside_the_known_settings():
+    """Fields the tool never writes are notes on an `exists` row; [defaults] readback_extra_keys = "fail" names each
+    one as drift instead, tenant -> requested."""
     rec, sia, uap, _ = make(ONE)
     assert rec.run().failures == 0
     policy = uap.policies[0]
@@ -62,7 +64,13 @@ def test_drift_names_condition_values_outside_the_known_settings():
     policy["conditions"].update({"overrideIdleTime": True, "overrideMaxSessionDuration": True, "overrideRecording": True})
     result = make(ONE, sia=sia, uap=uap, drift=True, dry_run=True)[0].run()
     outcome = result.servers[0].policy
-    assert outcome.status == "drift"
+    assert outcome.status == "exists" and result.failures == 0
+    assert outcome.notes == ('access conditions: tenant also carries accessApproval={"required": true}, '
+                             'overrideRecording=true, someFutureField={"x": 1}',)
+
+    strict = replace(DEFAULTS, readback_extra_keys="fail")
+    outcome = make(ONE, sia=sia, uap=uap, drift=True, dry_run=True, defaults=strict)[0].run().servers[0].policy
+    assert outcome.status == "drift" and not outcome.notes
     assert ('access conditions differ (accessApproval: {"required": true} -> absent; '
             'recording override: true -> false; someFutureField: {"x": 1} -> absent)') in outcome.detail
 
@@ -87,8 +95,24 @@ def test_session_override_echo_is_not_drift():
     assert result.servers[0].policy.status == "exists" and not calls(uap, "update_policy")
 
 
-def test_unverified_readback_diagnostic_renders_values_in_verbose_details():
+def test_notes_render_in_summary_json_and_csv(tmp_path):
     result = make(ONE, uap=ApprovalEnforcingUAP())[0].run()
+    out = io.StringIO()
+    print_summary(result, out)
+    text = out.getvalue()
+    assert "policy created —" in text
+    assert 'note: access conditions: tenant also carries accessApproval={"required": true}' in text
+    assert "Troubleshooting" not in text and "need attention" not in text
+    policy = result_dict(result)["servers"][0]["policy"]
+    assert policy["notes"] == ['access conditions: tenant also carries accessApproval={"required": true}']
+    assert policy["diagnostic"]["code"] == "SIA-TENANT-FIELDS"
+    _json_path, csv_path = write_reports(result, tmp_path)
+    assert "note: access conditions: tenant also carries accessApproval" in csv_path.read_text(encoding="utf-8")
+
+
+def test_unverified_readback_diagnostic_renders_values_in_verbose_details():
+    strict = replace(DEFAULTS, readback_extra_keys="fail")
+    result = make(ONE, uap=ApprovalEnforcingUAP(), defaults=strict)[0].run()
     assert result.servers[0].policy.status == "unverified"
     normal, verbose, verify = io.StringIO(), io.StringIO(), io.StringIO()
     print_summary(result, normal)

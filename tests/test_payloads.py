@@ -8,8 +8,8 @@ from sia.payloads import (
     build_bulk_target_sets, build_fqdn_rule, build_policy, build_policy_update, build_group_principal, build_role_principal,
     build_secret_payload, build_target_set, build_target_set_update, build_vault_account, description_for, exact_fqdns,
     is_owned_policy, is_owned_target_set, leaf_differences, names_match, normalize_field, ownership_marker, plain,
-    policy_name_for, policy_signature, policy_status, render, sanitize_template, split_fqdn, validate_template,
-    SESSION_OVERRIDE_FLAGS,
+    partition_differences, policy_name_for, policy_signature, policy_status, render, sanitize_template, split_fqdn,
+    validate_template, SESSION_OVERRIDE_FLAGS,
 )
 
 DEFAULTS = Defaults(time_zone="America/New_York")
@@ -524,6 +524,54 @@ def test_template_validation_and_cloning_tolerate_null_echoes():
     wrong["conditions"]["accessApproval"] = "yes"
     assert validate_template(wrong) == ["conditions.accessWindow.fromHour must be a string",
                                         "conditions.accessApproval must be an object"]
+
+
+def test_partition_differences_separates_tenant_only_leaves_from_managed_changes():
+    current = {"accessWindow": {"daysOfTheWeek": [0, 1], "fromHour": "07:00"}, "idleTime": 99, "sessionRecording": False,
+               "overrideIdleTime": False}
+    desired = {"accessWindow": {"daysOfTheWeek": [0, 1]}, "idleTime": 10, "maxSessionDuration": 2}
+    managed, tenant_only = partition_differences("conditions", current, desired)
+    assert managed == [("accessWindow.fromHour", "07:00", None), ("idleTime", 99, 10), ("maxSessionDuration", None, 2),
+                       ("overrideIdleTime", False, None)]
+    assert tenant_only == [("sessionRecording", False, None)]
+    assert partition_differences("targets", {"ipRules": [{"x": 1}]}, {}) == ([("ipRules", [{"x": 1}], None)], [])
+    assert partition_differences("tags", ["a", "owner", "portal"], ["a", "owner"]) == ([], [("portal", "portal", None)])
+    assert partition_differences("tags", ["owner"], ["a", "owner"]) == ([("", ["owner"], ["a", "owner"])], [])
+    assert partition_differences("principals", ["r1"], ["r1", "r2"]) == ([("", ["r1"], ["r1", "r2"])], [])
+
+
+def test_build_policy_update_preserves_leaves_only_the_tenant_carries():
+    principal = build_role_principal(ROLE_ROW, CDS_DIRECTORY)
+    desired = build_policy(server(), [principal], DEFAULTS)
+    existing = json.loads(json.dumps(desired))
+    existing["metadata"]["policyId"] = "pol-1"
+    existing["metadata"]["policyTags"].append("cost-center:42")
+    existing["metadata"]["timeFrame"] = {"fromTime": None, "toTime": None}
+    existing["conditions"].update({"accessApproval": {"required": False, "approvers": []}, "someFutureField": {"x": 1},
+                                   "overrideIdleTime": True, "overrideMaxSessionDuration": True, "overrideRecording": False})
+    existing["conditions"]["accessWindow"].update({"fromHour": "07:00", "toHour": None})
+    profile = existing["behavior"]["connectAs"]["rdp"]["localEphemeralUser"]
+    profile.update({"assignDomainGroups": [], "allowMappingLocalDrives": False})
+    existing["behavior"]["connectAs"]["ssh"] = None
+
+    body = build_policy_update(existing, desired)
+    conditions = body["conditions"]
+    assert conditions["someFutureField"] == {"x": 1}
+    assert not any(key.startswith("override") for key in conditions)        # derived: the tenant sets them again
+    assert "accessApproval" not in conditions                                # the "not required" echo means unset
+    assert "fromHour" not in conditions["accessWindow"]                      # the tool's silence means "full days"
+    assert body["behavior"]["connectAs"]["rdp"]["localEphemeralUser"]["allowMappingLocalDrives"] is False
+    assert "assignDomainGroups" not in body["behavior"]["connectAs"]["rdp"]["localEphemeralUser"]
+    assert "ssh" not in body["behavior"]["connectAs"]
+    assert body["metadata"]["policyTags"] == [*desired["metadata"]["policyTags"], "cost-center:42"]
+    assert body["metadata"]["timeFrame"] == {} and body["metadata"]["policyId"] == "pol-1"
+    assert desired == build_policy(server(), [principal], DEFAULTS)          # the desired body is not mutated
+
+    existing["conditions"]["accessApproval"] = {"required": True, "approvers": []}
+    existing["conditions"]["overrideRecording"] = True
+    kept = build_policy_update(existing, desired)["conditions"]
+    assert kept["accessApproval"] == {"required": True, "approvers": []} and kept["overrideRecording"] is True
+    assert build_policy_update(existing, desired, preserve=False)["conditions"] == desired["conditions"]
 
 
 def test_plain_and_leaf_differences_describe_normalized_values():
