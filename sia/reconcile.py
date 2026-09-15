@@ -37,7 +37,7 @@ import threading
 import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import asdict, dataclass, field
-from typing import Any, Callable, Iterable
+from typing import Any, Callable, Iterable, NamedTuple
 
 from .checkpoint import Checkpoint, fingerprint, is_done, row_key
 from .clients import UAP_VM_FILTER, SIAClient, UAPClient, owned_vm_filter
@@ -47,9 +47,9 @@ from .http import SIAApiError
 from .inputs import Inputs, ServerRow, StrongAccountRow
 from .payloads import (
     build_bulk_target_sets, build_policy, build_policy_update, build_secret_payload, build_target_set,
-    build_target_set_update, build_vault_account, exact_fqdns, is_owned_policy, is_owned_target_set, policy_name_for,
-    policy_signature, policy_status, sanitize_template, target_set_name_for, validate_template,
-    target_set_signature,
+    build_target_set_update, build_vault_account, exact_fqdns, is_owned_policy, is_owned_target_set, leaf_differences,
+    normalize_field, plain, policy_name_for, policy_signature, policy_status, sanitize_template, target_set_name_for,
+    validate_template, target_set_signature,
 )
 from .redact import register_secret
 from .resolve import PrincipalResolver, ResolveError, SecretIndex, pick, secret_id_of, secret_type_of
@@ -59,6 +59,7 @@ LOOKUP_MODES = ("auto", "search", "list")
 BULK_CHUNK = 50
 MAX_WORKERS = 16
 POLICY_STATUS_POLL_SECONDS = 2.0
+MAX_CHANGE_ENTRIES = 8            # named values per differing policy field in a drift or read-back message
 BAD = ("failed", "blocked", "inactive", "uncertain", "unverified")
 NON_SYSTEMATIC_4XX = (404, 409, 429)
 NOT_APPLICABLE = "n/a"
@@ -85,8 +86,25 @@ def _principal_summary(policy: dict) -> list[str]:
                   for p in policy.get("principals") or [] if isinstance(p, dict))
 
 
-def _policy_change_values(key: str, current: dict, desired: dict) -> str:
-    """Compact, named before/after values for the settings an operator can change."""
+class PolicyReadBack(NamedTuple):
+    policy: dict[str, Any]
+    status: str
+    description: str
+    mismatch: str                 # "" once every managed field converged, else "still differs in ..." with values
+    differences: dict[str, Any]   # {signature key: {"tenant": ..., "requested": ..., "changed": [paths]}}
+
+
+def _unset(value: Any) -> bool:
+    return value is None or value == "" or value == [] or value == {}
+
+
+def _policy_change_values(key: str, current: dict, desired: dict,
+                          current_sig: dict | None = None, desired_sig: dict | None = None) -> str:
+    """Compact, named before/after values (tenant -> requested) for one differing signature key.
+
+    Settings an operator recognises are named first; every other differing leaf of the block follows by its path,
+    so a field the tool does not manage (a condition a newer tenant adds, an extra RDP setting) is never silent.
+    """
     if key == "principals":
         before, after = _principal_summary(current), _principal_summary(desired)
         return f" ({', '.join(before) or 'none'} -> {', '.join(after) or 'none'})" if before != after else ""
@@ -112,14 +130,31 @@ def _policy_change_values(key: str, current: dict, desired: dict) -> str:
         return policy
 
     def short(value):
+        if value is None:
+            return "absent"
         text = json.dumps(value, ensure_ascii=False)
         return text if len(text) <= 100 else text[:97] + "..."
 
-    changed = []
+    changed: list[str] = []
+    covered: list[str] = []
     for label, path in paths:
+        covered.append(".".join(path[1:]))
         old, new = get(current, path), get(desired, path)
-        if old != new:
-            changed.append(f"{label}: {short(old)} -> {short(new)}")
+        if (_unset(old) and _unset(new)) or normalize_field(old, path[-1]) == normalize_field(new, path[-1]):
+            continue                    # null/empty echoes and order-only differences are not changes
+        changed.append(f"{label}: {short(old)} -> {short(new)}")
+    current_sig = policy_signature(current) if current_sig is None else current_sig
+    desired_sig = policy_signature(desired) if desired_sig is None else desired_sig
+    old_value, new_value = plain(current_sig.get(key)), plain(desired_sig.get(key))
+    if isinstance(old_value, dict) and isinstance(new_value, dict):
+        for path, old, new in leaf_differences(old_value, new_value):
+            if path in covered or any(path.startswith(prefix + ".") for prefix in covered):
+                continue
+            changed.append(f"{path}: {short(old)} -> {short(new)}")
+    elif not changed and old_value != new_value:
+        changed.append(f"{short(old_value)} -> {short(new_value)}")
+    if len(changed) > MAX_CHANGE_ENTRIES:
+        changed = changed[:MAX_CHANGE_ENTRIES] + [f"+{len(changed) - MAX_CHANGE_ENTRIES} more"]
     return " (" + "; ".join(changed) + ")" if changed else ""
 
 
@@ -664,12 +699,19 @@ class Reconciler:
         return Outcome(status, f"{detail}: {exc}", ref, diagnostic)
 
     @staticmethod
-    def _applied_unverified(detail: str, *, stage: str, object_name: str, ref: str) -> Outcome:
-        """A write was accepted, but its read-back did not prove that the requested state converged."""
+    def _applied_unverified(detail: str, *, stage: str, object_name: str, ref: str,
+                            details: dict[str, Any] | None = None) -> Outcome:
+        """A write was accepted, but its read-back did not prove that the requested state converged.
+
+        ``details`` (the read-back's tenant/requested values) goes into the diagnostic: the JSON report always
+        carries it and ``--verbose`` prints it under "Technical details"."""
+        actions = ["Run plan --drift to reconcile the current tenant state before retrying the write."]
+        if details and details.get("differences"):
+            actions.append("The detail names each field as tenant -> requested; --verbose or the JSON report shows "
+                           "the full values, and `show-policy NAME` prints the raw policy.")
         diagnostic = Diagnostic(
             code="SIA-API-RESPONSE", message=detail, stage=stage, object_name=object_name,
-            mutation_state="applied",
-            actions=("Run plan --drift to reconcile the current tenant state before retrying the write.",),
+            mutation_state="applied", actions=tuple(actions), details=dict(details or {}),
         ).to_dict()
         return Outcome("unverified", detail, ref, diagnostic)
 
@@ -1349,7 +1391,7 @@ class Reconciler:
             stage="policy read-back", object_name=sr.policy_name, ref=policy_id)
         expected_status = self.set_policy_status or self.defaults.policy_status
         try:
-            _read_back, status, description, mismatch = self._poll_policy(policy_id, desired, expected_status)
+            _read_back, status, description, mismatch, differences = self._poll_policy(policy_id, desired, expected_status)
         except SIAApiError as exc:
             sr.policy = self._exception_outcome(
                 "unverified", f"policy {policy_id} may have been created, but read-back failed", exc,
@@ -1368,7 +1410,9 @@ class Reconciler:
                 problems.append(f"read-back {mismatch}")
             sr.policy = self._applied_unverified(
                 f"{detail}{suffix}; " + "; ".join(problems),
-                stage="policy read-back", object_name=sr.policy_name, ref=policy_id)
+                stage="policy read-back", object_name=sr.policy_name, ref=policy_id,
+                details={"policy_id": policy_id, "status": status, "requested_status": expected_status,
+                         "differences": differences})
         else:
             sr.policy = Outcome("created", detail, policy_id)
         self._checkpoint_row(server, sr)
@@ -1441,7 +1485,7 @@ class Reconciler:
                 continue
             checked.append("targets" if key == "fqdn_rules" else key.replace("_", " "))
             if current_sig[key] != desired_sig[key]:
-                diff.append(labels[key] + _policy_change_values(key, full, desired))
+                diff.append(labels[key] + _policy_change_values(key, full, desired, current_sig, desired_sig))
         status = policy_status(full)
         if self.set_policy_status is not None and status != self.set_policy_status:
             diff.append(f"status is {status or 'unknown'}, requested {self.set_policy_status}")
@@ -1505,7 +1549,7 @@ class Reconciler:
             "Policy update accepted; read-back not yet complete",
             stage="policy read-back", object_name=sr.policy_name, ref=policy_id)
         try:
-            _read_back, read_status, description, mismatch = self._poll_policy(
+            _read_back, read_status, description, mismatch, differences = self._poll_policy(
                 policy_id, update_payload, expected_status)
         except SIAApiError as exc:
             sr.policy = self._exception_outcome(
@@ -1524,7 +1568,9 @@ class Reconciler:
                 problems.append(f"read-back {mismatch}")
             sr.policy = self._applied_unverified(
                 f"{detail}{suffix}; " + "; ".join(problems),
-                stage="policy read-back", object_name=sr.policy_name, ref=policy_id)
+                stage="policy read-back", object_name=sr.policy_name, ref=policy_id,
+                details={"policy_id": policy_id, "status": read_status, "requested_status": expected_status,
+                         "differences": differences})
         elif read_status not in ("Active", "Suspended"):
             suffix = f": {description}" if description else ""
             sr.policy = self._applied_unverified(
@@ -1534,12 +1580,15 @@ class Reconciler:
         else:
             sr.policy = Outcome("updated", detail, policy_id)
 
-    def _poll_policy(self, policy_id: str, desired: dict[str, Any],
-                     expected_status: str) -> tuple[dict[str, Any], str, str, str]:
-        """Poll until a policy's status and normalized writable fields both match the submitted payload."""
+    def _poll_policy(self, policy_id: str, desired: dict[str, Any], expected_status: str) -> PolicyReadBack:
+        """Poll until a policy's status and normalized writable fields both match the submitted payload.
+
+        A persistent mismatch names every differing field with its tenant -> requested values, and
+        ``differences`` carries the normalized blocks for the diagnostic."""
         policy: dict[str, Any] = {}
         status, description = "unknown", ""
         mismatch = "returned no policy state"
+        differences: dict[str, Any] = {}
         desired_signature = policy_signature(desired)
         for attempt in range(self.status_polls):
             try:
@@ -1570,12 +1619,19 @@ class Reconciler:
             except (AttributeError, TypeError, ValueError):
                 status, description = "unknown", ""
                 mismatch = "returned a malformed policy object"
+                differences = {}
             else:
-                changed = [key.replace("_", " ") for key in desired_signature
-                           if actual_signature.get(key) != desired_signature[key]]
-                mismatch = "still differs in " + ", ".join(changed) if changed else ""
+                changed = [key for key in desired_signature if actual_signature.get(key) != desired_signature[key]]
+                differences = {}
+                for key in changed:
+                    tenant, requested = plain(actual_signature.get(key)), plain(desired_signature[key])
+                    differences[key] = {"tenant": tenant, "requested": requested,
+                                        "changed": [path for path, _, _ in leaf_differences(tenant, requested) if path]}
+                mismatch = "still differs in " + ", ".join(
+                    key.replace("_", " ") + _policy_change_values(key, policy, desired, actual_signature, desired_signature)
+                    for key in changed) if changed else ""
             if status.lower() == "error" or (status == expected_status and not mismatch):
                 break
             if attempt < self.status_polls - 1:
                 self._sleep(POLICY_STATUS_POLL_SECONDS)
-        return policy, status, description, mismatch
+        return PolicyReadBack(policy, status, description, mismatch, differences)

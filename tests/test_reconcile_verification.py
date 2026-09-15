@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import copy
+import json
 from dataclasses import replace
 
 import pytest
@@ -282,3 +283,68 @@ def test_target_set_accepted_state_survives_readback_interruption(tmp_path):
     assert outcome.status == "unverified" and outcome.ref == "web01.corp.example.com"
     assert outcome.diagnostic["mutation_state"] == "applied"
     assert result.incomplete and result.interrupted and checkpoint.done_count() == 0
+
+
+def test_policy_create_converges_on_a_dual_control_tenant(tmp_path):
+    """A tenant with dual control echoes accessApproval {"required": false, "approvers": []} for every policy."""
+    uap = FakeUAP()
+    uap.echo_defaults = uap.echo_dual_control = True
+    checkpoint = Checkpoint(tmp_path / "checkpoint.jsonl")
+    rec, sia, uap, _ = make(ONE, uap=uap, checkpoint=checkpoint)
+    result = rec.run()
+    outcome = result.servers[0].policy
+
+    assert outcome.status == "created" and outcome.ref == "pol-1"
+    assert result.failures == 0 and checkpoint.done_count() == 1
+    assert not calls(uap, "update_policy")
+
+    uap.partial_list = True                   # the real list endpoint carries no targets: --drift fetches the echo
+    again = make(ONE, sia=sia, uap=uap, drift=True)[0].run()
+    assert again.servers[0].policy.status == "exists" and "targets checked" in again.servers[0].policy.detail
+    assert len(calls(uap, "create_policy")) == 1 and not calls(uap, "update_policy")
+
+
+class ApprovalEnforcingUAP(FakeUAP):
+    """Stores every new policy with dual control switched on, whatever the request said."""
+
+    def create_policy(self, payload):
+        policy_id = super().create_policy(payload)
+        self.policies[-1]["conditions"]["accessApproval"] = {"required": True, "approvers": []}
+        return policy_id
+
+
+def test_policy_create_is_unverified_when_the_tenant_enforces_approval(tmp_path):
+    checkpoint = Checkpoint(tmp_path / "checkpoint.jsonl")
+    result = make(ONE, uap=ApprovalEnforcingUAP(), checkpoint=checkpoint)[0].run()
+    outcome = result.servers[0].policy
+
+    assert outcome.status == "unverified" and outcome.ref == "pol-1"
+    assert 'read-back still differs in conditions (accessApproval: {"required": true} -> absent)' in outcome.detail
+    diagnostic = outcome.diagnostic
+    assert diagnostic["code"] == "SIA-API-RESPONSE" and diagnostic["mutation_state"] == "applied"
+    differences = diagnostic["details"]["differences"]["conditions"]
+    assert differences["tenant"]["accessApproval"] == {"required": True}
+    assert "accessApproval" not in differences["requested"] and differences["changed"] == ["accessApproval"]
+    assert diagnostic["details"]["status"] == "Active" and diagnostic["details"]["policy_id"] == "pol-1"
+    assert any("show-policy" in action for action in diagnostic["actions"])
+    json.dumps(diagnostic)                    # the JSON report carries it as-is
+    assert result.failures == 1 and checkpoint.done_count() == 0
+
+
+def test_policy_update_readback_names_the_values_that_did_not_converge():
+    seed, sia, original, _ = make(ONE)
+    assert seed.run().failures == 0
+    original.policies[0]["conditions"]["idleTime"] = 99
+
+    class NoOpUpdateUAP(FakeUAP):
+        def update_policy(self, policy_id, payload):
+            self.calls.append(("update_policy", (policy_id, payload)))
+
+    uap = NoOpUpdateUAP(copy.deepcopy(original.policies))
+    result = make(ONE, sia=sia, uap=uap, update=True, drift=True)[0].run()
+    outcome = result.servers[0].policy
+
+    assert len(calls(uap, "update_policy")) == 1
+    assert outcome.status == "unverified"
+    assert "read-back still differs in conditions (idle minutes: 99 -> 10)" in outcome.detail
+    assert outcome.diagnostic["details"]["differences"]["conditions"]["changed"] == ["idleTime"]

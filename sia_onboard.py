@@ -523,7 +523,7 @@ def cmd_plan_apply(ctx: Context, args: argparse.Namespace, dry_run: bool) -> int
         rec.snapshot()
         if not dry_run and not args.yes:
             preview = rec.reconcile(dry_run=True)
-            print_summary(preview, human)
+            print_summary(preview, human, verbose=args.verbose)
             if preview.failures:
                 print("\nResolve the items above (or re-run with --yes to proceed with the rest).", file=human)
             try:
@@ -625,7 +625,7 @@ def cmd_plan_apply(ctx: Context, args: argparse.Namespace, dry_run: bool) -> int
     try:
         if run_stopped:
             print("\nRun stopped. Results below include completed and in-flight operations; pending writes were cancelled.", file=human)
-        print_summary(result, human)
+        print_summary(result, human, verbose=args.verbose)
         if report_outputs is not None:
             print(f"\nReport: {report_outputs[0]}\n        {report_outputs[1]}", file=human)
         for item in artifact_diagnostics:
@@ -680,7 +680,7 @@ def cmd_verify(ctx: Context, args: argparse.Namespace) -> int:
     result = rec.run()
     args._result_data = result_dict(result)
     args._result_data["mode"] = "verify"
-    problems = print_verify(result)
+    problems = print_verify(result, verbose=args.verbose)
     for row in result.servers:
         missing = [name for name, outcome in (("strong account", row.secret), ("target set", row.target_set), ("policy", row.policy))
                    if outcome.status == "planned"]

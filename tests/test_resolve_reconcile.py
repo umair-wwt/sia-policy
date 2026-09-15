@@ -777,13 +777,14 @@ def test_full_policy_drift_includes_schedule_tags_and_connection_behavior():
 def test_full_drift_ignores_null_and_empty_fields_echoed_by_the_api():
     rec, sia, uap, _ = make(ONE)
     assert rec.run().failures == 0
-    uap.echo_defaults = True
+    uap.echo_defaults = uap.partial_list = True   # the list carries no targets, so --drift fetches the echoing GET
     result = make(ONE, sia=sia, uap=uap, drift=True)[0].run()
     assert result.servers[0].policy.status == "exists" and "targets checked" in result.servers[0].policy.detail
-    assert not calls(uap, "update_policy")
+    assert calls(uap, "get_policy") and not calls(uap, "update_policy")
     uap.policies[0]["conditions"]["idleTime"] = 99
     result = make(ONE, sia=sia, uap=uap, drift=True)[0].run()
-    assert result.servers[0].policy.status == "drift" and "access conditions differ" in result.servers[0].policy.detail
+    assert result.servers[0].policy.status == "drift"
+    assert "access conditions differ (idle minutes: 99 -> 10)" in result.servers[0].policy.detail
 
 
 @pytest.mark.parametrize("configured", [

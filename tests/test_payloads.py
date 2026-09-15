@@ -7,8 +7,8 @@ from sia.inputs import ServerRow, StrongAccountRow
 from sia.payloads import (
     build_bulk_target_sets, build_fqdn_rule, build_policy, build_policy_update, build_group_principal, build_role_principal,
     build_secret_payload, build_target_set, build_target_set_update, build_vault_account, description_for, exact_fqdns,
-    is_owned_policy, is_owned_target_set, names_match, ownership_marker, policy_name_for, policy_signature, policy_status,
-    render, sanitize_template, split_fqdn, validate_template,
+    is_owned_policy, is_owned_target_set, leaf_differences, names_match, normalize_field, ownership_marker, plain,
+    policy_name_for, policy_signature, policy_status, render, sanitize_template, split_fqdn, validate_template,
 )
 
 DEFAULTS = Defaults(time_zone="America/New_York")
@@ -425,3 +425,64 @@ def test_policy_signature_ignores_directory_fields_for_role_principals():
     assert policy_signature(groups)["principal_details"] == [("g1", "GROUP", "d1", "Dir")]
     moved = {"principals": [{"id": "g1", "type": "GROUP", "sourceDirectoryId": "d2", "sourceDirectoryName": "Dir"}]}
     assert policy_signature(groups)["principal_details"] != policy_signature(moved)["principal_details"]
+
+
+@pytest.mark.parametrize("unset", [None, {}, {"required": False}, {"required": False, "approvers": []},
+                                   {"required": None, "approvers": []}, {"approvers": []}])
+def test_policy_signature_treats_unset_access_approval_as_absent(unset):
+    """A dual-control tenant echoes accessApproval as "not required" for every policy created without the key."""
+    desired = {"conditions": {"accessWindow": {"daysOfTheWeek": [0, 1]}, "idleTime": 10}}
+    echoed = {"conditions": {**desired["conditions"], "accessApproval": unset}}
+    assert policy_signature(desired)["conditions"] == policy_signature(echoed)["conditions"]
+    assert policy_signature(echoed)["conditions"] == policy_signature(desired)["conditions"]
+
+
+@pytest.mark.parametrize("configured", [
+    {"required": True}, {"required": True, "approvers": [{"id": "a", "type": "ROLE"}]},
+    {"required": False, "approvers": [{"id": "a", "type": "ROLE"}]},
+])
+def test_policy_signature_keeps_a_real_access_approval(configured):
+    desired = {"conditions": {"accessWindow": {"daysOfTheWeek": [0, 1]}, "idleTime": 10}}
+    tenant = {"conditions": {**desired["conditions"], "accessApproval": configured}}
+    assert policy_signature(desired)["conditions"] != policy_signature(tenant)["conditions"]
+    off = {"conditions": {**desired["conditions"], "accessApproval": {"required": False, "approvers": []}}}
+    assert policy_signature(off)["conditions"] != policy_signature(tenant)["conditions"]
+
+
+def test_sanitize_template_copies_access_approval_only_when_it_means_something():
+    unset = json.loads(json.dumps(TEMPLATE))
+    unset["conditions"]["accessApproval"] = {"required": False, "approvers": []}
+    assert "accessApproval" not in sanitize_template(unset)["conditions"]
+    required = json.loads(json.dumps(TEMPLATE))
+    required["conditions"]["accessApproval"] = {"required": True, "approvers": [{"id": "a", "type": "ROLE"}]}
+    assert sanitize_template(required)["conditions"]["accessApproval"] == required["conditions"]["accessApproval"]
+    approvers = json.loads(json.dumps(TEMPLATE))
+    approvers["conditions"]["accessApproval"] = {"required": False, "approvers": [{"id": "a", "type": "ROLE"}]}
+    assert sanitize_template(approvers)["conditions"]["accessApproval"] == approvers["conditions"]["accessApproval"]
+
+
+def test_template_validation_and_cloning_tolerate_null_echoes():
+    """A GET echoes unset fields as null; a template read from the tenant must still validate and clone cleanly."""
+    echoed = json.loads(json.dumps(TEMPLATE))
+    echoed["conditions"]["accessWindow"].update({"fromHour": None, "toHour": None})
+    echoed["conditions"]["accessApproval"] = None
+    echoed["conditions"]["idleTime"] = None
+    assert validate_template(echoed) == []
+    cloned = sanitize_template(echoed)["conditions"]
+    assert cloned["accessWindow"] == {"daysOfTheWeek": [1, 2, 3]}
+    assert "accessApproval" not in cloned and "idleTime" not in cloned and cloned["maxSessionDuration"] == 2
+    wrong = json.loads(json.dumps(TEMPLATE))
+    wrong["conditions"]["accessWindow"]["fromHour"] = 7
+    wrong["conditions"]["accessApproval"] = "yes"
+    assert validate_template(wrong) == ["conditions.accessWindow.fromHour must be a string",
+                                        "conditions.accessApproval must be an object"]
+
+
+def test_plain_and_leaf_differences_describe_normalized_values():
+    normalized = normalize_field({"accessWindow": {"daysOfTheWeek": [1, 0], "fromHour": None}, "idleTime": 10,
+                                  "accessApproval": {"required": False}})
+    assert plain(normalized) == {"accessWindow": {"daysOfTheWeek": [0, 1]}, "idleTime": 10}
+    assert plain(normalize_field(["b", "a"])) == ["b", "a"] and plain(5) == 5
+    assert leaf_differences({"a": {"b": 1}, "c": [1, 2]}, {"a": {"b": 2}}) == [("a.b", 1, 2), ("c", [1, 2], None)]
+    assert leaf_differences({"x": {"y": 1}}, {"x": None}) == [("x", {"y": 1}, None)]
+    assert leaf_differences({"same": 1}, {"same": 1}) == [] and leaf_differences(1, 2) == [("", 1, 2)]

@@ -140,14 +140,14 @@ def result_diagnostics(result: RunResult) -> list[Diagnostic]:
     return found
 
 
-def _print_result_diagnostics(result: RunResult, out: TextIO, max_rows: int) -> None:
+def _print_result_diagnostics(result: RunResult, out: TextIO, max_rows: int, verbose: bool = False) -> None:
     diagnostics = result_diagnostics(result)
     if not diagnostics:
         return
     shown = diagnostics[:min(max_rows, 10)]
     print("\nTroubleshooting:", file=out)
     for diagnostic in shown:
-        render_diagnostic(diagnostic, out)
+        render_diagnostic(diagnostic, out, verbose=verbose)
     if len(shown) < len(diagnostics):
         print(f"\n  ... {len(diagnostics) - len(shown)} more diagnostic(s) in the JSON report", file=out)
 
@@ -171,7 +171,8 @@ def _print_accounts(title: str, outcomes: dict[str, Outcome], out: TextIO, max_r
         print(f"  ... {len(outcomes) - shown} more (see the JSON report)", file=out)
 
 
-def print_summary(result: RunResult, out: TextIO | None = None, *, max_rows: int = 200) -> None:
+def print_summary(result: RunResult, out: TextIO | None = None, *, max_rows: int = 200, verbose: bool = False) -> None:
+    """Print the plan/apply summary; ``verbose`` adds each diagnostic's technical details (as ``-v`` does)."""
     out = out or sys.stdout  # resolve at call time so redirected/captured stdout is honoured
     title = "PLAN (dry run — nothing was changed)" if result.mode == "plan" else "APPLY"
     print(f"\n== {title} ==", file=out)
@@ -226,7 +227,7 @@ def print_summary(result: RunResult, out: TextIO | None = None, *, max_rows: int
             print(f"  - {sanitize(w)}", file=out)
         if len(result.warnings) > max_rows:
             print(f"  ... {len(result.warnings) - max_rows} more warnings (see the JSON report)", file=out)
-    _print_result_diagnostics(result, out, max_rows)
+    _print_result_diagnostics(result, out, max_rows, verbose)
     totals = _totals(result)
     print(f"\nSummary: {totals}", file=out)
     if result.failures:
@@ -363,7 +364,7 @@ def verify_rows(result: RunResult) -> list[list[str]]:
     return rows
 
 
-def print_verify(result: RunResult, out: TextIO | None = None, *, max_rows: int = 200) -> int:
+def print_verify(result: RunResult, out: TextIO | None = None, *, max_rows: int = 200, verbose: bool = False) -> int:
     """Print the PASS/FAIL table; returns the number of rows that are not PASS."""
     out = out or sys.stdout
     rows = verify_rows(result)
@@ -392,7 +393,7 @@ def print_verify(result: RunResult, out: TextIO | None = None, *, max_rows: int 
         print("\nWarnings:", file=out)
         for w in result.warnings[:max_rows]:
             print(f"  - {sanitize(w)}", file=out)
-    _print_result_diagnostics(result, out, max_rows)
+    _print_result_diagnostics(result, out, max_rows, verbose)
     print("\nVerify: " + ", ".join(f"{k}={v}" for k, v in sorted(counts.items())) + f" (rows={len(rows)})", file=out)
     return len(problems)
 

@@ -148,6 +148,8 @@ class FakeUAP:
         self.raise_on_update_policy: SIAApiError | None = None
         self.partial_list = False            # True: list results carry no "targets" (like the real list endpoint)
         self.echo_defaults = False           # True: GET echoes unset optional fields as null/empty (like the real API)
+        self.echo_dual_control = False       # with echo_defaults: accessApproval echoes as {"required": False,
+                                             # "approvers": []}, as a dual-control tenant does for every policy
         self.conflict_on_create: set[str] = set()   # policy names whose creation answers 409
         self._counter = 0
 
@@ -178,15 +180,14 @@ class FakeUAP:
                 return self._with_echoed_defaults(copy) if self.echo_defaults else copy
         raise SIAApiError("GET", f"/api/policies/{policy_id}", 404, "not found")
 
-    @staticmethod
-    def _with_echoed_defaults(policy):
+    def _with_echoed_defaults(self, policy):
         """Fields the tool never sends but the API returns as null/empty for an unset value."""
         policy["metadata"]["timeFrame"] = {"fromTime": None, "toTime": None, **(policy["metadata"].get("timeFrame") or {})}
         conditions = policy.setdefault("conditions", {})
         window = conditions.setdefault("accessWindow", {})
         window.setdefault("fromHour", None)
         window.setdefault("toHour", None)
-        conditions.setdefault("accessApproval", None)
+        conditions.setdefault("accessApproval", {"required": False, "approvers": []} if self.echo_dual_control else None)
         connect_as = policy.setdefault("behavior", {}).setdefault("connectAs", {})
         rdp = connect_as.get("rdp")
         if isinstance(rdp, dict):

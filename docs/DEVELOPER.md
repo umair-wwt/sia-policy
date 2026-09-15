@@ -129,6 +129,9 @@ Details worth knowing:
   2 s apart while the saved fields or intended final status have not converged. Success requires the normalized
   managed fields and intended status to match; optional ROLE directory metadata is ignored. Failed or incomplete
   read-back, or a persistent mismatch, is `unverified` and cannot complete a checkpoint. `Error` is a failure.
+  A persistent mismatch names each differing field with its tenant -> requested values (`absent` for a side
+  without the field), and the SIA-API-RESPONSE diagnostic's `details.differences` carries the normalized blocks:
+  always in the JSON report, printed under *Technical details* with `-v`.
 - Target-set updates read back the exact name under the intended strong account and compare all managed fields
   within the same polling limit. Missing, conflicting or divergent state remains `unverified`; only reads are retried.
 - Principal resolution stays single-threaded (the resolver cache is not thread-safe and principals are few); reads,
@@ -238,6 +241,12 @@ sorted tags, time zone, principal IDs/types (source-directory metadata for non-r
 ROLE and therefore ignored), delegation classification, conditions,
 FQDN rules, and complete RDP/SSH behavior (including local groups and reconnect). A top-level key missing from a
 partial list object is `None`; `--drift` / `--update` fetches the full object before using the complete signature.
+Null and empty values a GET echoes for unset fields are dropped, and an `accessApproval` that only says "not
+required" (`{"required": false, "approvers": []}`, `{"required": false}`, `null`) is unset: tenants with dual
+control echo it for every policy created without the key, and CyberArk's SDKs omit it for that state.
+`required: true` or any approver is a real difference. Drift lines and read-back mismatches name values
+(`tenant -> requested`) through `_policy_change_values()`, which lists the settings an operator recognises by name
+and every other differing leaf of the block by its path, so a field the tool does not manage is never silent.
 Names are compared HTML-unescaped. Status is handled separately: normal updates preserve the live value;
 `--set-policy-status Active|Suspended` requires `--update` and deliberately includes it in preview/update behavior.
 
@@ -250,7 +259,9 @@ provisioning format during full drift checks. Without `--drift`, the account lin
 connection profile (RDP `localEphemeralUser`/`domainEphemeralUser`, or SSH `username`) and non-empty conditions.
 `sanitize_template()` keeps only `conditions` ∩ {accessWindow, maxSessionDuration, idleTime, accessApproval},
 `behavior.connectAs.rdp` ∩ the two profile keys, `behavior.connectAs.ssh.username`, `metadata.timeZone`,
-`metadata.policyTags`, `delegationClassification`. `build_policy()` then uses the profile matching the row's
+`metadata.policyTags`, `delegationClassification` (`accessApproval` only when it requires approval or names
+approvers; null/empty echoes such as `fromHour: null` are dropped, not sent back). `build_policy()` then uses the
+profile matching the row's
 protocol and fails the row if the template lacks it; a per-row `assign_groups` (rdp) or `ssh_username` (ssh)
 still overrides the cloned value.
 

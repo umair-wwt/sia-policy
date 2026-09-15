@@ -30,7 +30,7 @@ every possible tenant response, operating-system failure, or abrupt process term
 | Ambiguous Identity roles or groups, accounts, target sets, or policies | Require disambiguation; duplicate references to the same stable identity can be deduplicated. |
 | Mutation timeout or server error | Preserve an uncertain outcome; require read-only reconciliation before repeating the write. |
 | Policy listing omits principals | Read full details; report unverified if the full response still cannot establish the principals. |
-| Accepted policy write or target-set update reads back different settings | Retry reads within the polling limit; retain the object reference and report unverified without a completed checkpoint if it does not match. |
+| Accepted policy write or target-set update reads back different settings | Retry reads within the polling limit; retain the object reference and report unverified (naming each differing policy field as `tenant -> requested`) without a completed checkpoint if it does not match. |
 | Version-2 checkpoint | Preserve the file and reconcile the row again under version-3 verification rules. |
 | Interrupted run or checkpoint failure | Stop new write scheduling, retain in-flight results, block unattempted work, and keep partial object references. |
 | Failed or interrupted report publication | Preserve tenant results and list completed output paths; local output failure does not undo tenant changes. |

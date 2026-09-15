@@ -68,7 +68,7 @@ command arguments are not saved in command history. Completion falls back to pla
 | `blocked` | Not attempted because something it depends on failed, or the run stopped after an error. | Fix the cause in the detail and run again. |
 | `failed` | SIA, Identity or the PVWA rejected it, or a name could not be found. | See [Troubleshooting](#8-troubleshooting). |
 | `uncertain` | A write lost its response, so the tool cannot safely say whether the tenant applied it. | Do not repeat it blindly. Run `plan --drift` to read and reconcile current state. |
-| `unverified` | A response or read-back did not prove the requested object and status. | Run `plan --drift`; inspect the object ID/state before another write. |
+| `unverified` | A response or read-back did not prove the requested object and status; a read-back mismatch names each field as `tenant -> requested`. | Run `plan --drift` (`-v` prints the full values); inspect the object ID/state before another write. |
 | `skipped` | You limited the run with `--only`. | Nothing. |
 
 `verify` turns these into verdicts: `PASS` (exists / created / updated / n/a), `MISSING` (would be created), `FAIL`
@@ -84,6 +84,8 @@ Checkpoints contain only fully completed rows; reports can also show partial row
 Policy creates/updates and target-set updates must read back the intended fields before they count as complete.
 An `Active` policy alone does not confirm that its requested role or group was saved. Reads retry within
 `[http] status_polls`; persistent differences remain `unverified` and are not recorded as completed checkpoints.
+The detail names each differing field with its tenant and requested values; null/empty echoes and a dual-control
+`accessApproval` that only says "not required" are not differences.
 
 ## 2. How a user connects
 
@@ -377,7 +379,8 @@ do next**. The message distinguishes known causes from suggestions; `-v` adds sa
 | `drift: … not managed by this tool` | `--update` on a hand-built object. | Add `--adopt <fqdn>` (for a shared target set, `--adopt <target set name>`). |
 | `SSLError` / `CERTIFICATE_VERIFY_FAILED` | A proxy is re-signing TLS with a certificate the tool does not trust. | `[http] system_trust` (on by default) verifies against the computer's own trust store, which normally already holds the proxy root. If it still fails, confirm `sia doctor` names that store under `TLS trust` (`Windows certificate store` or `macOS keychain`) — when it reports `certifi` instead, install `truststore` (`python -m pip install .`). Otherwise export the proxy's root CA and pass `--ca-bundle FILE` (or set `[http] ca_bundle`), which takes precedence. Do **not** disable verification to get past this on a real tenant. |
 | `uncertain` / `… may or may not have been applied` | A request failed on the network after a write may have reached the service. | Do not repeat the write blindly. Run `plan --drift` and inspect current tenant state. |
-| `unverified` | The API response/read-back did not prove a usable object or requested status. | Run `plan --drift`; confirm the referenced object before applying again. |
+| `read-back still differs in <field> (<name>: <tenant> -> <requested>)` | The tenant stored something other than what was sent, or echoes a field the tool does not manage. Null/empty echoes and an `accessApproval` that only says `required: false` are already ignored. | Run `plan --drift -v` to compare with full values; `show-policy NAME` prints the raw object. If the field is one you never set, report it with that output. |
+| `unverified` | The API response/read-back did not prove a usable object or requested status. | Run `plan --drift` (`-v` shows the values a read-back mismatch compared); confirm the referenced object before applying again. |
 | `checkpoint … reconciling it again` | A version, record, fingerprint or completed-stage reference is missing/mismatched. | Let the read-only snapshot reconcile it; do not treat the old checkpoint as live proof. |
 | `interrupted … re-run apply with --resume` | You stopped the run. | Run the same command with `--resume`. |
 | `… is readable by other users` | File permissions are too open. | `chmod 600 <file>` (macOS/Linux). |

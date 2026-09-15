@@ -43,9 +43,11 @@ def _rdp_profile_errors(profile: Mapping[str, Any], path: str) -> list[str]:
 
 
 def _condition_errors(conditions: Mapping[str, Any]) -> list[str]:
+    """Shape problems in a policy's conditions. ``null`` is how a GET echoes an unset optional field (``fromHour``,
+    ``accessApproval`` ...), so it is never an error."""
     errors: list[str] = []
     window = conditions.get("accessWindow")
-    if "accessWindow" in conditions:
+    if window is not None:
         if not isinstance(window, Mapping):
             errors.append("conditions.accessWindow must be an object")
         else:
@@ -56,14 +58,32 @@ def _condition_errors(conditions: Mapping[str, Any]) -> list[str]:
                                 for day in days))):
                 errors.append("conditions.accessWindow.daysOfTheWeek must be a list of integers from 0 through 6")
             for key in ("fromHour", "toHour"):
-                if key in window and not isinstance(window[key], str):
+                if window.get(key) is not None and not isinstance(window[key], str):
                     errors.append(f"conditions.accessWindow.{key} must be a string")
     for key in ("maxSessionDuration", "idleTime"):
-        if key in conditions and not _finite_number(conditions[key]):
+        if conditions.get(key) is not None and not _finite_number(conditions[key]):
             errors.append(f"conditions.{key} must be a finite number")
-    if "accessApproval" in conditions and not isinstance(conditions["accessApproval"], Mapping):
+    if conditions.get("accessApproval") is not None and not isinstance(conditions["accessApproval"], Mapping):
         errors.append("conditions.accessApproval must be an object")
     return errors
+
+
+def _approval_unset(value: Any) -> bool:
+    """True when an ``accessApproval`` value means "no dual control": null, ``{}``, or ``required`` false/null with
+    no approvers. A tenant with dual control enabled echoes ``{"required": false, "approvers": []}`` for a policy
+    created without the key (CyberArk's SDKs leave the field out for that state), so it must equal absent."""
+    if value is None:
+        return True
+    if not isinstance(value, Mapping):
+        return False
+    return not value.get("required") and not value.get("approvers")
+
+
+def _without_unset(value: Any) -> Any:
+    """A copied condition without the null/empty members a GET echoes for unset settings (``fromHour: null``)."""
+    if isinstance(value, Mapping):
+        return {k: v for k, v in value.items() if v is not None and v != ""}
+    return value
 
 
 def _condition_is_safe(key: str, value: Any) -> bool:
@@ -365,14 +385,19 @@ def validate_template(template: dict[str, Any]) -> list[str]:
 def sanitize_template(template: dict[str, Any]) -> dict[str, Any]:
     """Copy only the approved fields of an existing policy: conditions, the RDP ephemeral-user profile, the SSH
     profile's username, timeZone, policyTags and delegationClassification. Names, ids, principals, targets and
-    read-only metadata never carry over. build_policy() then uses the profile matching the row's protocol."""
+    read-only metadata never carry over. build_policy() then uses the profile matching the row's protocol.
+
+    Null/empty echoes of unset settings are dropped rather than sent back, and ``accessApproval`` is copied only when
+    it actually requires approval or names approvers: the "not required" form is what a dual-control tenant echoes
+    for every policy, and a tenant without the feature may reject the key."""
     source = template if isinstance(template, Mapping) else {}
     raw_meta = source.get("metadata")
     meta = raw_meta if isinstance(raw_meta, Mapping) else {}
     raw_conditions = source.get("conditions")
     conditions_source = raw_conditions if isinstance(raw_conditions, Mapping) else {}
-    conditions = {k: copy.deepcopy(v) for k, v in conditions_source.items()
-                  if k in APPROVED_CONDITION_KEYS and _condition_is_safe(k, v)}
+    conditions = {k: _without_unset(copy.deepcopy(v)) for k, v in conditions_source.items()
+                  if k in APPROVED_CONDITION_KEYS and v is not None and _condition_is_safe(k, v)
+                  and not (k == "accessApproval" and _approval_unset(v))}
     raw_behavior = source.get("behavior")
     behavior = raw_behavior if isinstance(raw_behavior, Mapping) else {}
     raw_connect_as = behavior.get("connectAs")
@@ -492,11 +517,14 @@ def _normalized(value: Any, key: str = "") -> Any:
 
     ``null``, empty strings and empty containers are dropped: the API echoes unset optional fields that way
     (``accessWindow.fromHour``, ``timeFrame.fromTime``, ``connectAs.rdp.domainEphemeralUser`` ...) while the tool
-    simply leaves them out, and both mean the same setting, not drift.
+    simply leaves them out, and both mean the same setting, not drift. An ``accessApproval`` that only says "not
+    required" is dropped for the same reason (see ``_approval_unset``); ``required: true`` or any approver counts.
     """
     if isinstance(value, dict):
         entries = []
         for name, item in value.items():
+            if str(name) == "accessApproval" and _approval_unset(item):
+                continue
             normalized = _normalized(item, str(name))
             if normalized is None or normalized == "" or normalized == ():
                 continue
@@ -506,6 +534,37 @@ def _normalized(value: Any, key: str = "") -> Any:
         items = tuple(_normalized(item) for item in value)
         return tuple(sorted(set(items), key=repr)) if key in ("assignGroups", "daysOfTheWeek") else items
     return value
+
+
+def normalize_field(value: Any, key: str = "") -> Any:
+    """One field normalized the way policy_signature() compares it (unset echoes dropped, order-free lists)."""
+    return _normalized(value, key)
+
+
+def plain(normalized: Any) -> Any:
+    """Display form of a normalized value: ``((name, value), ...)`` back to a dict, other tuples to lists.
+
+    For messages and diagnostics only; comparisons always use the normalized form itself.
+    """
+    if isinstance(normalized, (tuple, list)):
+        if normalized and all(isinstance(e, tuple) and len(e) == 2 and isinstance(e[0], str) for e in normalized):
+            return {name: plain(item) for name, item in normalized}
+        return [plain(item) for item in normalized]
+    return normalized
+
+
+def leaf_differences(current: Any, desired: Any, path: str = "") -> list[tuple[str, Any, Any]]:
+    """``(dotted path, current, desired)`` for every leaf that differs between two plain() values.
+
+    A side that lacks the key reports ``None`` -- unambiguous, because normalized values never contain null.
+    """
+    if isinstance(current, dict) and isinstance(desired, dict):
+        out: list[tuple[str, Any, Any]] = []
+        for name in sorted(set(current) | set(desired)):
+            child = f"{path}.{name}" if path else name
+            out.extend(leaf_differences(current.get(name), desired.get(name), child))
+        return out
+    return [] if current == desired else [(path, current, desired)]
 
 
 def _principal_detail(principal: dict[str, Any]) -> tuple[str, str, str, str]:
