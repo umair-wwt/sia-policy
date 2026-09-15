@@ -424,6 +424,12 @@ def test_uap_client_pagination_find_create():
     assert session.requests[7][2]["params"]["filter"] == "((targetCategory eq 'VM') and (policyTags eq 'tag-1'))"
 
 
+def test_uap_page_size_reaches_the_limit_parameter():
+    client, session = http_with([FakeResponse(200, {"results": []})])
+    UAPClient(client, "https://u", page_size=200).list_policies()
+    assert session.requests[0][2]["params"]["limit"] == 200
+
+
 def test_uap_create_without_policy_id_is_error():
     client, _ = http_with([FakeResponse(200, {"something": "else"})])
     with pytest.raises(SIAApiError, match="no policyId") as exc:
@@ -471,7 +477,7 @@ def test_pvwa_client_logon_find_add_logoff():
         FakeResponse(200, '"tok-12345"'),
         FakeResponse(200, {"value": [{"id": "1_2", "name": "web01-Administrator", "safeName": "SIA-LocalAdmins"},
                                      {"id": "1_3", "name": "web01-Administrator-old", "safeName": "SIA-LocalAdmins"}]}),
-        FakeResponse(201, {"id": "9_1", "name": "n"}),
+        FakeResponse(201, {"id": "9_1", "name": "n", "safeName": "Safe"}),
         FakeResponse(200, {}),
     ])
     pv = PVWAClient("https://pvwa.corp/", auth_type="ldap", session=session, sleep=lambda s: None)
@@ -483,7 +489,7 @@ def test_pvwa_client_logon_find_add_logoff():
     assert pv.find_account("sia-localadmins", "WEB01-Administrator")["id"] == "1_2"
     kw = session.requests[1][2]
     assert kw["headers"]["Authorization"] == "tok-12345" and kw["params"] == {"search": "WEB01-Administrator", "filter": "safeName eq sia-localadmins"}
-    assert pv.add_account({"name": "n"})["id"] == "9_1"
+    assert pv.add_account({"name": "n", "safeName": "Safe"})["id"] == "9_1"
     assert session.requests[2][:2] == ("POST", "https://pvwa.corp/PasswordVault/API/Accounts")
     pv.logoff()
     assert session.requests[3][1] == "https://pvwa.corp/PasswordVault/API/auth/Logoff"

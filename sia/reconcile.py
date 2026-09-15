@@ -234,6 +234,7 @@ class Reconciler:
         self._target_sets: dict[str, dict[str, Any]] = {}
         self._refs: dict[str, tuple[str | None, str]] = {}
         self._secrets: SecretIndex = SecretIndex([])
+        self._secret_listing: list[dict[str, Any]] | None = None
         self._template: dict[str, Any] | None = None
         self._principal_errors: dict[str, ResolveError] = {}
         self._checkpoint_context: dict[str, Any] = {}
@@ -254,6 +255,7 @@ class Reconciler:
     def snapshot(self) -> None:
         """Read the tenant once: template policy, strong accounts, target sets and policies for the rows to process."""
         self._snapshot_warnings = []
+        self._secret_listing = None
         self._template = self._load_template()
         self._checkpoint_context = self._build_checkpoint_context()
         self._plan_rows()
@@ -445,6 +447,28 @@ class Reconciler:
         caps = getattr(self.sia, "capabilities", None)
         return True if caps is None else bool(getattr(caps, "name_filter_reliable", True))
 
+    def _distrust_name_filters(self, kind: str, recovered: list[str]) -> None:
+        """A name filter missed objects the unfiltered listing serves: from here on nothing in this run is treated
+        as missing on the strength of a filtered read, and the operator is told to pin list mode."""
+        caps = getattr(self.sia, "capabilities", None)
+        if caps is not None:
+            caps.name_filter_reliable = False
+        shown = ", ".join(repr(n) for n in recovered[:3])
+        if len(recovered) > 3:
+            shown += f" and {len(recovered) - 3} more"
+        plural = len(recovered) != 1
+        self._snapshot_warnings.append(
+            f"this tenant matched nothing when filtering by name for {kind}{'s' if plural else ''} {shown}, but its "
+            f"unfiltered listing serves {'them' if plural else 'it'}; nothing else in this run is treated as missing "
+            "on the strength of a name-filtered read. Pin --lookup list (or [http] lookup_search_max_rows = 0) for "
+            "this tenant.")
+
+    def _list_all_secrets(self) -> list[dict[str, Any]]:
+        """Share one complete listing between secret discovery and account-scoped target-set discovery."""
+        if self._secret_listing is None:
+            self._secret_listing = self.sia.list_secrets()
+        return self._secret_listing
+
     def _snapshot_secrets(self, accounts: list[StrongAccountRow]) -> None:
         # The legacy secrets API has no server-side name filter: a per-account search would list every secret once
         # per account, so read the listing once and index it, whatever the lookup mode.
@@ -458,23 +482,19 @@ class Reconciler:
             # client-side filter would pick out anyway, and some tenants match nothing for a name the unfiltered
             # listing serves. Confirm once for the whole batch before any miss becomes a failure or a create.
             if any(not self._secrets.has(a.sia_name) for a in accounts):
-                listed = SecretIndex(self.sia.list_secrets())
+                listing = self._list_all_secrets()
+                listed = SecretIndex(listing)
                 recovered = sorted({a.sia_name for a in accounts
                                     if not self._secrets.has(a.sia_name) and listed.has(a.sia_name)})
-                self._secrets = listed
+                # Union, not replacement: the per-name reads are evidence too, and a listing endpoint that already
+                # misbehaves (empty pages with live cursors) is not the only source of truth. The index collapses
+                # an object seen by both reads through its id.
+                for secret in listing:
+                    self._secrets.add(secret)
                 if recovered:
-                    caps = getattr(self.sia, "capabilities", None)
-                    if caps is not None:
-                        caps.name_filter_reliable = False
-                    shown = ", ".join(repr(n) for n in recovered[:3])
-                    if len(recovered) > 3:
-                        shown += f" and {len(recovered) - 3} more"
-                    self._snapshot_warnings.append(
-                        f"this tenant matched nothing when filtering by name for {shown}, but its unfiltered listing "
-                        f"serves {'it' if len(recovered) == 1 else 'them'}; no object was read by a server-side filter "
-                        "after that. Pin --lookup list (or [http] lookup_search_max_rows = 0) for this tenant.")
+                    self._distrust_name_filters("strong account", recovered)
         else:
-            self._secrets = SecretIndex(self.sia.list_secrets())
+            self._secrets = SecretIndex(self._list_all_secrets())
         # Ambiguity must be discovered before any account or target-set write.
         for account in accounts:
             self._secrets.find(account)
@@ -504,6 +524,20 @@ class Reconciler:
         if self._lookup_mode == "search" and unfiltered and self._filters_trusted():
             for chunk in self._parallel(names, lambda n: self.sia.list_target_sets(name=n)):
                 items.extend(chunk)
+            # As for strong accounts, an empty name-filtered read is not proof of absence: confirm every wanted
+            # name still missing against one unfiltered listing before it becomes a bulk create, which on a set
+            # that exists is either a false failure or a write to an object this run never inspected.
+            missing = set(names) - {str(pick(ts, "name", default="")).lower() for ts in items}
+            if missing:
+                listing = self.sia.list_target_sets()
+                recovered = [ts for ts in listing
+                             if str(pick(ts, "name", default="")).lower() in missing]
+                # Keep conflicting evidence for names already found, too: discarding it would bypass the
+                # identity/signature ambiguity check below.
+                items.extend(listing)
+                if recovered:
+                    self._distrust_name_filters("target set",
+                                                sorted({str(pick(ts, "name")) for ts in recovered}, key=str.lower))
         elif unfiltered:
             items = self.sia.list_target_sets()
         else:
@@ -511,6 +545,19 @@ class Reconciler:
                                  for sid in (secret_id_of(s),) if sid})
             for chunk in self._parallel(secret_ids, lambda sid: self.sia.list_target_sets(strong_account_id=sid)):
                 items.extend(chunk)
+            missing = set(names) - {str(pick(ts, "name", default="")).lower() for ts in items}
+            if missing:
+                # Absence under the desired account does not establish global absence: a set may still point
+                # at an old account outside this wave. Read the remaining tenant accounts before any create.
+                listing = self._list_all_secrets()
+                for secret in listing:
+                    self._secrets.add(secret)
+                for account in accounts:
+                    self._secrets.find(account)
+                remaining_ids = sorted({sid for secret in listing if (sid := secret_id_of(secret))}
+                                       - set(secret_ids))
+                for chunk in self._parallel(remaining_ids, lambda sid: self.sia.list_target_sets(strong_account_id=sid)):
+                    items.extend(chunk)
         for ts in items:
             name = str(pick(ts, "name", default="")).lower()
             if name:
@@ -525,7 +572,8 @@ class Reconciler:
 
     def _snapshot_policies(self, fqdns: list[str]) -> None:
         self._owned_by_fqdn = None
-        if self._lookup_mode == "search" and self._filters_trusted():
+        # The UAP client stops trusting q= on its own once a template or conflict lookup was confirmed by the listing.
+        if self._lookup_mode == "search" and self._filters_trusted() and getattr(self.uap, "search_reliable", True):
             # q= searches name + description: the FQDN finds policies named after the server (and renamed ones whose
             # description still names it); rows with a custom policy_name are searched by that name as well.
             queries = list(dict.fromkeys(fqdns))
@@ -535,6 +583,13 @@ class Reconciler:
             seen: dict[str, dict[str, Any]] = {}
             for chunk in self._parallel(queries, lambda f: self.uap.find_policies_for_fqdn(f)):
                 for policy in chunk:
+                    pid = str(pick(policy.get("metadata") or {}, "policyId", "policy_id", default="")) or str(id(policy))
+                    seen.setdefault(pid, policy)
+            found_names = self._policies_by_name(list(seen.values()))
+            if any(sr.policy_name.casefold() not in found_names for _, sr in self._rows):
+                # q= can fail independently of SIA's filters. A renamed owned policy cannot trigger the
+                # same-name 409 recovery, so confirm before deciding to create and rebuild both indexes below.
+                for policy in self.uap.list_policies(filter_query=UAP_VM_FILTER):
                     pid = str(pick(policy.get("metadata") or {}, "policyId", "policy_id", default="")) or str(id(policy))
                     seen.setdefault(pid, policy)
             self._policy_list = list(seen.values())
@@ -796,6 +851,8 @@ class Reconciler:
             if self.only == "vault":
                 result.warnings.append("[pvwa] is not configured; the vault stage cannot run")
             return
+        # Preview and apply share a client, but each pass must observe changes made during confirmation.
+        self.pvwa.reset_lookup_cache()
         to_create: list[tuple[StrongAccountRow, dict[str, Any], str]] = []
         for account in accounts:
             what = f"Vault account {account.account_name!r} in safe {account.safe!r}"
@@ -1118,10 +1175,7 @@ class Reconciler:
         last_mismatch = "did not return the requested target set"
         for attempt in range(self.status_polls):
             try:
-                # No name= filter: the exact match below re-checks the name anyway, and a server-side filter that
-                # matches nothing would report a good write as unverified. strong_account_id already bounds this to
-                # one account's sets, and on some tenants it is the only listing key accepted.
-                rows = self.sia.list_target_sets(strong_account_id=secret_id)
+                rows = self._read_back_target_set(name, secret_id)
             except SIAApiError:
                 if attempt >= self.status_polls - 1:
                     raise
@@ -1145,6 +1199,17 @@ class Reconciler:
             if attempt < self.status_polls - 1:
                 self._sleep(POLICY_STATUS_POLL_SECONDS)
         return None, last_mismatch
+
+    def _read_back_target_set(self, name: str, secret_id: str) -> list[dict[str, Any]]:
+        """The strong account's target sets, narrowed to `name` while the tenant's name filter can be trusted.
+        strong_account_id is load-bearing (a set re-pointed at another account must stay invisible); name= only
+        saves pages on an account with many sets, so an empty name-filtered read is confirmed against the account's
+        listing rather than reported as an unverified write."""
+        if self._filters_trusted():
+            rows = self.sia.list_target_sets(name=name, strong_account_id=secret_id)
+            if rows:
+                return rows
+        return self.sia.list_target_sets(strong_account_id=secret_id)
 
     @staticmethod
     def _verified_target_set_signature(target_set: dict[str, Any]) -> dict[str, Any]:

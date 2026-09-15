@@ -3,12 +3,15 @@ in the Vault yet, so SIA's vault reference (<account_name>_<safe>) can point at 
 
   POST /PasswordVault/API/auth/{CyberArk|LDAP}/Logon   -> session token (sent verbatim in Authorization)
   GET  /PasswordVault/API/Accounts?search=<name>&filter=safeName eq <safe>
+       (an empty search is confirmed against the safe itself, read once per reconciliation pass:
+        ?filter=safeName eq <safe>)
   POST /PasswordVault/API/Accounts                      -> the created account (id, name, safeName, ...)
   POST /PasswordVault/API/auth/Logoff
 """
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from typing import Any, Callable
 from urllib.parse import urljoin, urlsplit
@@ -35,6 +38,9 @@ class PVWAClient:
         self._token: str | None = None
         self._log = logger or logging.getLogger("sia.pvwa")
         self.cancel_check = cancel_check
+        # Safes read in full by find_account, keyed by casefolded safe, then account name, then id.
+        self._safes: dict[str, dict[str, dict[str, dict[str, Any]]]] = {}
+        self._safes_lock = threading.Lock()
         # The session token cannot be refreshed, so a 401 must surface at once: retrying a rejected logon would
         # count a second failed attempt against the Vault user's lockout threshold.
         self._http = HttpClient(lambda force=False: self._token or "-", timeout=timeout, max_retries=max_retries,
@@ -44,12 +50,19 @@ class PVWAClient:
     def base_url(self) -> str:
         return self._base
 
+    def reset_lookup_cache(self) -> None:
+        """Start a fresh safe snapshot, especially between preview and apply or after an uncertain write."""
+        with self._safes_lock:
+            self._safes.clear()
+
     def _headers(self) -> dict[str, str]:
         if not self._token:
             raise SIAApiError("GET", self._base, 0, "PVWA: not logged on (call logon first)")
         return {"Authorization": self._token}   # PVWA tokens are sent verbatim, not as Bearer
 
     def logon(self, username: str, password: str) -> None:
+        self._token = None
+        self.reset_lookup_cache()
         url = f"{self._base}/PasswordVault/API/auth/{AUTH_PATHS[self._auth_type]}/Logon"
         register_secret(password)
         try:
@@ -68,26 +81,29 @@ class PVWAClient:
         self._log.info("PVWA logon OK for %s", username)
 
     def logoff(self) -> None:
-        if not self._token:
-            return
         try:
-            self._http.post(f"{self._base}/PasswordVault/API/auth/Logoff", headers=self._headers(), expected=(200, 204))
+            if self._token:
+                self._http.post(f"{self._base}/PasswordVault/API/auth/Logoff", headers=self._headers(), expected=(200, 204))
         except SIAApiError as exc:   # best effort; the session expires on its own
             self._log.debug("PVWA logoff failed: %s", exc)
-        self._token = None
+        finally:
+            self._token = None
+            self.reset_lookup_cache()
 
     def find_account(self, safe: str, name: str, *, max_pages: int = MAX_ACCOUNT_PAGES) -> dict[str, Any] | None:
         """The account named `name` in `safe`, or None."""
         if max_pages < 1:
             raise ValueError("max_pages must be at least 1")
-        safe_filter = f"safeName eq {safe}"
-        matches = self._account_matches(safe, name, {"search": name, "filter": safe_filter}, max_pages)
+        matches = self._exact(self._walk_accounts({"search": name, "filter": self._safe_filter(safe)}, max_pages),
+                              safe, name)
         if not matches:
             # `search` is a server-side substring match over a set this walk re-checks exactly, so it only narrows
             # what the exact comparison would pick out anyway. On a tenant whose search misses a name the safe does
-            # hold, believing the empty result onboards a SECOND privileged account into that safe -- so scan the
-            # safe itself before concluding the account is absent.
-            matches = self._account_matches(safe, name, {"filter": safe_filter}, max_pages)
+            # hold, believing the empty result onboards a SECOND privileged account into that safe -- so check the
+            # safe itself before concluding the account is absent. The vault stage exists to onboard accounts that
+            # are missing, so nearly every lookup ends up here: the safe is read once per reconciliation pass and
+            # indexed. The reconciler resets this snapshot before each pass, including the apply after a preview.
+            matches = dict(self._safe_index(safe, max_pages).get(name.casefold(), {}))
             if matches:
                 self._log.warning("account %r was not returned by search=%r but safe %r holds it; this Vault's "
                                   "account search is unreliable", name, name, safe)
@@ -97,15 +113,51 @@ class PVWAClient:
                               f"{', '.join(sorted(matches))}", cause="ambiguous_response")
         return next(iter(matches.values()), None)
 
-    def _account_matches(self, safe: str, name: str, params: dict[str, str],
-                         max_pages: int) -> dict[str, dict[str, Any]]:
-        """Walk /Accounts with `params`, returning every account whose name and safe match exactly, keyed by id."""
+    @staticmethod
+    def _safe_filter(safe: str) -> str:
+        return f"safeName eq {safe}"
+
+    @staticmethod
+    def _exact(accounts: list[dict[str, Any]], safe: str, name: str) -> dict[str, dict[str, Any]]:
+        """The accounts whose name and safe both match exactly (case-insensitively), keyed by id."""
+        matches: dict[str, dict[str, Any]] = {}
+        for account in accounts:
+            if account["name"].casefold() == name.casefold() and account["safeName"].casefold() == safe.casefold():
+                matches.setdefault(account["id"], account)
+        return matches
+
+    def _safe_index(self, safe: str, max_pages: int) -> dict[str, dict[str, dict[str, Any]]]:
+        """Every account in `safe`, keyed by casefolded name and then id. Reused until reset_lookup_cache;
+        add_account records this client's confirmed creations while an uncertain write invalidates the snapshot."""
+        key = safe.casefold()
+        with self._safes_lock:
+            index = self._safes.get(key)
+            if index is None:
+                index = {}
+                for account in self._walk_accounts({"filter": self._safe_filter(safe)}, max_pages):
+                    if account["safeName"].casefold() == key:
+                        index.setdefault(account["name"].casefold(), {}).setdefault(account["id"], account)
+                self._safes[key] = index
+            return index
+
+    def _remember(self, account: dict[str, Any]) -> None:
+        """Record an account this client just onboarded in its safe's index, if that safe has been read."""
+        safe_name, name, account_id = account.get("safeName"), account.get("name"), account.get("id")
+        if not all(isinstance(value, str) and value.strip() for value in (safe_name, name, account_id)):
+            return
+        with self._safes_lock:
+            index = self._safes.get(safe_name.casefold())
+            if index is not None:
+                index.setdefault(name.casefold(), {}).setdefault(account_id, account)
+
+    def _walk_accounts(self, params: dict[str, str], max_pages: int) -> list[dict[str, Any]]:
+        """Walk /Accounts with `params`, returning every account, each with a non-empty id, name and safeName."""
         initial_url = f"{self._base}/PasswordVault/API/Accounts"
         url = initial_url
         request_params: dict[str, str] | None = dict(params)
         seen_urls: set[str] = set()
         seen_pages: set[str] = set()
-        matches: dict[str, dict[str, Any]] = {}
+        accounts: list[dict[str, Any]] = []
         for _ in range(max_pages):
             response = self._http.get(url, params=request_params, headers=self._headers())
             request_params = None
@@ -118,23 +170,24 @@ class PVWAClient:
                 if not isinstance(account, dict):
                     raise SIAApiError("GET", response.url, response.status_code,
                                       f"PVWA account lookup item {index} is not an object", cause="malformed_response")
-                account_id = account.get("id")
-                account_name = account.get("name")
-                safe_name = account.get("safeName")
-                if not all(isinstance(value, str) and value.strip() for value in (account_id, account_name, safe_name)):
+                if not all(isinstance(value, str) and value.strip()
+                           for value in (account.get("id"), account.get("name"), account.get("safeName"))):
                     raise SIAApiError("GET", response.url, response.status_code,
                                       f"PVWA account lookup item {index} needs non-empty id, name, and safeName",
                                       cause="malformed_response")
-                if account_name.casefold() == name.casefold() and safe_name.casefold() == safe.casefold():
-                    matches.setdefault(account_id, account)
+                accounts.append(account)
             next_link = body.get("nextLink")
             if next_link in (None, ""):
-                return matches
+                return accounts
             if not isinstance(next_link, str) or not next_link.strip():
                 raise SIAApiError("GET", response.url, response.status_code,
                                   "PVWA account nextLink must be a non-empty string or null",
                                   cause="malformed_response")
-            next_url = urljoin(response.url, next_link)
+            # PVWA returns application-relative links such as "api/Accounts?offset=50", rooted at PasswordVault.
+            # Query-only continuations refer to the current Accounts endpoint; absolute and root-relative links
+            # retain their standard URL meaning and must still pass the origin check below.
+            link_base = response.url if next_link.startswith("?") else f"{self._base}/PasswordVault/"
+            next_url = urljoin(link_base, next_link)
             base_parts, next_parts = urlsplit(self._base), urlsplit(next_url)
             if (next_parts.scheme, next_parts.netloc) != (base_parts.scheme, base_parts.netloc):
                 raise SIAApiError("GET", response.url, response.status_code,
@@ -156,18 +209,23 @@ class PVWAClient:
 
     def add_account(self, payload: dict[str, Any]) -> dict[str, Any]:
         headers = self._headers()
-        resp = self._http.post(f"{self._base}/PasswordVault/API/Accounts", json=payload, headers=headers,
-                               expected=(200, 201), cancel_check=self.cancel_check)
-        body = json_or_error(resp)
-        valid = isinstance(body, dict) and isinstance(body.get("id"), str) and bool(body["id"].strip())
-        expected_name = str(payload.get("name") or "")
-        if valid and expected_name:
-            valid = isinstance(body.get("name"), str) and body["name"].lower() == expected_name.lower()
-        expected_safe = str(payload.get("safeName") or "")
-        if valid and expected_safe and "safeName" in body:
-            valid = isinstance(body["safeName"], str) and body["safeName"].lower() == expected_safe.lower()
-        if not valid:
-            raise SIAApiError("POST", resp.url, resp.status_code,
-                              "PVWA account create response has no usable matching account id/name",
-                              uncertain=True, cause="malformed_response")
+        try:
+            resp = self._http.post(f"{self._base}/PasswordVault/API/Accounts", json=payload, headers=headers,
+                                   expected=(200, 201), cancel_check=self.cancel_check)
+            body = json_or_error(resp)
+            valid = isinstance(body, dict) and all(isinstance(body.get(field), str) and body[field].strip()
+                                                  for field in ("id", "name", "safeName"))
+            for field in ("name", "safeName"):
+                expected = str(payload.get(field) or "")
+                if valid and expected:
+                    valid = body[field].casefold() == expected.casefold()
+            if not valid:
+                raise SIAApiError("POST", resp.url, resp.status_code,
+                                  "PVWA account create response has no usable matching account id/name/safeName",
+                                  uncertain=True, cause="malformed_response")
+        except SIAApiError as exc:
+            if exc.uncertain or exc.cause == "malformed_response":
+                self.reset_lookup_cache()
+            raise
+        self._remember(body)
         return body

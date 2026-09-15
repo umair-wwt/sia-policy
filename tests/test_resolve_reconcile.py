@@ -168,11 +168,15 @@ def test_search_lookup_reads_per_server():
     result = rec.run()
     assert result.lookup_mode == "search" and result.failures == 0
     assert sorted(calls(sia, "find_secret")) == sorted([VAULT_SIA_NAME, "SA-dmz"])
-    assert sorted(name for _, name in calls(sia, "list_target_sets")) == sorted([WEB01_FQDN, WEB02_FQDN, DMZ_FQDN])
-    assert sorted(text for text, _ in calls(uap, "list_policies")) == sorted([WEB01_FQDN, WEB02_FQDN, DMZ_FQDN])
-    # This tenant is empty, so both per-name reads miss and one unfiltered listing confirms that before the misses
-    # become creates. A tenant that serves every name costs nothing extra -- see the test below.
-    assert calls(sia, "list_secrets") == [None]
+    target_set_reads = calls(sia, "list_target_sets")
+    assert sorted(name for _, name in target_set_reads if name) == sorted([WEB01_FQDN, WEB02_FQDN, DMZ_FQDN])
+    policy_reads = calls(uap, "list_policies")
+    assert sorted(text for text, _ in policy_reads if text) == sorted([WEB01_FQDN, WEB02_FQDN, DMZ_FQDN])
+    # This tenant is empty, so every per-name read misses and one unfiltered listing per kind confirms that before
+    # the misses become creates. A tenant that serves every name costs nothing extra -- see the test below.
+    assert calls(sia, "list_secrets") == [None] and target_set_reads[-1] == (None, None)
+    assert policy_reads[-1] == (None, "(targetCategory eq 'VM')")
+    assert sum(text is None for text, _ in policy_reads) == 1
 
 
 def test_auto_lookup_switches_on_size():
@@ -392,10 +396,13 @@ def test_legacy_secrets_are_listed_once_even_in_search_mode():
 
 
 def test_a_tenant_that_serves_every_name_is_never_listed_in_search_mode():
-    sia = FakeSIA(secrets=[{"secret_id": "sec-1", "secret_type": "PCloudAccount", "secret_name": VAULT_SIA_NAME}])
+    sia = FakeSIA(secrets=[{"secret_id": "sec-1", "secret_type": "PCloudAccount", "secret_name": VAULT_SIA_NAME}],
+                  target_sets=[{"id": "ts-1", "name": WEB01_FQDN, "type": "Target", "secret_id": "sec-1",
+                                "secret_type": "PCloudAccount"}])
     result = make(ONE, sia=sia, dry_run=True, lookup="search")[0].run()
-    assert result.secrets["SA-corp-rdp"].status == "exists"
+    assert result.secrets["SA-corp-rdp"].status == "exists" and result.servers[0].target_set.status == "exists"
     assert calls(sia, "find_secret") == [VAULT_SIA_NAME] and "list_secrets" not in [c[0] for c in sia.calls]
+    assert calls(sia, "list_target_sets") == [(None, WEB01_FQDN)]
 
 
 class BlindFilterSIA(FakeSIA):
@@ -449,6 +456,59 @@ def test_an_account_missing_from_both_reads_still_fails_after_one_confirming_lis
     assert result.secrets["SA-legacy"].status == "failed" and "type=existing" in result.secrets["SA-legacy"].detail
     assert calls(sia, "list_secrets") == [None] and sia.capabilities.name_filter_reliable
     assert result.warnings == [] and not calls(sia, "create_secret")
+
+
+class BlindTargetSetFilterSIA(FakeSIA):
+    """A tenant whose strong-account filter works but whose target-set name filter matches nothing."""
+
+    def list_target_sets(self, *, strong_account_id=None, name=None):
+        if name:
+            self.calls.append(("list_target_sets", (strong_account_id, name)))
+            return []
+        return super().list_target_sets(strong_account_id=strong_account_id)
+
+
+def test_a_blind_target_set_filter_does_not_become_a_bulk_create():
+    sia = BlindTargetSetFilterSIA(
+        secrets=[{"secret_id": "sec-1", "secret_type": "PCloudAccount", "secret_name": VAULT_SIA_NAME}],
+        target_sets=[{"id": "ts-1", "name": WEB01_FQDN, "type": "Target", "secret_id": "other-secret",
+                      "secret_type": "PCloudAccount"}])
+    rec, sia, uap, _ = make(ONE, sia=sia, lookup="search")
+    result = rec.run()
+
+    # The set exists and points elsewhere. Found through the confirming listing, it is reported as drift instead of
+    # going to a bulk create that never saw it -- which would fail, or silently re-point a set this run never read.
+    assert result.servers[0].target_set.status == "drift" and not calls(sia, "bulk_create_target_sets")
+    assert calls(sia, "find_secret") == [VAULT_SIA_NAME] and "list_secrets" not in [c[0] for c in sia.calls]
+    assert calls(sia, "list_target_sets") == [(None, WEB01_FQDN), (None, None)]
+    assert not sia.capabilities.name_filter_reliable
+    assert any("target set" in w and WEB01_FQDN in w and "--lookup list" in w for w in result.warnings)
+    assert calls(uap, "list_policies") == [(None, OWNED_FILTER)]     # policies no longer trust q= either
+
+
+def test_the_confirming_listing_adds_to_the_filtered_reads_rather_than_replacing_them():
+    class ShortListingSIA(FakeSIA):
+        """A tenant whose per-name reads serve a strong account that its unfiltered listing drops."""
+
+        def list_secrets(self, *, name=None):
+            self.calls.append(("list_secrets", name))
+            return []
+
+    sia = ShortListingSIA(secrets=[{"secret_id": "sec-1", "secret_type": "PCloudAccount", "secret_name": VAULT_SIA_NAME}])
+    result = make(sia=sia, dry_run=True, lookup="search")[0].run()
+
+    # SA-dmz is missing, so the listing is read to confirm it; what the per-name read found is kept, not replaced.
+    assert result.secrets["SA-corp-rdp"].status == "exists" and result.secrets["SA-dmz"].status == "planned"
+    assert calls(sia, "list_secrets") == [None] and sia.capabilities.name_filter_reliable
+    assert not any("unfiltered listing" in w for w in result.warnings)
+
+
+def test_a_blind_policy_search_makes_the_snapshot_list_policies():
+    uap = FakeUAP()
+    uap.search_reliable = False      # what UAPClient records once a q= lookup had to be confirmed by the listing
+    rec, _, uap, _ = make(ONE, uap=uap, dry_run=True, lookup="search")
+    rec.run()
+    assert calls(uap, "list_policies") == [(None, OWNED_FILTER)]
 
 
 def test_progress_is_logged(caplog):
@@ -1134,7 +1194,8 @@ def test_domain_target_set_found_by_a_later_wave():
 def test_domain_target_set_is_looked_up_by_domain_name():
     rec, sia, _, _ = make(DOMAIN_INPUTS, sia=FakeSIA([CORP_SECRET]), lookup="search")
     rec.run()
-    assert [name for _, name in calls(sia, "list_target_sets")] == [DOM]     # once, not once per server
+    # Once, not once per server; the set is missing from this tenant, so one unfiltered listing then confirms it.
+    assert [name for _, name in calls(sia, "list_target_sets")] == [DOM, None]
 
 
 def test_domain_target_set_drift_warns_that_it_moves_every_server():

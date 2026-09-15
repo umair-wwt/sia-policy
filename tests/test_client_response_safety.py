@@ -215,10 +215,17 @@ def test_a_name_search_that_matches_nothing_is_confirmed_against_the_unfiltered_
     client, session = http_with([
         FakeResponse(200, {"results": []}),                        # q=<name> matches nothing
         FakeResponse(200, {"results": [policy("web01.corp", "p1")]}),   # the unfiltered listing has it
+        FakeResponse(200, {"results": [policy("web01.corp", "p1"), policy("web02.corp", "p2")]}),   # re-read once
     ])
-    found = UAPClient(client, "https://u").find_policy_by_name("web01.corp")
-    assert found == policy("web01.corp", "p1")
+    uap = UAPClient(client, "https://u")
+    assert uap.find_policy_by_name("web01.corp") == policy("web01.corp", "p1")
     assert [call[2]["params"].get("q") for call in session.requests] == ["web01.corp", None]
+    # The listing is kept and q= is no longer sent: a second lookup costs nothing, and a name the cached listing
+    # lacks (created since it was read) re-reads it once rather than reporting a false absence.
+    assert not uap.search_reliable
+    assert uap.find_policy_by_name("WEB01.corp") == policy("web01.corp", "p1") and len(session.requests) == 2
+    assert uap.find_policy_by_name("web02.corp") == policy("web02.corp", "p2")
+    assert [call[2]["params"].get("q") for call in session.requests] == ["web01.corp", None, None]
 
     # A policy that is genuinely absent stays absent, at the cost of exactly one confirming listing.
     client, session = http_with([FakeResponse(200, {"results": []}), FakeResponse(200, {"results": []})])
@@ -250,6 +257,26 @@ def test_a_vault_account_search_that_matches_nothing_is_confirmed_against_the_sa
     pvwa = PVWAClient("https://pvwa.example", session=session, sleep=lambda _: None)
     pvwa.logon("svc", "pw")
     assert pvwa.find_account("safe", "admin") is None and len(session.requests) == 3
+
+
+def test_the_safe_is_read_once_however_many_accounts_the_search_misses():
+    session = FakeSession([
+        FakeResponse(200, '"token"'),
+        FakeResponse(200, {"value": []}),                                              # search=admin
+        FakeResponse(200, {"value": [{"id": "2", "name": "Backup", "safeName": "Safe"}]}),   # the safe, read once
+        FakeResponse(200, {"value": []}),                                              # search=backup
+        FakeResponse(201, {"id": "3", "name": "Admin", "safeName": "Safe"}),           # onboarding Admin
+        FakeResponse(200, {"value": []}),                                              # search=admin again
+    ])
+    pvwa = PVWAClient("https://pvwa.example", session=session, sleep=lambda _: None)
+    pvwa.logon("svc", "pw")
+    assert pvwa.find_account("safe", "admin") is None                 # search, then one walk of the safe
+    assert pvwa.find_account("safe", "backup")["id"] == "2"           # search misses; the index answers, no walk
+    assert pvwa.add_account({"name": "Admin", "safeName": "Safe"})["id"] == "3"
+    assert pvwa.find_account("safe", "admin")["id"] == "3"            # the onboarded account joined the index
+    assert [call[2].get("params") for call in session.requests[1:]] == [
+        {"search": "admin", "filter": "safeName eq safe"}, {"filter": "safeName eq safe"},
+        {"search": "backup", "filter": "safeName eq safe"}, None, {"search": "admin", "filter": "safeName eq safe"}]
 
 
 def test_pvwa_paginates_safely_and_rejects_duplicate_exact_accounts():

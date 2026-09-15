@@ -193,11 +193,33 @@ def test_target_set_update_requires_exact_account_filtered_readback(tmp_path):
     assert "did not return the requested target set" in outcome.detail
     assert outcome.diagnostic["mutation_state"] == "applied"
     update_index = next(i for i, call in enumerate(sia.calls) if call[0] == "update_target_set")
-    # Filtered by the strong account, which is what makes the re-pointed set invisible here; the name is matched
-    # client-side instead, so a server-side name filter cannot report a good write as unverified.
+    # Filtered by the strong account, which is what makes the re-pointed set invisible here. The name filter only
+    # saves pages, so each empty name-filtered read is confirmed against the account's listing before the write is
+    # reported as unverified.
     assert [call[1] for call in sia.calls[update_index + 1:] if call[0] == "list_target_sets"] == [
-        ("sec-1", None), ("sec-1", None)]
+        ("sec-1", "web01.corp.example.com"), ("sec-1", None), ("sec-1", "web01.corp.example.com"), ("sec-1", None)]
     assert checkpoint.done_count() == 0
+
+
+def test_target_set_readback_confirms_an_empty_name_filtered_read_against_the_account():
+    seed, original, uap, _ = make(ONE)
+    assert seed.run().failures == 0
+    original.target_sets[0]["secret_id"] = "wrong-secret"
+
+    class BlindNameFilterSIA(FakeSIA):
+        def list_target_sets(self, *, strong_account_id=None, name=None):
+            if name:
+                self.calls.append(("list_target_sets", (strong_account_id, name)))
+                return []
+            return super().list_target_sets(strong_account_id=strong_account_id)
+
+    sia = BlindNameFilterSIA(copy.deepcopy(original.secrets), copy.deepcopy(original.target_sets))
+    result = make(ONE, sia=sia, uap=uap, update=True)[0].run()
+
+    assert result.servers[0].target_set.status == "updated" and sia.target_sets[0]["secret_id"] == "sec-1"
+    update_index = next(i for i, call in enumerate(sia.calls) if call[0] == "update_target_set")
+    assert [call[1] for call in sia.calls[update_index + 1:] if call[0] == "list_target_sets"] == [
+        ("sec-1", "web01.corp.example.com"), ("sec-1", None)]
 
 
 def test_target_set_readback_retries_transient_failure_then_converges():

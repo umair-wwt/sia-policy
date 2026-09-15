@@ -11,8 +11,10 @@ and `targetsets_api` pin the answer once known.
 """
 from __future__ import annotations
 
+import html
 import json
 import logging
+import threading
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import quote
@@ -491,6 +493,11 @@ class UAPClient:
         # tenant: on a large tenant the page size, not the number of matches, decides how many round trips that costs.
         self._page_size = int(page_size) if page_size else self.PAGE_SIZE
         self._log = logger or logging.getLogger("sia.clients")
+        # The confirming read behind find_policy_by_name, kept for the life of the client (one per command), and
+        # whether q= is still worth sending first.
+        self._listing: list[dict[str, Any]] | None = None
+        self._lock = threading.Lock()
+        self._search_reliable = True
 
     def list_policies(self, *, text: str | None = None, filter_query: str | None = UAP_VM_FILTER,
                       max_pages: int = MAX_LIST_PAGES) -> list[dict[str, Any]]:
@@ -545,26 +552,49 @@ class UAPClient:
             raise _malformed(response, f"policy response id does not match requested id {policy_id!r}")
         return body
 
+    @property
+    def search_reliable(self) -> bool:
+        """False once a q= search missed a policy the unfiltered listing serves; searches are skipped from then on."""
+        return self._search_reliable
+
     def find_policy_by_name(self, name: str) -> dict[str, Any] | None:
         """Text search then exact name match (the API's q= is a substring search)."""
         def exact(candidates: list[dict[str, Any]]) -> dict[str, Any] | None:
-            return _one_exact(candidates, name,
-                              name_of=lambda p: (p.get("metadata") or {}).get("name"),
+            # UAP may return HTML-escaped policy names; use the same normalization as reconciliation.
+            return _one_exact(candidates, html.unescape(name),
+                              name_of=lambda p: html.unescape(str((p.get("metadata") or {}).get("name") or "")),
                               id_of=lambda p: (p.get("metadata") or {}).get("policyId")
                               or (p.get("metadata") or {}).get("policy_id"),
                               resource="policy", url=f"{self._base}/api/policies")
 
-        found = exact(self.list_policies(text=name, filter_query=None))
-        if found is not None:
-            return found
+        if self._search_reliable:
+            found = exact(self.list_policies(text=name, filter_query=None))
+            if found is not None:
+                return found
         # q= only narrows what the exact match above picks out anyway. Some tenants match nothing for a name the
         # unfiltered listing serves, and a false "not found" here aborts the run (template_policy) or lets the
-        # 409 reclassifier fail open into a duplicate policy -- so confirm before reporting absence.
-        found = exact(self.list_policies(text=None, filter_query=None))
-        if found is not None:
+        # 409 reclassifier fail open into a duplicate policy -- so confirm before reporting absence. The listing is
+        # read once per client: the reclassifier asks once per conflicting create, and on a tenant whose q= is
+        # blind that is every policy of the run.
+        listing, fresh = self._all_policies()
+        found = exact(listing)
+        if found is None and not fresh:
+            # A name the cached listing lacks may have been created since it was read (a 409 says it exists).
+            found = exact(self._all_policies(refresh=True)[0])
+        if found is not None and self._search_reliable:
+            self._search_reliable = False
             self._log.warning("policy %r was not returned by the q= search but the unfiltered listing has it; "
-                              "this tenant's server-side name filter is unreliable", name)
+                              "this tenant's server-side name filter is unreliable, so policy lookups use the "
+                              "listing from now on", name)
         return found
+
+    def _all_policies(self, *, refresh: bool = False) -> tuple[list[dict[str, Any]], bool]:
+        """Every policy in the tenant (all categories), and whether this call read it rather than reusing the cache."""
+        with self._lock:
+            if self._listing is None or refresh:
+                self._listing = self.list_policies(text=None, filter_query=None)
+                return self._listing, True
+            return self._listing, False
 
     def create_policy(self, payload: dict[str, Any]) -> str:
         resp = self._http.post(f"{self._base}/api/policies", json=payload, expected=(200, 201))

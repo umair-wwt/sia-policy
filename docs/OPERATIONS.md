@@ -284,8 +284,14 @@ The programme this tool was built for has ~70,000 servers and up to two policies
   preserved but rechecked because they predate verification of saved policy and target-set update fields.
 - **Lookups scale with the wave.** `--lookup search` (default up to 2,000 servers per run) reads the objects of
   the servers in the wave, one request per server in parallel; `--lookup list` (default above that) reads one
-  listing each of strong accounts, target sets and the policies tagged by the tool. A tenant with 70,000
-  policies is never read to onboard 500 more.
+  listing each of strong accounts, target sets and the policies tagged by the tool. Unresolved names in search
+  mode require one confirming listing of that kind, including a VM policy listing without text search. A wave
+  creating objects can therefore read the full tenant listings. On tenants that require account-scoped target-set
+  reads, unresolved sets require checking the remaining tenant accounts, so sets still linked to old accounts
+  are reported as drift. Incomplete discovery stops the run before writes.
+- **Vault previews are refreshed.** Each preview and apply pass reads a safe at most once for search confirmation.
+  Apply refreshes those safe snapshots after the confirmation prompt; an account added during the pause is
+  discovered before onboarding. Authentication changes and uncertain writes invalidate the cache too.
 - **Cheap re-runs.** The policy list carries only part of each policy. Name and principals are compared from
   the list when present; missing principals require a full read even without `--drift`. `--drift` / `--update`
   fetches incomplete policy details to compare all managed settings. Missing principal evidence is `unverified`.
@@ -358,7 +364,7 @@ do next**. The message distinguishes known causes from suggestions; `-v` adds sa
 | `protocol=ssh needs ssh_username …` | A Linux row has no certificate user name. | Fill `ssh_username` on the row or in `config.toml`. |
 | `strong_account 'SA-x' is not defined in strong_accounts.csv or domains.csv` | The row refers to an unknown account. | Add the row (`type=existing` if it already exists in SIA), or name it on the domain's row in `domains.csv`. |
 | `no strong account named '…' in SIA (type=existing)` | Nothing in SIA has that exact name — confirmed against the full listing, not just a filtered read. | Check the *Strong accounts* page, or set `strong_account_type = "vault"` so the reference is created. |
-| `this tenant matched nothing when filtering by name for '…', but its unfiltered listing serves it` | The tenant's server-side name filter disagrees with its own listing. The run recovered by reading everything, so the result is correct but slower. The same confirmation guards the policy lookup and the Vault account search — those log a warning rather than reporting one. | Pin `--lookup list` or `[http] lookup_search_max_rows = 0` for this tenant, and report the filter to CyberArk. |
+| `this tenant matched nothing when filtering by name for strong account '…', but its unfiltered listing serves it` (or `for target set '…'`) | The tenant's server-side name filter disagrees with its own listing. Confirmation recovered the object; normal drift and ambiguity checks still apply. Policy and Vault exact-name lookups also log recovered misses. Target-set read-back confirms empty name searches against the account listing. | Pin `--lookup list` or `[http] lookup_search_max_rows = 0` for this tenant, and report the filter to CyberArk. |
 | `Vault account '…' is missing and its current password is not available` | Nothing to onboard it with. | Add the account's name and password to the password file, or onboard it in PVWA. |
 | `role 'X' not found in Identity` / `group 'X' not found in Identity` | Name mismatch; similar names are listed. | Check the exact name of the role (Identity › Roles) or group; `principal_type` decides which kind is looked up. |
 | `group 'X' is ambiguous` / `role 'X' is ambiguous` | Same group name in several directories / two roles with one name. | Add the group to `groups.csv` with its directory / rename one of the roles. |

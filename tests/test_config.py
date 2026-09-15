@@ -123,6 +123,8 @@ def test_other_sections(tmp_path):
         load_config(make(tmp_path, other_sections='[http]\ntargetsets_api = "old"\n'))
     with pytest.raises(ConfigError, match="lookup_search_max_rows"):
         load_config(make(tmp_path, other_sections="[http]\nlookup_search_max_rows = -5\n"))
+    with pytest.raises(ConfigError, match="policy_page_size"):
+        load_config(make(tmp_path, other_sections="[http]\npolicy_page_size = 0\n"))
     cfg = load_config(make(tmp_path, other_sections='[http]\nmax_requests_per_second = 12.5\nsecrets_api = "public"\ntargetsets_api = "discovery"\n'))
     assert cfg.http.max_requests_per_second == 12.5 and cfg.http.secrets_api == "public" and cfg.http.targetsets_api == "discovery"
 

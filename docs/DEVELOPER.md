@@ -122,8 +122,9 @@ flowchart TD
 
 Details worth knowing:
 
-- `snapshot()` runs once per command; `apply` without `--yes` previews and applies from the same snapshot (no
-  second tenant read). A create that then hits a name conflict is reclassified (§3), so a stale preview is safe.
+- `snapshot()` runs once per command; `apply` without `--yes` previews and applies from the same SIA/UAP snapshot.
+  The Vault stage refreshes its account snapshots for each pass. A policy create that hits a name conflict is
+  reclassified (§3); concurrent tenant changes can still require another plan.
 - Policy creates and updates read the policy back up to `status_polls` times (default 5; `[http] status_polls`),
   2 s apart while the saved fields or intended final status have not converged. Success requires the normalized
   managed fields and intended status to match; optional ROLE directory metadata is ignored. Failed or incomplete
@@ -262,6 +263,28 @@ contain its FQDN. `--lookup list` reads one listing each: all secrets (paginated
 referenced strong account), and the policies carrying the owner tag (`filter=(targetCategory eq 'VM') and
 (policyTags eq '<tag>')`; the plain VM listing only with `--adopt-all`). `auto` picks search up to
 `[http] lookup_search_max_rows` servers (default 2,000), list above, list with `--adopt-all`.
+If an account-scoped target-set lookup leaves a wanted name unresolved, discovery lists the remaining tenant
+accounts' target sets before deciding it is absent. The complete secret listing is shared with secret discovery;
+each account is queried once. An incomplete listing stops the snapshot before writes.
+
+**Confirmed misses.** Every server-side name filter above only narrows a set that is re-matched exactly on the
+client, so an empty filtered read is not evidence of absence (one tenant returns nothing for names its listing
+serves). `_snapshot_secrets()` and `_snapshot_target_sets()` confirm the names still missing after the per-name
+pass against one unfiltered listing of that kind, merging what it returns; a recovered name flips
+`SIACapabilities.name_filter_reliable`, after which the remaining reads of the run (policies, the target-set
+read-back) take their listing branches. `UAPClient.find_policy_by_name()` confirms a `q=` miss against the full
+policy listing, cached on the client, and stops sending `q=` once the listing proved it blind
+(`search_reliable`, which `_snapshot_policies()` also consults). `PVWAClient.find_account()` confirms an empty
+`search=` by reading the safe once per reconciliation pass and indexing it. Preview and apply reset this cache
+separately, so changes during operator confirmation are observed. Authentication changes and uncertain writes
+also clear it; only complete, matching create receipts enter the cache. PVWA application-relative continuation
+links resolve from `/PasswordVault/`, retaining same-origin validation.
+
+Policy snapshot searches also confirm unresolved desired names against one VM listing without `q=`, independent
+of SIA filter reliability. All returned evidence is merged before name and owned-FQDN indexes are built, so a
+renamed policy is discovered before a create can bypass the same-name conflict check. Target-set confirmation
+likewise retains the whole listing, including conflicts for names already found. Exact policy lookups normalize
+HTML entities in both requested and returned names before case-insensitive matching and ambiguity checks.
 
 **Bounded drift reads.** The list endpoint returns partial policies. `_reconcile_existing_policy()` compares what
 the object carries and fetches the full policy (`GET /api/policies/{id}`) only when `drift` is requested
@@ -362,8 +385,8 @@ checkpoint, reports, connection CSV and `.rdp` files never contain secrets.
   `_upper`/`_lower` variants (`description_template` may also use `{protocol}`), the
   `strong_account_type` matrix (vault needs safe + account-name templates, credentials needs a username template,
   both need `strong_account_template`), the `[http]` scale keys (`max_requests_per_second >= 0`,
-  `lookup_search_max_rows >= 0`, the two path-family pins), `[pvwa]` (https URL, auth type, platform) and
-  `[connect]` (bare host, suffix without `@`).
+  `lookup_search_max_rows >= 0`, `policy_page_size >= 1`, the two path-family pins), `[pvwa]` (https URL, auth
+  type, platform) and `[connect]` (bare host, suffix without `@`).
 - Defaults changed for this programme: `policy_name_template = "{fqdn}"`, `max_session_hours = 2`.
 - `read_dotenv()` is non-mutating, rejects duplicate keys/malformed quoting, and returns file values for explicit
   source resolution. `load_dotenv()` retains compatibility without overriding exported variables. The terminal
@@ -404,7 +427,7 @@ PascalCase; PVWA uses camelCase.
 | Target sets | `GET /api/[discovery/]targetsets[?strongAccountId=…][&name=…][&b64StartKey=…]` → `{target_sets, b64_last_evaluated_key}` · `POST …/targetsets/bulk` (207, `results[].{target_set_name, success}`) · `PUT …/targetsets/{name}` |
 | Policies | `GET https://<sub>.uap.cyberark.cloud/api/policies?limit=50&filter=…[&q=…][&nextToken=…]` → `{results, nextToken}` (partial objects) · `GET /api/policies/{id}` · `POST /api/policies` → `{policyId}` · `PUT /api/policies/{id}` |
 | Directories | `GET {identity_url}/Core/GetDirectoryServices` · `POST {identity_url}/UserMgmt/DirectoryServiceQuery` with `{"directoryServices": [<CDS uuid>], "roles": "{\"Name\": {\"_like\": {\"value\": …, \"ignoreCase\": true}}}", "Args": {...}}` → `Result.roles` (or `Roles`) rows `{_ID, Name, …}`; for groups `{"directoryServices": [...], "group": "<json filter>", "Args": {...}}` → `Result.Group` rows `{InternalName, SystemName, DirectoryServiceUuid, ServiceInstanceLocalized, …}` |
-| PVWA | `POST {pvwa}/PasswordVault/API/auth/{CyberArk\|LDAP}/Logon` → token (sent verbatim as `Authorization`) · `GET {pvwa}/PasswordVault/API/Accounts?search=<name>&filter=safeName eq <safe>` → `{value: [...]}` · `POST {pvwa}/PasswordVault/API/Accounts` · `POST …/auth/Logoff` |
+| PVWA | `POST {pvwa}/PasswordVault/API/auth/{CyberArk\|LDAP}/Logon` → token (sent verbatim as `Authorization`) · `GET {pvwa}/PasswordVault/API/Accounts?search=<name>&filter=safeName eq <safe>` → `{value: [...]}` (an empty search is confirmed by reading the safe once per reconciliation pass: `?filter=safeName eq <safe>`) · `POST {pvwa}/PasswordVault/API/Accounts` · `POST …/auth/Logoff` |
 
 Headers on every call: `Authorization: Bearer <token>` (PVWA: the raw token), `Accept: application/json`, `X-IDAP-NATIVE-CLIENT: true`.
 

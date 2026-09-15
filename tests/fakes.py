@@ -236,6 +236,9 @@ class FakeUAP:
 
 
 class FakePVWA:
+    def reset_lookup_cache(self):
+        pass  # This fake reads its current account list directly on every lookup.
+
     def __init__(self, accounts: list[dict[str, Any]] | None = None):
         self.accounts = list(accounts or [])
         self.calls: list[tuple[str, Any]] = []
