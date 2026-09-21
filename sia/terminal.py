@@ -1066,7 +1066,7 @@ def _workflow_steps(command: str, args, answers: dict[str, Any]) -> list[dict[st
         if not accounts:
             steps.append({"key": "update", "label": "Include updates to existing managed objects?",
                           "default": False, "kind": "bool"})
-        if answers.get("update") is True:
+        if answers.get("update") is True and not accounts:
             steps.append({"key": "policy_state", "label": "Existing policy status", "default": "keep", "kind": "choice",
                           "choices": {"keep": "Leave current status unchanged", "Active": "Activate selected policies",
                                       "Suspended": "Suspend selected policies"}})
@@ -1088,7 +1088,7 @@ def _workflow_steps(command: str, args, answers: dict[str, Any]) -> list[dict[st
             if not accounts:
                 steps.append({"key": "checkpoint", "label": "Checkpoint file (empty uses the input directory)", "kind": "path"})
             steps.append({"key": "passwords", "label": "Password CSV path (empty uses configured file or hidden prompts)", "kind": "path"})
-            if answers.get("update") is True:
+            if answers.get("update") is True and not accounts:
                 steps.append({"key": "adopt", "label": "Adopt an unmanaged server FQDN (empty adopts none)", "kind": "optional_fqdn"})
             steps.append({"key": "keep_going", "label": "Continue after a rejected create/update instead of stopping?",
                           "default": False, "kind": "bool"})
@@ -1142,6 +1142,7 @@ def _prompt_workflow_step(step: dict[str, Any], previous: Any = None) -> Any:
 
 
 def _workflow_argv(command: str, answers: dict[str, Any]) -> list[str]:
+    from .reconcile import ACCOUNT_STAGES
     argv = [command]
     accounts = answers.get("scope") == "2"
     if accounts:
@@ -1158,18 +1159,21 @@ def _workflow_argv(command: str, answers: dict[str, Any]) -> list[str]:
     if command in ("plan", "apply", "verify") and not accounts:   # nothing to drift-check without policies
         argv.append("--drift")
     if command in ("plan", "apply"):
-        if answers.get("update"):
+        if answers.get("update") and not accounts:
             argv.append("--update")
             if answers.get("policy_state", "keep") != "keep":
                 argv += ["--set-policy-status", answers["policy_state"]]
-        if answers.get("resume"):
+        if answers.get("resume") and not accounts:
             argv.append("--resume")
         if answers.get("advanced"):
             for key, flag in (("offset", "--offset"), ("limit", "--limit"), ("workers", "--workers"),
                               ("lookup", "--lookup"), ("only", "--only"), ("progress_every", "--progress-every")):
-                argv += [flag, answers[key]]
+                value = answers[key]
+                if key == "only" and accounts and value not in ACCOUNT_STAGES:
+                    value = "all"
+                argv += [flag, value]
             for key, flag in (("checkpoint", "--checkpoint"), ("passwords", "--passwords"), ("adopt", "--adopt")):
-                if answers.get(key):
+                if answers.get(key) and (not accounts or key == "passwords"):
                     argv += [flag, answers[key]]
             if answers.get("keep_going"):
                 argv.append("--keep-going")
@@ -1185,6 +1189,7 @@ def _workflow_argv(command: str, answers: dict[str, Any]) -> list[str]:
 
 
 def workflow(command: str, args) -> list[str]:
+    from .reconcile import ACCOUNT_STAGES
     descriptions = {"plan": "Preview what would change for servers, or for their strong accounts only. This reads the "
                             "tenant and does not apply changes.",
                     "apply": "Prepare changes for servers, or for their strong accounts only. You will review the plan and "
@@ -1201,7 +1206,14 @@ def workflow(command: str, args) -> list[str]:
         if index < len(steps):
             step = steps[index]
             try:
-                answers[step["key"]] = _prompt_workflow_step(step, answers.get(step["key"]))
+                previous = answers.get(step["key"])
+                answers[step["key"]] = _prompt_workflow_step(step, previous)
+                if step["key"] == "scope" and answers["scope"] == "2" and previous != "2":
+                    # Keep shared options, but revisiting server scope must ask for fresh policy decisions.
+                    for key in ("principal", "ssh", "ssh_username", "update", "policy_state", "resume", "adopt", "checkpoint"):
+                        answers.pop(key, None)
+                    if answers.get("only", "all") not in ACCOUNT_STAGES:
+                        answers["only"] = "all"
                 index += 1
             except Back:
                 if index == 0:

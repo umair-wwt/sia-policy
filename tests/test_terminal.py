@@ -688,3 +688,52 @@ def test_home_forwards_accounts_flag(tmp_path, monkeypatch):
     called = []
     assert terminal.home(args_for(tmp_path), Session(shell_env={}), lambda argv: called.append(argv) or 0) == 0
     assert called == [["verify", "--accounts", "--input", str(tmp_path / "input")]]
+
+
+@pytest.mark.parametrize(("stage", "expected_stage"), [("policies", "all"), ("secrets", "secrets")])
+def test_workflow_review_scope_change_discards_server_flags_and_keeps_common_options(tmp_path, monkeypatch, stage, expected_stage):
+    answers(monkeypatch, [
+        "1", "2", "srv09.example.com", "Old Admins", "yes", "old-ssh-user", "custom input",
+        "yes", "Active", "yes", "yes", "10", "20", "3", "list", stage, "50",
+        "old-checkpoint.json", "passwords.csv", "srv09.example.com", "yes",
+        "edit", "1", "2", "", "", "yes", "", "", "", "", "", "", "", "", "", "", "run",
+    ])
+    argv = terminal.workflow("plan", args_for(tmp_path))
+    assert argv == [
+        "plan", "--accounts", "--server", "srv09.example.com", "--workgroup", "--input", "custom input",
+        "--offset", "10", "--limit", "20", "--workers", "3", "--lookup", "list", "--only", expected_stage,
+        "--progress-every", "50", "--passwords", "passwords.csv", "--keep-going",
+    ]
+
+
+def test_workflow_back_scope_change_reasks_server_options_without_old_defaults(tmp_path, monkeypatch):
+    # Back from the review through every answered server step, then switch to accounts.
+    initial = ["1", "2", "srv09.example.com", "Old Admins", "yes", "old-ssh-user", "custom input",
+               "yes", "Active", "yes", "yes", "10", "20", "3", "list", "targetsets", "50",
+               "old-checkpoint.json", "passwords.csv", "srv09.example.com", "yes"]
+    # Finish the accounts draft, edit its scope back to servers and accept the cleared defaults.
+    accounts = ["2", "", "", "yes", "", "", "", "", "", "", "", "", "", ""]
+    server = ["edit", "1", "1", "", "", "", "", "", "", "yes", "", "", "", "", "", "", "",
+              "", "", "", "", "", "", "run"]
+    answers(monkeypatch, initial + ["/back"] * len(initial) + accounts + server)
+    argv = terminal.workflow("apply", args_for(tmp_path))
+    assert argv == [
+        "apply", "--server", "srv09.example.com", "--workgroup", "--input", "custom input", "--drift", "--update",
+        "--offset", "10", "--limit", "20", "--workers", "3", "--lookup", "list", "--only", "all",
+        "--progress-every", "50", "--passwords", "passwords.csv", "--keep-going",
+    ]
+
+
+def test_accounts_scope_gates_stale_prompts_and_arguments(tmp_path):
+    stale = {"scope": "2", "source": "2", "server": "srv09.example.com", "input": "input",
+             "principal": "Old Admins", "ssh": True, "ssh_username": "old-ssh-user", "update": True,
+             "policy_state": "Active", "resume": True, "advanced": True, "offset": "0", "limit": "0",
+             "workers": "1", "lookup": "auto", "only": "policies", "progress_every": "100",
+             "checkpoint": "old-checkpoint.json", "adopt": "srv09.example.com", "passwords": "passwords.csv"}
+    keys = {step["key"] for step in terminal._workflow_steps("plan", args_for(tmp_path), stale)}
+    assert not keys & {"principal", "ssh", "ssh_username", "update", "policy_state", "resume", "checkpoint", "adopt"}
+    assert terminal._workflow_argv("plan", stale) == [
+        "plan", "--accounts", "--server", "srv09.example.com", "--input", "input",
+        "--offset", "0", "--limit", "0", "--workers", "1", "--lookup", "auto", "--only", "all",
+        "--progress-every", "100", "--passwords", "passwords.csv",
+    ]

@@ -352,7 +352,7 @@ exit code is `0` success, `1` something needs attention, `2` bad input or config
 
 A workgroup (standalone) server has no domain account to borrow: its strong account is its own local administrator,
 which already exists on the server. Those accounts can be onboarded into SIA on their own, before anyone decides
-which role gets a policy, from a list that holds nothing but server names:
+which role gets a policy, from a list of server names marked as workgroup servers:
 
 ```csv
 fqdn,domain_joined
@@ -360,8 +360,10 @@ dmz-app01.example.com,no
 dmz-app02.example.com,no
 ```
 
-`domain_joined = no` is optional here; it keeps the same file correct for the later server run. The account name,
-the Windows user name and the `local` domain come from the naming convention in `config.toml`; `credentials` stores
+Set `domain_joined = no` for every standalone server, including an accounts-only run; use `--workgroup` with
+`--server`. Without it, a matching DNS suffix in `domains.csv` can select the domain account instead of the
+server's local account. The account name, the Windows user name and the `local` domain come from the naming
+convention in `config.toml`; `credentials` stores
 the user name and password in the SIA service (the *Stored in SIA* option of the portal), which is what a server
 outside any Vault needs:
 
@@ -382,6 +384,12 @@ dmz-app01.example.com,current-password-1
 dmz-app02.example.com,current-password-2
 ```
 
+For local `credentials` or `vault` accounts declared in `strong_accounts.csv`, a missing `address` is inferred
+when the complete input maps the account to one distinct server. Repeated policy rows for that server count
+once, and wave selection does not change the inference. An explicit address takes precedence. For an account
+shared by several servers, key its password by account name or set an explicit address. In the password file,
+an account-name entry takes precedence over an address entry; both are matched case-insensitively.
+
 Then:
 
 ```text
@@ -396,6 +404,8 @@ sia apply  --accounts --server dmz-app09.example.com --workgroup --yes --json --
 or `--only secrets` still limit the account stages). The table, the reports (`plan-accounts-*.json/.csv`) and the
 `verify` verdicts are per account. Run it again and every account says `exists`; the later `sia apply` for the
 same servers finds the account, reports it as `exists`, and creates only the target set and the policy.
+With `[pvwa]` configured, `verify --accounts` checks each selected Vault account as well as its SIA reference;
+a missing or unreadable Vault account cannot pass verification.
 
 Before the run, on each server: the account is in the local *Administrators* group,
 `LocalAccountTokenFilterPolicy = 1` is set (there is no GPO to push it on a workgroup machine), and the SIA

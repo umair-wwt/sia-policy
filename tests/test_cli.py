@@ -681,3 +681,93 @@ def test_password_file_keys_by_fqdn_as_well_as_name(monkeypatch):
     assert get(local) == "by-name"          # the account name wins over the address, both case-insensitively
     assert sia_onboard.make_password_source(allow_prompt=False, file_passwords={"SRV01.Example.com": "by-fqdn"})(local) == "by-fqdn"
     assert sia_onboard.make_password_source(allow_prompt=False, file_passwords={"other.example.com": "x"})(local) is None
+    monkeypatch.setenv("SIA_SA_ADM_W2_PASSWORD", "by-env")
+    assert get(local) == "by-env"
+
+
+@pytest.mark.parametrize("kind", ["credentials", "vault"])
+@pytest.mark.parametrize("accounts_only", [False, True])
+def test_explicit_account_uses_fqdn_password_without_address(workspace, monkeypatch, capsys, caplog, kind, accounts_only):
+    inp, pwfile = _accounts_workspace(workspace)
+    _no_account_env(monkeypatch)
+    (inp / "servers.csv").write_text("fqdn,strong_account,domain_joined\nSRV01.example.com,adm-srv01,no\n", encoding="utf-8")
+    (inp / "strong_accounts.csv").write_text(
+        "name,type,safe,account_name,username,account_domain\n"
+        f"ADM-srv01,{kind},Safe,AdminAccount,Administrator,local\n", encoding="utf-8")
+    pwfile.write_text("name,password\nSrV01.Example.COM,fqdn-password\n", encoding="utf-8")
+
+    class PasswordCapturingPVWA(FakePVWA):
+        password = None
+
+        def add_account(self, payload):
+            self.password = payload["secret"]
+            return super().add_account(payload)
+
+    pvwa = PasswordCapturingPVWA()
+    if kind == "vault":
+        cfg = workspace / "config.toml"
+        cfg.write_text(cfg.read_text().replace('base_url = ""', 'base_url = "https://pvwa.example.com"'), encoding="utf-8")
+        FakeContext.pvwa = pvwa
+    sia = FakeSIA()
+    shared_context(monkeypatch, sia=sia, identity=FakeIdentity(roles=[role_row("SIA-SRV01-RDP")]))
+    scope = ["--accounts"] if accounts_only else []
+    assert run(workspace, "apply", *scope, "--yes", "--input", str(inp), "--passwords", str(pwfile),
+               "--checkpoint", cp(workspace), "--json", "--no-report") == 0
+    captured = capsys.readouterr()
+    data = json.loads(captured.out)
+    assert data["accounts"][0]["address"] == "srv01.example.com"
+    assert data["accounts"][0]["secret_status"] == "created"
+    if kind == "vault":
+        assert pvwa.password == "fqdn-password" and pvwa.accounts[0]["address"] == "srv01.example.com"
+        assert pvwa.logged_off
+    else:
+        payload = next(payload for action, payload in sia.calls if action == "create_secret")
+        assert payload["secret"]["secret_data"]["password"] == "fqdn-password"
+    assert not any("match no strong account" in record.getMessage() for record in caplog.records)
+    assert "fqdn-password" not in captured.out + captured.err + caplog.text
+
+
+@pytest.mark.parametrize("inline", [False, True])
+def test_accounts_workgroup_ignores_matching_domain_account(workspace, monkeypatch, capsys, inline):
+    inp, pwfile = _accounts_workspace(workspace)
+    _no_account_env(monkeypatch)
+    (inp / "servers.csv").write_text("fqdn,domain_joined\nsrv01.example.com,no\n", encoding="utf-8")
+    (inp / "domains.csv").write_text("domain,strong_account\nexample.com,SA-DOMAIN\n", encoding="utf-8")
+    domain_secret = {"secret_id": "domain-secret", "secret_name": "SA-DOMAIN",
+                     "secret_type": "ProvisionerUser", "is_active": True}
+    sia = FakeSIA(secrets=[domain_secret])
+    shared_context(monkeypatch, sia=sia)
+    source = ["--server", "srv01.example.com", "--workgroup"] if inline else []
+    assert run(workspace, "apply", "--accounts", "--yes", "--input", str(inp), *source,
+               "--passwords", str(pwfile), "--json", "--no-report") == 0
+    data = json.loads(capsys.readouterr().out)
+    assert [(a["name"], a["secret_status"]) for a in data["accounts"]] == [("ADM-srv01", "created")]
+    assert {s["secret_name"] for s in sia.secrets} == {"SA-DOMAIN", "ADM-srv01"}
+    assert sia.secrets[0] == domain_secret
+    ctx = FakeContext.instances[-1]
+    assert not ctx.uap.calls and not ctx.identity.queries and not sia.target_sets
+
+
+def test_shared_account_does_not_pick_a_password_by_wave(workspace, monkeypatch, capsys):
+    inp, pwfile = _accounts_workspace(workspace)
+    monkeypatch.delenv("SIA_SA_ADM_SHARED_PASSWORD", raising=False)
+    monkeypatch.setattr(sia_onboard, "interactive", lambda: False)
+    (inp / "servers.csv").write_text(
+        "fqdn,strong_account,domain_joined\nsrv01.example.com,ADM-shared,no\nsrv02.example.com,ADM-shared,no\n",
+        encoding="utf-8")
+    (inp / "strong_accounts.csv").write_text(
+        "name,type,username\nADM-shared,credentials,Administrator\n", encoding="utf-8")
+    pwfile.write_text("name,password\nsrv01.example.com,first-password\nsrv02.example.com,second-password\n", encoding="utf-8")
+    sia = FakeSIA()
+    shared_context(monkeypatch, sia=sia)
+    for offset in ("0", "1"):
+        assert run(workspace, "apply", "--accounts", "--yes", "--input", str(inp), "--passwords", str(pwfile),
+                   "--offset", offset, "--limit", "1", "--json", "--no-report") == 1
+        data = json.loads(capsys.readouterr().out)
+        assert data["accounts"][0]["secret_status"] == "failed"
+        assert not sia.secrets
+    pwfile.write_text("name,password\nADM-shared,shared-password\n", encoding="utf-8")
+    assert run(workspace, "apply", "--accounts", "--yes", "--input", str(inp), "--passwords", str(pwfile),
+               "--offset", "1", "--limit", "1", "--json", "--no-report") == 0
+    payload = next(payload for action, payload in sia.calls if action == "create_secret")
+    assert payload["secret"]["secret_data"]["password"] == "shared-password"

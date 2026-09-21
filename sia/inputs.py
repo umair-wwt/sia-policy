@@ -94,7 +94,7 @@ class StrongAccountRow:
     account_domain: str
     password_env: str | None
     line: int
-    address: str | None = None          # Vault onboarding only: the account's address (server FQDN or AD domain)
+    address: str | None = None          # Vault onboarding and password lookup: server FQDN or AD domain
 
     @property
     def secret_type(self) -> str | None:
@@ -792,6 +792,16 @@ def _finish(servers: list[ServerRow], templated: dict[str, StrongAccountRow], ct
     _check_target_set_definitions(servers, origin, problems)
     if problems:
         raise InputError("\n".join(problems))
+    # Resolve from the full inventory before wave slicing: a shared local account must not acquire whichever
+    # server happens to be in the current wave. Repeated policy rows for one server still give one address.
+    account_servers: dict[str, set[str]] = {}
+    for server in servers:
+        if server.strong_account and not server.is_ssh:
+            account_servers.setdefault(server.strong_account, set()).add(server.fqdn)
+    for name, fqdns in account_servers.items():
+        account = accounts[name]
+        if account.address is None and account.is_local and account.type in ("credentials", "vault") and len(fqdns) == 1:
+            accounts[name] = replace(account, address=next(iter(fqdns)))
     return Inputs(servers=tuple(servers), strong_accounts=accounts, groups=groups, warnings=tuple(warnings),
                   domains=ctx.domains, accounts_only=ctx.accounts_only)
 

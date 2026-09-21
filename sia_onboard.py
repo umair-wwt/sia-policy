@@ -756,11 +756,44 @@ def cmd_plan_apply(ctx: Context, args: argparse.Namespace, dry_run: bool) -> int
 def cmd_verify(ctx: Context, args: argparse.Namespace) -> int:
     inputs = load_wave(ctx, args)
     resolver = PrincipalResolver(ctx.identity, inputs.pinned_directory, principal_type=ctx.cfg.defaults.principal_type)
-    rec = Reconciler(sia=ctx.sia, uap=ctx.uap, resolver=resolver, inputs=inputs, defaults=ctx.cfg.defaults, dry_run=True,
-                     drift=bool(args.drift), lookup=args.lookup, lookup_search_max_rows=ctx.cfg.http.lookup_search_max_rows,
-                     workers=args.workers, status_polls=1, progress_every=0,
-                     get_password=make_password_source(allow_prompt=False), accounts_only=args.accounts)
-    result = rec.run()
+    needs_vault = args.accounts and ctx.cfg.pvwa.enabled and any(
+        a.type == "vault" for a in inputs.referenced_strong_accounts)
+    pvwa = ctx.pvwa_client() if needs_vault else None
+    result = None
+    run_error: BaseException | None = None
+    cleanup_error: BaseException | None = None
+    try:
+        rec = Reconciler(sia=ctx.sia, uap=ctx.uap, resolver=resolver, inputs=inputs, defaults=ctx.cfg.defaults, dry_run=True,
+                         drift=bool(args.drift), lookup=args.lookup, lookup_search_max_rows=ctx.cfg.http.lookup_search_max_rows,
+                         workers=args.workers, status_polls=1, progress_every=0,
+                         pvwa=pvwa, pvwa_platform_id=ctx.cfg.pvwa.platform_id, pvwa_cpm_managed=ctx.cfg.pvwa.cpm_managed,
+                         get_password=make_password_source(allow_prompt=False), accounts_only=args.accounts)
+        result = rec.run()
+    except (Exception, KeyboardInterrupt) as exc:
+        result = getattr(exc, "partial_result", None)
+        if result is None:
+            run_error = exc
+    finally:
+        if pvwa is not None:
+            try:
+                pvwa.logoff()
+            except (Exception, KeyboardInterrupt) as exc:
+                cleanup_error = exc
+    if run_error is not None:
+        # A cleanup problem must never hide the original snapshot or lookup failure.
+        raise run_error
+    assert result is not None
+    if cleanup_error is not None:
+        result.incomplete = True
+        if isinstance(cleanup_error, KeyboardInterrupt):
+            result.interrupted = True
+            diagnostic = Diagnostic(
+                code="SIA-INTERRUPTED", message="PVWA session cleanup was interrupted after verification results were collected.",
+                actions=("The PVWA session expires automatically; review the verification results before continuing.",),
+                stage="PVWA logoff", mutation_state="not_applied")
+        else:
+            diagnostic = diagnose(cleanup_error, stage="PVWA logoff", mutation_state="not_applied")
+        result.diagnostics.append(diagnostic.to_dict())
     args._result_data = result_dict(result)
     args._result_data["mode"] = "verify"
     problems = print_verify(result, verbose=args.verbose)
@@ -771,8 +804,11 @@ def cmd_verify(ctx: Context, args: argparse.Namespace) -> int:
         if missing:
             missing_items.append((row.fqdn, f"Missing {', '.join(missing)} for {row.fqdn}."))
     if result.accounts_only:
-        missing_items += [(a.name, f"Missing strong account {a.name} for {a.address}.")
-                          for a in result.accounts if a.secret.status == "planned"]
+        for account in result.accounts:
+            missing = [name for name, outcome in (("Vault account", account.vault), ("strong account", account.secret))
+                       if outcome.status == "planned"]
+            if missing:
+                missing_items.append((account.name, f"Missing {', '.join(missing)} {account.name} for {account.address}."))
     for object_name, message in missing_items:
         diagnostic = Diagnostic(code="SIA-MISSING", message=message,
                                 actions=("Run plan with the same configuration and input/server options to review what is missing.",
@@ -780,12 +816,13 @@ def cmd_verify(ctx: Context, args: argparse.Namespace) -> int:
                                 mutation_state="not_applicable")
         args._result_data.setdefault("diagnostics", []).append(diagnostic.to_dict())
         render_diagnostic(diagnostic, sys.stdout, verbose=args.verbose)
-    args._result_data["ok"] = not problems
-    args._result_data["exit_code"] = EXIT_FAILURES if problems else EXIT_OK
+    code = exit_code(result) or (EXIT_FAILURES if problems else EXIT_OK)
+    args._result_data["ok"] = code == EXIT_OK
+    args._result_data["exit_code"] = code
     if args.out:
         path = write_verify_csv(result, args.out)
         print(f"CSV: {path}")
-    return EXIT_FAILURES if problems else EXIT_OK
+    return code
 
 
 def cmd_connect_info(ctx: Context, args: argparse.Namespace) -> int:

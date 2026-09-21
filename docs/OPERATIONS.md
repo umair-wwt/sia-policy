@@ -221,18 +221,23 @@ SA-legacy,existing,,,,,,
 | `username` | The Windows user name (`credentials`: required; `vault`: needed to onboard into the Vault). |
 | `account_domain` | `local` (default) or the AD domain of a domain account shared by several servers. |
 | `password_env` | `credentials`: env var holding the password (default `SIA_SA_<NAME>_PASSWORD`). |
-| `address` | Vault onboarding of a domain account: the domain. Local accounts use the server FQDN. |
+| `address` | Vault onboarding address and password-file lookup key; use the AD domain for a domain account. For local `credentials`/`vault` accounts, an omitted value is inferred only when the complete input names one distinct server for the account. Explicit values take precedence. |
 
 **Passwords** (for `credentials` accounts and for accounts the `vault` stage onboards) come from, in order: the
 environment variable, the password file (`name,password`, kept outside the repository, `--passwords FILE` or
 `[auth] password_file`), or a prompt when you run `apply` interactively (at most five per run). Every password is
-masked in all output.
+masked in all output. The file may be keyed by account name or address, matched case-insensitively; the account
+name wins when both are present. Address inference happens before wave selection and counts repeated policy
+rows for the same server once. For local accounts shared by several servers, use an account-name password
+entry or set an explicit address.
 
 **Onboarding into the Vault (optional `vault` stage).** Fill in `[pvwa]` in `config.toml` and put `PVWA_USER` /
 `PVWA_PASSWORD` in `.env` (a PVWA user allowed to add accounts to the Safe). `plan` shows `Vault accounts: … would
 onboard …` for every referenced `vault` account missing from the Safe; `apply` onboards it (name, address = the
 server FQDN, user name, platform, the current password from the password file) before creating the SIA
 reference. The Windows account must already exist on the server.
+With `[pvwa]` configured, `verify --accounts` reads both the selected Vault accounts and their SIA references.
+A missing or unreadable Vault account gives a non-passing verdict, even when its SIA reference exists.
 
 **Requirements on the server.** The account must be in the local *Administrators* group, marked *Account is
 sensitive and cannot be delegated*, not in *Protected Users*; local accounts need `LocalAccountTokenFilterPolicy = 1`
@@ -242,7 +247,8 @@ reach the server over WinRM (TCP 5985/5986).
 **Standalone (workgroup) servers.** A server outside any domain keeps its own local administrator as its strong
 account, and those accounts can be onboarded on their own, before any policy exists, with
 `sia plan/apply/verify --accounts` (README, "Standalone servers: onboard the strong accounts first"): `servers.csv`
-needs only `fqdn` (add `domain_joined = no` so the same file is right for the later server run),
+needs `fqdn` and `domain_joined = no` for each standalone server; use `--workgroup` with `--server`.
+Without that marking, a matching DNS suffix in `domains.csv` can select a domain account even with `--accounts`.
 `[defaults] strong_account_type = "credentials"` stores the user name and password in the SIA service (the portal's
 *Stored in SIA* option, a *Local account*), and the password file may be keyed by the server FQDN instead of the
 account name. Before the run, on each server:

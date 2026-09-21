@@ -736,3 +736,64 @@ def test_inline_accounts_only_matches_the_csv_path(tmp_path):
                            strong_account_template=CREDS_SPEC, accounts_only=True)
     assert [replace(s, line=0) for s in inline.servers] == [replace(s, line=0) for s in from_csv.servers]
     assert inline.strong_accounts == from_csv.strong_accounts and inline.accounts_only
+
+
+@pytest.mark.parametrize("kind", ["credentials", "vault"])
+@pytest.mark.parametrize("inline", [False, True])
+@pytest.mark.parametrize("accounts_only", [False, True])
+def test_explicit_local_account_infers_unique_server_address(tmp_path, kind, inline, accounts_only):
+    (tmp_path / "strong_accounts.csv").write_text(
+        f"name,type,safe,account_name,username,account_domain\nSA-local,{kind},Safe,admin,Administrator,LOCAL\n",
+        encoding="utf-8")
+    rows = [
+        {"fqdn": "WEB01.Example.COM.", "strong_account": "sa-LOCAL", "principal": "Admins", "policy_name": "admins"},
+        {"fqdn": "web01.example.com", "strong_account": "SA-local", "principal": "Ops", "policy_name": "ops"},
+        {"fqdn": "lnx01.example.com", "strong_account": "SA-local", "principal": "Linux", "protocol": "ssh",
+         "ssh_username": "ec2-user"},
+    ]
+    if inline:
+        inputs = inline_inputs(tmp_path, rows, accounts_only=accounts_only)
+    else:
+        (tmp_path / "servers.csv").write_text(
+            "fqdn,strong_account,principal,policy_name,protocol,ssh_username\n"
+            "WEB01.Example.COM.,sa-LOCAL,Admins,admins,,\n"
+            "web01.example.com,SA-local,Ops,ops,,\n"
+            "lnx01.example.com,SA-local,Linux,,ssh,ec2-user\n", encoding="utf-8")
+        inputs = load_inputs(tmp_path, accounts_only=accounts_only)
+    account = inputs.strong_accounts["SA-local"]
+    assert account.type == kind and account.address == "web01.example.com"
+    assert [s.strong_account for s in inputs.servers] == ["SA-local", "SA-local", None]
+    assert inputs.window(0, 1).strong_accounts["SA-local"].address == "web01.example.com"
+
+
+@pytest.mark.parametrize("kind", ["credentials", "vault"])
+def test_shared_local_account_address_stays_ambiguous_in_each_wave(tmp_path, kind):
+    make_inputs(tmp_path,
+                "web01.example.com,SA-local,Admins\nweb01.example.com,sa-LOCAL,Ops,ops\n"
+                "web02.example.com,SA-local,Admins\n",
+                f"SA-local,{kind},Safe,admin,Administrator,local,\n")
+    inputs = load_inputs(tmp_path)
+    assert inputs.strong_accounts["SA-local"].address is None
+    for offset in (0, 1):
+        wave = inputs.window(offset, 1)
+        assert len(wave.unique_fqdns) == 1
+        assert wave.strong_accounts["SA-local"].address is None
+
+
+@pytest.mark.parametrize("kind", ["credentials", "vault"])
+def test_account_address_inference_preserves_explicit_and_nonlocal_accounts(tmp_path, kind):
+    # An SSH-only account is never referenced after protocol parsing.
+    (tmp_path / "servers.csv").write_text(
+        "fqdn,strong_account,principal,protocol,ssh_username\nweb01.example.com,SA-explicit,Admins,,\n"
+        "web02.example.com,SA-domain,Admins,,\nweb03.example.com,SA-existing,Admins,,\n"
+        "lnx01.example.com,SA-ssh,Linux,ssh,ec2-user\n", encoding="utf-8")
+    (tmp_path / "strong_accounts.csv").write_text(
+        "name,type,safe,account_name,username,account_domain,address\n"
+        f"SA-explicit,{kind},Safe,admin,Administrator,local,ALIAS.Example.COM.\n"
+        f"SA-domain,{kind},Safe,domain,Administrator,example.com,\n"
+        "SA-existing,existing,,,,local,\n"
+        f"SA-unused,{kind},Safe,unused,Administrator,local,\n"
+        f"SA-ssh,{kind},Safe,ssh,Administrator,local,\n", encoding="utf-8")
+    accounts = load_inputs(tmp_path).strong_accounts
+    assert accounts["SA-explicit"].address == "ALIAS.Example.COM."
+    assert all(accounts[name].address is None for name in ("SA-domain", "SA-existing", "SA-unused", "SA-ssh"))
