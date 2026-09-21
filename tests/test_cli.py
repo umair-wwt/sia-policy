@@ -509,3 +509,175 @@ def test_groups_csv_with_role_principals_warns(workspace, monkeypatch, capsys, c
     assert run(workspace, "plan", "--input", str(inp), "--server", "web09.corp.example.com") == 0
     captured = capsys.readouterr()
     assert 'groups.csv is only used when [defaults] principal_type = "group"' in caplog.text + captured.err
+
+
+# ---------------------------------------------------------------- accounts-only onboarding (--accounts)
+
+def _accounts_workspace(workspace):
+    """Standalone servers: an FQDN-only list whose local administrators are stored in SIA (type=credentials)."""
+    cfg = workspace / "config.toml"
+    cfg.write_text(cfg.read_text()
+                   .replace('strong_account_type = "vault"', 'strong_account_type = "credentials"')
+                   .replace('principal_template = ""', 'principal_template = "SIA-{hostname_upper}-RDP"'), encoding="utf-8")
+    inp = workspace / "input"
+    inp.mkdir()
+    (inp / "servers.csv").write_text("fqdn,domain_joined\nsrv01.example.com,no\nsrv02.example.com,no\n", encoding="utf-8")
+    pwfile = workspace / "passwords.csv"
+    pwfile.write_text("name,password\nSRV01.example.com,pw-1\nADM-srv02,pw-2\nunrelated,x\n", encoding="utf-8")
+    pwfile.chmod(0o600)
+    return inp, pwfile
+
+
+def _no_account_env(monkeypatch):
+    for var in ("SIA_SA_ADM_SRV01_PASSWORD", "SIA_SA_ADM_SRV02_PASSWORD", "SIA_SA_ADM_SRV09_PASSWORD"):
+        monkeypatch.delenv(var, raising=False)
+
+
+def test_plan_accounts_reads_secrets_only_and_writes_account_reports(workspace, monkeypatch, capsys):
+    inp, pwfile = _accounts_workspace(workspace)
+    _no_account_env(monkeypatch)
+    sia = FakeSIA()
+    shared_context(monkeypatch, sia=sia)
+    assert run(workspace, "plan", "--input", str(inp), "--accounts", "--passwords", str(pwfile)) == 0
+    out = capsys.readouterr().out
+    assert "PLAN (dry run" in out and "Scope: strong accounts only" in out and "Strong accounts:" in out and "Servers:" not in out
+    assert "Account" in out and "SIA status" in out and "srv01.example.com" in out and "Summary: planned=2" in out
+    ctx = FakeContext.instances[-1]
+    assert ctx.uap.calls == [] and ctx.identity.queries == []
+    assert [c[0] for c in sia.calls] == ["find_secret", "find_secret", "list_secrets"]   # search, then one confirming listing
+    reports = sorted((workspace / "reports").iterdir())
+    assert [p.name.startswith("plan-accounts-") for p in reports] == [True, True]
+    data = json.loads(next(p for p in reports if p.suffix == ".json").read_text())
+    assert data["scope"] == "accounts" and data["rows"] == 2 and data["mode"] == "plan" and data["failures"] == 0
+    assert [a["name"] for a in data["accounts"]] == ["ADM-srv01", "ADM-srv02"] and data["accounts"][0]["secret_status"] == "planned"
+    assert data["accounts"][0]["address"] == "srv01.example.com" and data["accounts"][0]["sia_name"] == "ADM-srv01"
+    assert data["accounts"][0]["vault_status"] == "n/a" and data["servers"] == []
+    csv_lines = next(p for p in reports if p.suffix == ".csv").read_text().splitlines()
+    assert csv_lines[0] == "name,type,sia_name,username,address,vault_status,vault_detail,secret_status,secret_detail,secret_id"
+    assert len(csv_lines) == 3 and csv_lines[1].startswith("ADM-srv01,credentials,ADM-srv01,Administrator,srv01.example.com,n/a,")
+    assert not list(inp.glob(".sia-checkpoint*"))
+
+
+def test_apply_accounts_creates_then_exists_then_server_apply_sees_it(workspace, monkeypatch, capsys, caplog):
+    inp, pwfile = _accounts_workspace(workspace)
+    _no_account_env(monkeypatch)
+    caplog.set_level(logging.INFO)
+    sia = FakeSIA()
+    identity = FakeIdentity(roles=[role_row("SIA-SRV01-RDP", "r1"), role_row("SIA-SRV02-RDP", "r2")])
+    shared_context(monkeypatch, sia=sia, identity=identity)
+    code = run(workspace, "apply", "--accounts", "--yes", "--input", str(inp), "--passwords", str(pwfile), "--json", "--no-report",
+               "--checkpoint", cp(workspace))
+    captured = capsys.readouterr()
+    data = json.loads(captured.out)
+    assert code == 0 and data["scope"] == "accounts" and data["failures"] == 0
+    assert [a["secret_status"] for a in data["accounts"]] == ["created", "created"]
+    created = [c[1] for c in sia.calls if c[0] == "create_secret"]
+    assert [c["secret"]["secret_data"] for c in created] == [{"username": "Administrator", "password": "pw-1"},
+                                                              {"username": "Administrator", "password": "pw-2"}]
+    assert all(c["secret_details"] == {"account_domain": "local", "ephemeral_domain_user_data": {}} for c in created)
+    assert "pw-1" not in captured.out + captured.err + caplog.text and "pw-2" not in captured.out + captured.err
+    assert not Path(cp(workspace)).exists()
+    warnings = [r.getMessage() for r in caplog.records if "password file lists" in r.getMessage()]
+    assert warnings == ["password file lists 1 name(s) that match no strong account name or server FQDN: unrelated"]
+    # Second run: everything exists, nothing is created.
+    assert run(workspace, "apply", "--accounts", "--yes", "--input", str(inp), "--passwords", str(pwfile), "--no-report",
+               "--checkpoint", cp(workspace)) == 0
+    out = capsys.readouterr().out
+    assert "Summary: exists=2" in out and len([c for c in sia.calls if c[0] == "create_secret"]) == 2
+    # The later server run finds the accounts and adds only target sets and policies.
+    assert run(workspace, "apply", "--yes", "--input", str(inp), "--passwords", str(pwfile), "--no-report", "--checkpoint", cp(workspace)) == 0
+    out = capsys.readouterr().out
+    assert "Summary: created=4, exists=2" in out and len(sia.secrets) == 2 and Path(cp(workspace)).exists()
+
+
+def test_apply_accounts_without_password_fails_where_plan_only_plans(workspace, monkeypatch, capsys):
+    inp, _ = _accounts_workspace(workspace)
+    _no_account_env(monkeypatch)
+    monkeypatch.setattr(sia_onboard, "interactive", lambda: False)
+    shared_context(monkeypatch)
+    assert run(workspace, "plan", "--accounts", "--input", str(inp), "--no-report") == 0
+    assert "planned" in capsys.readouterr().out
+    assert run(workspace, "apply", "--accounts", "--yes", "--input", str(inp), "--no-report", "--json") == 1
+    data = json.loads(capsys.readouterr().out)
+    assert data["failures"] == 2 and all(a["secret_status"] == "failed" for a in data["accounts"])
+    assert "server FQDN" in data["accounts"][0]["secret_detail"]
+
+
+def test_accounts_single_server_from_a_build_job(workspace, monkeypatch, capsys):
+    inp, _ = _accounts_workspace(workspace)
+    _no_account_env(monkeypatch)
+    monkeypatch.setenv("SIA_SA_ADM_SRV09_PASSWORD", "pw-9")
+    sia = FakeSIA()
+    shared_context(monkeypatch, sia=sia)
+    code = run(workspace, "apply", "--accounts", "--server", "srv09.example.com", "--workgroup", "--yes", "--json", "--no-report",
+               "--input", str(inp))
+    data = json.loads(capsys.readouterr().out)
+    assert code == 0 and data["rows"] == 1 and data["accounts"][0]["name"] == "ADM-srv09"
+    assert data["accounts"][0]["address"] == "srv09.example.com" and data["accounts"][0]["secret_status"] == "created"
+    assert sia.secrets[0]["secret_name"] == "ADM-srv09"
+    assert run(workspace, "apply", "--accounts", "--server", "srv09.example.com", "--principal", "X", "--yes", "--input", str(inp)) == 2
+    assert "--principal do not apply with --accounts" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("argv, fragment", [
+    (["plan", "--accounts", "--update"], "--update do not apply with --accounts"),
+    (["plan", "--accounts", "--drift"], "--drift do not apply with --accounts"),
+    (["plan", "--accounts", "--adopt", "x"], "--adopt do not apply"),
+    (["plan", "--accounts", "--adopt-all"], "--adopt-all do not apply"),
+    (["apply", "--accounts", "--resume", "--yes"], "--resume do not apply"),
+    (["plan", "--accounts", "--only", "policies"], "--only policies do not apply"),
+    (["plan", "--accounts", "--update", "--set-policy-status", "Active"], "--update, --set-policy-status do not apply"),
+    (["plan", "--accounts", "--server", "a.b.c", "--protocol", "ssh", "--ssh-username", "u"], "--protocol ssh does not apply"),
+    (["verify", "--accounts", "--drift"], "--drift do not apply"),
+    (["connect-info", "--accounts"], "unrecognized arguments"),
+])
+def test_accounts_rejected_flag_combinations(workspace, monkeypatch, capsys, argv, fragment):
+    inp, _ = _accounts_workspace(workspace)
+    shared_context(monkeypatch)
+    assert run(workspace, *argv, "--input", str(inp)) == 2
+    assert fragment in capsys.readouterr().err
+
+
+def test_accounts_accepts_the_account_stages_and_waves(workspace, monkeypatch, capsys):
+    inp, pwfile = _accounts_workspace(workspace)
+    _no_account_env(monkeypatch)
+    shared_context(monkeypatch)
+    assert run(workspace, "plan", "--accounts", "--only", "secrets", "--input", str(inp), "--no-report") == 0
+    assert run(workspace, "plan", "--accounts", "--only", "vault", "--input", str(inp), "--no-report") == 0
+    capsys.readouterr()
+    assert run(workspace, "plan", "--accounts", "--offset", "1", "--limit", "1", "--input", str(inp), "--json", "--no-report") == 0
+    data = json.loads(capsys.readouterr().out)
+    assert [a["name"] for a in data["accounts"]] == ["ADM-srv02"] and data["rows"] == 1
+
+
+def test_verify_accounts_missing_then_pass_then_inactive(workspace, monkeypatch, capsys):
+    inp, pwfile = _accounts_workspace(workspace)
+    _no_account_env(monkeypatch)
+    sia = FakeSIA()
+    shared_context(monkeypatch, sia=sia)
+    out_csv = workspace / "verify.csv"
+    assert run(workspace, "verify", "--accounts", "--input", str(inp), "--out", str(out_csv)) == 1
+    out = capsys.readouterr().out
+    assert "== VERIFY ==" in out and "Scope: strong accounts only" in out and "MISSING=2 (accounts=2)" in out
+    assert "Missing strong account ADM-srv01 for srv01.example.com" in out and "Servers" not in out.split("Details:")[0].split("\n")[3]
+    lines = out_csv.read_text().splitlines()
+    assert lines[0] == "name,type,sia_name,username,address,vault,secret,verdict,secret_id,detail" and ",MISSING," in lines[1]
+    assert run(workspace, "apply", "--accounts", "--yes", "--input", str(inp), "--passwords", str(pwfile), "--no-report") == 0
+    capsys.readouterr()
+    assert run(workspace, "verify", "--accounts", "--input", str(inp)) == 0
+    assert "PASS=2 (accounts=2)" in capsys.readouterr().out
+    sia.secrets[0]["is_active"] = False
+    assert run(workspace, "verify", "--accounts", "--input", str(inp), "--json") == 1
+    data = json.loads(capsys.readouterr().out)
+    assert data["mode"] == "verify" and data["scope"] == "accounts" and not data["ok"] and data["exit_code"] == 1
+    assert [a["secret_status"] for a in data["accounts"]] == ["inactive", "exists"]
+
+
+def test_password_file_keys_by_fqdn_as_well_as_name(monkeypatch):
+    monkeypatch.delenv("SIA_SA_ADM_W2_PASSWORD", raising=False)
+    local = StrongAccountRow(name="ADM-w2", type="credentials", safe=None, account_name=None, username="u",
+                             account_domain="local", password_env="SIA_SA_ADM_W2_PASSWORD", line=0, address="srv01.example.com")
+    get = sia_onboard.make_password_source(allow_prompt=False, file_passwords={"SRV01.Example.com": "by-fqdn", "adm-w2": "by-name"})
+    assert get(local) == "by-name"          # the account name wins over the address, both case-insensitively
+    assert sia_onboard.make_password_source(allow_prompt=False, file_passwords={"SRV01.Example.com": "by-fqdn"})(local) == "by-fqdn"
+    assert sia_onboard.make_password_source(allow_prompt=False, file_passwords={"other.example.com": "x"})(local) is None

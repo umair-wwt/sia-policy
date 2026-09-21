@@ -72,6 +72,7 @@ target_set_scope = "server"
 #   strong_account_type       existing    = only look it up in SIA (it was onboarded there already)
 #                             vault       = create a SIA reference to the account in your Vault (safe + account name)
 #                             credentials = store user name + password in SIA (password from the password file)
+#   For standalone (workgroup) servers, `sia plan/apply --accounts` onboards only these accounts, from a list of FQDNs.
 strong_account_template = "ADM-{hostname}"
 strong_account_type = "vault"
 strong_account_safe_template = "SIA-LocalAdmins"              # vault: the Safe holding the account
@@ -98,8 +99,9 @@ template_policy = ""
 # Run `preflight`: if the Identity line fails with 401/403 under one method, switch to the other.
 identity_auth = "platform_token"
 oidc_application = "__idaptive_cybr_user_oidc"
-# Optional CSV with columns name,password (name = strong_accounts.csv name, or the name rendered from
-# strong_account_template). Used for type=credentials accounts and for onboarding into the Vault.
+# Optional CSV with columns name,password (name = strong_accounts.csv name, the name rendered from
+# strong_account_template, or the server FQDN of a per-server local account). Used for type=credentials accounts
+# and for onboarding into the Vault.
 # Keep it OUTSIDE the repository with owner-only permissions; --passwords FILE on the command line overrides this.
 # A relative path here is resolved beside this config.toml file, not beside the shell's working directory.
 password_file = ""

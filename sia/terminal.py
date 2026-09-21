@@ -1038,17 +1038,24 @@ def split_command_line(text: str, *, windows: bool | None = None) -> list[str]:
 
 
 def _workflow_steps(command: str, args, answers: dict[str, Any]) -> list[dict[str, Any]]:
-    steps: list[dict[str, Any]] = [
-        {"key": "source", "label": "Work with a server list or one server?", "default": "1",
-         "choices": {"1": "Server list (CSV files)", "2": "One server"}, "kind": "choice"},
-    ]
+    from .reconcile import ACCOUNT_STAGES, STAGES
+    steps: list[dict[str, Any]] = []
+    if command in ("plan", "apply", "verify"):
+        steps.append({"key": "scope", "label": "What to onboard?", "default": "1", "kind": "choice",
+                      "choices": {"1": "Servers and policies (strong account, target set, access policy)",
+                                  "2": "Strong accounts only (no target sets or policies)"}})
+    # --accounts: the rows only name the strong accounts to onboard, so nothing about principals or policies is asked.
+    accounts = answers.get("scope") == "2"
+    steps.append({"key": "source", "label": "Work with a server list or one server?", "default": "1",
+                  "choices": {"1": "Server list (CSV files)", "2": "One server"}, "kind": "choice"})
     if answers.get("source") == "2":
-        steps.extend([
-            {"key": "server", "label": "Server FQDN", "kind": "fqdn"},
-            {"key": "principal", "label": "Identity role or group that may connect (empty uses naming convention)", "kind": "text"},
-            {"key": "ssh", "label": "Is this an SSH/Linux server?", "default": False, "kind": "bool"},
-        ])
-        if answers.get("ssh") is True:
+        steps.append({"key": "server", "label": "Server FQDN", "kind": "fqdn"})
+        if not accounts:
+            steps.extend([
+                {"key": "principal", "label": "Identity role or group that may connect (empty uses naming convention)", "kind": "text"},
+                {"key": "ssh", "label": "Is this an SSH/Linux server?", "default": False, "kind": "bool"},
+            ])
+        if answers.get("ssh") is True and not accounts:
             steps.append({"key": "ssh_username", "label": "SSH username", "kind": "required_text"})
         else:
             steps.append({"key": "workgroup", "label": "Is this a workgroup server (not domain-joined)?",
@@ -1056,17 +1063,17 @@ def _workflow_steps(command: str, args, answers: dict[str, Any]) -> list[dict[st
     steps.append({"key": "input", "label": "Folder containing your CSV files",
                   "default": getattr(args, "input", "input"), "kind": "path"})
     if command in ("plan", "apply"):
-        steps.append({"key": "update", "label": "Include updates to existing managed objects?",
-                      "default": False, "kind": "bool"})
+        if not accounts:
+            steps.append({"key": "update", "label": "Include updates to existing managed objects?",
+                          "default": False, "kind": "bool"})
         if answers.get("update") is True:
             steps.append({"key": "policy_state", "label": "Existing policy status", "default": "keep", "kind": "choice",
                           "choices": {"keep": "Leave current status unchanged", "Active": "Activate selected policies",
                                       "Suspended": "Suspend selected policies"}})
-        steps.extend([
-            {"key": "resume", "label": "Resume completed rows from a matching checkpoint?", "default": False, "kind": "bool"},
-            {"key": "advanced", "label": "Configure advanced run options (waves, workers, adoption)?",
-             "default": False, "kind": "bool"},
-        ])
+        if not accounts:
+            steps.append({"key": "resume", "label": "Resume completed rows from a matching checkpoint?", "default": False, "kind": "bool"})
+        steps.append({"key": "advanced", "label": "Configure advanced run options (waves, workers, adoption)?",
+                      "default": False, "kind": "bool"})
         if answers.get("advanced") is True:
             steps.extend([
                 {"key": "offset", "label": "First server offset", "default": "0", "kind": "nonnegative"},
@@ -1075,11 +1082,12 @@ def _workflow_steps(command: str, args, answers: dict[str, Any]) -> list[dict[st
                 {"key": "lookup", "label": "Lookup mode", "default": "auto", "kind": "choice",
                  "choices": {"auto": "Detect", "search": "Per server", "list": "List objects"}},
                 {"key": "only", "label": "Stage", "default": "all", "kind": "choice",
-                 "choices": {key: "" for key in ("all", "vault", "secrets", "targetsets", "policies")}},
+                 "choices": {key: "" for key in (ACCOUNT_STAGES if accounts else STAGES)}},
                 {"key": "progress_every", "label": "Log progress every N objects (0 = off)", "default": "100", "kind": "nonnegative"},
-                {"key": "checkpoint", "label": "Checkpoint file (empty uses the input directory)", "kind": "path"},
-                {"key": "passwords", "label": "Password CSV path (empty uses configured file or hidden prompts)", "kind": "path"},
             ])
+            if not accounts:
+                steps.append({"key": "checkpoint", "label": "Checkpoint file (empty uses the input directory)", "kind": "path"})
+            steps.append({"key": "passwords", "label": "Password CSV path (empty uses configured file or hidden prompts)", "kind": "path"})
             if answers.get("update") is True:
                 steps.append({"key": "adopt", "label": "Adopt an unmanaged server FQDN (empty adopts none)", "kind": "optional_fqdn"})
             steps.append({"key": "keep_going", "label": "Continue after a rejected create/update instead of stopping?",
@@ -1135,16 +1143,19 @@ def _prompt_workflow_step(step: dict[str, Any], previous: Any = None) -> Any:
 
 def _workflow_argv(command: str, answers: dict[str, Any]) -> list[str]:
     argv = [command]
+    accounts = answers.get("scope") == "2"
+    if accounts:
+        argv.append("--accounts")
     if answers.get("source") == "2":
         argv += ["--server", answers["server"]]
-        if answers.get("principal"):
+        if answers.get("principal") and not accounts:
             argv += ["--principal", answers["principal"]]
-        if answers.get("ssh"):
+        if answers.get("ssh") and not accounts:
             argv += ["--protocol", "ssh", "--ssh-username", answers["ssh_username"]]
         elif answers.get("workgroup"):
             argv.append("--workgroup")
     argv += ["--input", answers["input"]]
-    if command in ("plan", "apply", "verify"):
+    if command in ("plan", "apply", "verify") and not accounts:   # nothing to drift-check without policies
         argv.append("--drift")
     if command in ("plan", "apply"):
         if answers.get("update"):
@@ -1174,9 +1185,12 @@ def _workflow_argv(command: str, answers: dict[str, Any]) -> list[str]:
 
 
 def workflow(command: str, args) -> list[str]:
-    descriptions = {"plan": "Preview what would change. This reads the tenant and does not apply changes.",
-                    "apply": "Prepare changes. You will review the plan and confirm before anything is applied.",
-                    "verify": "Read the tenant and check whether server access is configured as expected.",
+    descriptions = {"plan": "Preview what would change for servers, or for their strong accounts only. This reads the "
+                            "tenant and does not apply changes.",
+                    "apply": "Prepare changes for servers, or for their strong accounts only. You will review the plan and "
+                             "confirm before anything is applied.",
+                    "verify": "Read the tenant and check whether server access, or the strong accounts alone, is configured "
+                              "as expected.",
                     "connect-info": "Create connection instructions for your servers."}
     heading(command.replace("-", " ").title(), descriptions[command])
     note("Answer a few questions to prepare this run. Enter accepts a default; /back moves one answer; /cancel returns home.")
@@ -1229,9 +1243,9 @@ HOME_COMMANDS = {
     "/settings": "Edit configuration by topic or search",
     "/credentials": "Add your service user and password",
     "/doctor": "Troubleshoot files and optional tenant access",
-    "/plan": "Preview server changes without applying them",
-    "/apply": "Review and apply server changes",
-    "/verify": "Check current server configuration",
+    "/plan": "Preview server or strong-account changes without applying them",
+    "/apply": "Review and apply server or strong-account changes",
+    "/verify": "Check current server or strong-account configuration",
     "/connect-info": "Get connection instructions",
     "/help": "Read help or explain an error code",
     "/menu": "Show the home menu again",

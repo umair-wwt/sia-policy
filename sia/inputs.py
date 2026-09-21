@@ -143,6 +143,7 @@ class Inputs:
     groups: dict[str, GroupRow]
     warnings: tuple[str, ...] = field(default=())
     domains: dict[str, DomainRow] = field(default_factory=dict)
+    accounts_only: bool = False   # parsed for --accounts: the rows carry no principals and name no policies
 
     def strong_account_for(self, server: ServerRow) -> StrongAccountRow:
         if server.strong_account is None:
@@ -342,6 +343,8 @@ class ParseContext:
     principal_template: str = ""
     principal_type: str = "role"
     target_set_scope: str = "server"
+    # --accounts: the rows only say which strong accounts to onboard, so no principal or policy name is needed.
+    accounts_only: bool = False
     domains: dict[str, DomainRow] = field(default_factory=dict)
     generated_origins: dict[str, str] = field(default_factory=dict)
 
@@ -482,7 +485,9 @@ def _build_server_row(c: dict[str, str], where: str, line: int, ctx: ParseContex
             problems.append(
                 f"{where}: target_set_type = Target must name this exact server {fqdn!r}, "
                 f"but the resolved target set is {target_set_name!r}")
-    principals = _resolve_principals(c.get("principal"), fqdn, dns_domain, entry, ctx, where, problems)
+    # --accounts onboards strong accounts only: no policy is built, so no principal is resolved (or required).
+    principals = (() if ctx.accounts_only else
+                  _resolve_principals(c.get("principal"), fqdn, dns_domain, entry, ctx, where, problems))
 
     policy_name = c.get("policy_name") or None
     policy_suffix = c.get("policy_suffix") or None
@@ -547,7 +552,8 @@ def _parse_servers(path: Path, problems: list[str], warnings: list[str],
     for line, c in rows:
         where = f"{path.name}:{line}"
         row = _build_server_row(c, where, line, ctx, problems, warnings, templated)
-        _check_policy_name(row, where, ctx, policy_names, problems)
+        if not ctx.accounts_only:   # no policy is named in an accounts-only run, so a repeated FQDN is not a collision
+            _check_policy_name(row, where, ctx, policy_names, problems)
         _check_row_agreement(row, where, first_row, problems)
         servers.append(row)
     return servers, templated
@@ -733,7 +739,7 @@ def _parse_groups(path: Path, problems: list[str]) -> dict[str, GroupRow]:
 
 def _parse_context(input_dir: Path, problems: list[str], *, strong_account_template: str | StrongAccountTemplate,
                    ssh_username_default: str, policy_name_template: str, principal_template: str,
-                   principal_type: str, target_set_scope: str) -> ParseContext:
+                   principal_type: str, target_set_scope: str, accounts_only: bool = False) -> ParseContext:
     if principal_type not in PRINCIPAL_TYPES:
         raise ValueError(f"principal_type must be one of {', '.join(PRINCIPAL_TYPES)}")
     if isinstance(strong_account_template, StrongAccountTemplate):
@@ -742,7 +748,7 @@ def _parse_context(input_dir: Path, problems: list[str], *, strong_account_templ
         spec = StrongAccountTemplate(name=strong_account_template) if strong_account_template else None
     return ParseContext(spec=spec, ssh_username_default=ssh_username_default,
                         policy_name_template=policy_name_template, principal_template=principal_template,
-                        principal_type=principal_type, target_set_scope=target_set_scope,
+                        principal_type=principal_type, target_set_scope=target_set_scope, accounts_only=accounts_only,
                         domains=_parse_domains(input_dir / "domains.csv", problems))
 
 
@@ -787,12 +793,12 @@ def _finish(servers: list[ServerRow], templated: dict[str, StrongAccountRow], ct
     if problems:
         raise InputError("\n".join(problems))
     return Inputs(servers=tuple(servers), strong_accounts=accounts, groups=groups, warnings=tuple(warnings),
-                  domains=ctx.domains)
+                  domains=ctx.domains, accounts_only=ctx.accounts_only)
 
 
 def load_inputs(input_dir: str | Path, *, strong_account_template: str | StrongAccountTemplate = "",
                 ssh_username_default: str = "", policy_name_template: str = "{fqdn}", principal_template: str = "",
-                principal_type: str = "role", target_set_scope: str = "server") -> Inputs:
+                principal_type: str = "role", target_set_scope: str = "server", accounts_only: bool = False) -> Inputs:
     """Load and validate the CSVs. Only servers.csv is required; domains, strong_accounts and groups (directory pins
     for group principals) are optional.
 
@@ -802,6 +808,8 @@ def load_inputs(input_dir: str | Path, *, strong_account_template: str | StrongA
     typed explicitly in servers.csv must be declared in strong_accounts.csv or domains.csv (typo protection);
     explicit rows win over derived ones.
     policy_name_template: needed here so duplicate policy names are rejected before any tenant contact.
+    accounts_only: --accounts. The rows only say which strong accounts to onboard: no principal is resolved or
+    required, and policy names are not checked (a repeated FQDN is not a collision).
     """
     input_dir = Path(input_dir)
     problems: list[str] = []
@@ -811,7 +819,7 @@ def load_inputs(input_dir: str | Path, *, strong_account_template: str | StrongA
     ctx = _parse_context(input_dir, problems, strong_account_template=strong_account_template,
                          ssh_username_default=ssh_username_default, policy_name_template=policy_name_template,
                          principal_template=principal_template, principal_type=principal_type,
-                         target_set_scope=target_set_scope)
+                         target_set_scope=target_set_scope, accounts_only=accounts_only)
     servers, templated = _parse_servers(input_dir / "servers.csv", problems, warnings, ctx)
     return _finish(servers, templated, ctx, input_dir, problems, warnings, "servers.csv")
 
@@ -819,7 +827,7 @@ def load_inputs(input_dir: str | Path, *, strong_account_template: str | StrongA
 def inline_inputs(input_dir: str | Path, servers: list[dict[str, str]], *,
                   strong_account_template: str | StrongAccountTemplate = "", ssh_username_default: str = "",
                   policy_name_template: str = "{fqdn}", principal_template: str = "",
-                  principal_type: str = "role", target_set_scope: str = "server") -> Inputs:
+                  principal_type: str = "role", target_set_scope: str = "server", accounts_only: bool = False) -> Inputs:
     """Servers given on the command line (--server) instead of servers.csv, validated by the same code path.
 
     domains.csv and strong_accounts.csv are still read from `input_dir` when present; groups.csv is read in group
@@ -831,7 +839,7 @@ def inline_inputs(input_dir: str | Path, servers: list[dict[str, str]], *,
     ctx = _parse_context(input_dir, problems, strong_account_template=strong_account_template,
                          ssh_username_default=ssh_username_default, policy_name_template=policy_name_template,
                          principal_template=principal_template, principal_type=principal_type,
-                         target_set_scope=target_set_scope)
+                         target_set_scope=target_set_scope, accounts_only=accounts_only)
     rows: list[ServerRow] = []
     templated: dict[str, StrongAccountRow] = {}
     policy_names: dict[str, tuple[str, int]] = {}
@@ -839,7 +847,8 @@ def inline_inputs(input_dir: str | Path, servers: list[dict[str, str]], *,
     for line, cells in enumerate(servers, start=1):
         where = f"--server {cells.get('fqdn', '?')}"
         row = _build_server_row(cells, where, line, ctx, problems, warnings, templated)
-        _check_policy_name(row, where, ctx, policy_names, problems)
+        if not ctx.accounts_only:   # no policy is named in an accounts-only run, so a repeated FQDN is not a collision
+            _check_policy_name(row, where, ctx, policy_names, problems)
         _check_row_agreement(row, where, first_row, problems)
         rows.append(row)
     return _finish(rows, templated, ctx, input_dir, problems, warnings, "--server")

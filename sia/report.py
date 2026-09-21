@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import TextIO
 
 from .diagnostics import Diagnostic, render_diagnostic
-from .reconcile import Outcome, RunResult, ServerResult
+from .reconcile import AccountResult, Outcome, RunResult, ServerResult
 from .redact import sanitize
 from .artifacts import ArtifactWriteError, write_artifacts
 
@@ -29,6 +29,12 @@ VERDICT_BY_STATUS = {"exists": "PASS", "created": "PASS", "updated": "PASS", "n/
                      "drift": "FAIL", "failed": "FAIL", "blocked": "FAIL", "inactive": "FAIL", "skipped": "SKIP",
                      "uncertain": "FAIL", "unverified": "FAIL"}
 _DIAGNOSTIC_STATUSES = frozenset({"failed", "blocked", "inactive", "uncertain", "unverified", "drift"})
+# An accounts-only run (--accounts) reports strong accounts, not server rows.
+ACCOUNTS_CSV_COLUMNS = ("name", "type", "sia_name", "username", "address", "vault_status", "vault_detail",
+                        "secret_status", "secret_detail", "secret_id")
+ACCOUNT_VERIFY_COLUMNS = ("name", "type", "sia_name", "username", "address", "vault", "secret", "verdict", "secret_id", "detail")
+ACCOUNT_HEADERS = ("Account", "Type", "SIA name", "User", "Server", "Vault", "SIA status")
+ACCOUNTS_SCOPE_LINE = "Scope: strong accounts only (no target sets or policies)"
 
 
 @dataclass(frozen=True)
@@ -164,6 +170,40 @@ def _noteworthy(sr: ServerResult) -> bool:
                for o in (sr.secret, sr.target_set, sr.policy))
 
 
+def _noteworthy_account(ar: AccountResult) -> bool:
+    return any(o.status not in _QUIET_STATUSES or o.notes for o in (ar.vault, ar.secret))
+
+
+def _print_account_table(result: RunResult, out: TextIO, max_rows: int) -> None:
+    """The unit of an accounts-only run: one line per strong account, details under the table as for servers."""
+    accounts = result.accounts
+    hidden = 0
+    if len(accounts) > max_rows:
+        shown = [ar for ar in accounts if _noteworthy_account(ar)][:max_rows]
+        hidden = len(accounts) - len(shown)
+        accounts = shown
+    rows = [(str(sanitize(ar.name)), ar.type, str(sanitize(ar.sia_name)), str(sanitize(ar.username)) or "-",
+             str(sanitize(ar.address)) or "-", _cell(ar.vault), _cell(ar.secret)) for ar in accounts]
+    widths = [max(len(h), *(len(r[i]) for r in rows)) if rows else len(h) for i, h in enumerate(ACCOUNT_HEADERS)]
+    line = "  ".join(f"{h:<{w}}" for h, w in zip(ACCOUNT_HEADERS, widths, strict=True))
+    print(f"\nStrong accounts:\n  {line}\n  {'-' * len(line)}", file=out)
+    for r in rows:
+        print("  " + "  ".join(f"{c:<{w}}" for c, w in zip(r, widths, strict=True)), file=out)
+    if hidden:
+        print(f"  ... {hidden} account(s) with nothing to report not shown (see the CSV report)", file=out)
+    details = []
+    for ar in accounts:
+        for label, outcome in (("Vault account", ar.vault), ("strong account", ar.secret)):
+            if (outcome.status in _DETAIL_STATUSES or outcome.notes) and outcome.detail:
+                details.append(str(sanitize(f"  {ar.name}: {label} {outcome.status} — {outcome.detail}")))
+                details.extend(str(sanitize(f"      note: {note}")) for note in outcome.notes)
+    if details:
+        print("\nDetails:", file=out)
+        print("\n".join(details[:max_rows]), file=out)
+        if len(details) > max_rows:
+            print(f"  ... {len(details) - max_rows} more (see the CSV report)", file=out)
+
+
 def _print_accounts(title: str, outcomes: dict[str, Outcome], out: TextIO, max_rows: int) -> None:
     if not outcomes:
         return
@@ -188,8 +228,12 @@ def print_summary(result: RunResult, out: TextIO | None = None, *, max_rows: int
         print(f"Lookup mode: {result.lookup_mode}", file=out)
     if result.resumed:
         print(f"Resumed from checkpoint: {result.resumed} row(s) already complete, not re-checked", file=out)
-    _print_accounts("Vault accounts", result.vault, out, max_rows)
-    _print_accounts("Strong accounts", result.secrets, out, max_rows)
+    if result.accounts_only:
+        print(ACCOUNTS_SCOPE_LINE, file=out)
+        _print_account_table(result, out, max_rows)
+    else:
+        _print_accounts("Vault accounts", result.vault, out, max_rows)
+        _print_accounts("Strong accounts", result.secrets, out, max_rows)
     if result.servers:
         servers = result.servers
         hidden = 0
@@ -271,16 +315,24 @@ def _server_dict(sr: ServerResult) -> dict:
                      "policy": _outcome_dict(sr.policy)})
 
 
+def _account_dict(ar: AccountResult) -> dict:
+    return sanitize({"name": ar.name, "type": ar.type, "sia_name": ar.sia_name, "username": ar.username, "address": ar.address,
+                     "vault_status": ar.vault.status, "vault_detail": _detail_with_notes(ar.vault),
+                     "secret_status": ar.secret.status, "secret_detail": _detail_with_notes(ar.secret),
+                     "secret_id": ar.secret.ref or ""})
+
+
 def result_dict(result: RunResult, *, json_max_rows: int = 10_000) -> dict:
     """The whole run as plain data: written to reports/<mode>-<stamp>.json, and printed by --json."""
     data: dict = {
         "mode": result.mode,
+        "scope": "accounts" if result.accounts_only else "servers",
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "lookup_mode": result.lookup_mode,
         "complete": not result.incomplete,
         "interrupted": result.interrupted,
         "resumed": result.resumed,
-        "rows": len(result.servers),
+        "rows": len(result.accounts) if result.accounts_only else len(result.servers),
         "failures": result.failures,
         "counts": _counts(result),
         "aborted": result.aborted,
@@ -294,6 +346,11 @@ def result_dict(result: RunResult, *, json_max_rows: int = 10_000) -> dict:
     else:
         data["servers"] = f"{len(result.servers)} rows: see the CSV report"
         data["servers_needing_attention"] = [_server_dict(sr) for sr in result.servers if not sr.ok][:json_max_rows]
+    if len(result.accounts) <= json_max_rows:
+        data["accounts"] = [_account_dict(ar) for ar in result.accounts]
+    else:
+        data["accounts"] = f"{len(result.accounts)} accounts: see the CSV report"
+        data["accounts_needing_attention"] = [_account_dict(ar) for ar in result.accounts if not ar.ok][:json_max_rows]
     return sanitize(data)
 
 
@@ -312,8 +369,13 @@ def report_paths(report_dir: str | Path, mode: str, *, at: datetime | None = Non
         sequence += 1
 
 
+def report_stem(result: RunResult) -> str:
+    """plan / apply, or plan-accounts / apply-accounts for an accounts-only run (still matches plan-*.json)."""
+    return f"{result.mode}-accounts" if result.accounts_only else result.mode
+
+
 def write_reports(result: RunResult, report_dir: str | Path, *, json_max_rows: int = 10_000) -> tuple[Path, Path]:
-    paths = report_paths(report_dir, result.mode)
+    paths = report_paths(report_dir, report_stem(result))
     try:
         paths.json_path.parent.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
@@ -325,12 +387,19 @@ def write_reports(result: RunResult, report_dir: str | Path, *, json_max_rows: i
         json_text = json.dumps(result_dict(result, json_max_rows=json_max_rows), indent=2)
         csv_buffer = io.StringIO(newline="")
         writer = csv.writer(csv_buffer)
-        writer.writerow(CSV_COLUMNS)
-        for sr in result.servers:
-            writer.writerow(sanitize([sr.fqdn, sr.strong_account, sr.target_set_name or sr.fqdn, sr.policy_name,
-                                      sr.secret.status, _detail_with_notes(sr.secret),
-                                      sr.target_set.status, _detail_with_notes(sr.target_set),
-                                      sr.policy.status, _detail_with_notes(sr.policy), sr.policy.ref or ""]))
+        if result.accounts_only:
+            writer.writerow(ACCOUNTS_CSV_COLUMNS)
+            for ar in result.accounts:
+                writer.writerow(sanitize([ar.name, ar.type, ar.sia_name, ar.username, ar.address,
+                                          ar.vault.status, _detail_with_notes(ar.vault),
+                                          ar.secret.status, _detail_with_notes(ar.secret), ar.secret.ref or ""]))
+        else:
+            writer.writerow(CSV_COLUMNS)
+            for sr in result.servers:
+                writer.writerow(sanitize([sr.fqdn, sr.strong_account, sr.target_set_name or sr.fqdn, sr.policy_name,
+                                          sr.secret.status, _detail_with_notes(sr.secret),
+                                          sr.target_set.status, _detail_with_notes(sr.target_set),
+                                          sr.policy.status, _detail_with_notes(sr.policy), sr.policy.ref or ""]))
         csv_text = csv_buffer.getvalue()
     except (TypeError, ValueError, csv.Error, KeyboardInterrupt) as exc:
         raise ReportWriteError(paths.json_path, exc, paths=paths) from exc
@@ -341,7 +410,7 @@ def write_reports(result: RunResult, report_dir: str | Path, *, json_max_rows: i
                             exclusive=paths.as_tuple())
         except ArtifactWriteError as exc:
             if isinstance(exc.cause, FileExistsError) and not exc.completed_paths:
-                paths = report_paths(report_dir, result.mode)
+                paths = report_paths(report_dir, report_stem(result))
                 continue
             raise ReportWriteError(exc.path, exc.cause, paths=paths, completed_paths=exc.completed_paths) from exc
         return paths.as_tuple()
@@ -354,15 +423,25 @@ def exit_code(result: RunResult) -> int:
 
 # ------------------------------------------------------------------ verify
 
-def verdict_for(sr: ServerResult) -> tuple[str, str]:
-    """(verdict, detail) for one row: FAIL beats MISSING beats SKIP beats PASS."""
+def _worst_verdict(pairs) -> tuple[str, str]:
+    """(verdict, detail) over labelled outcomes: FAIL beats MISSING beats SKIP beats PASS."""
     worst, detail = "PASS", ""
     order = {"PASS": 0, "SKIP": 1, "MISSING": 2, "FAIL": 3}
-    for label, outcome in (("strong account", sr.secret), ("target set", sr.target_set), ("policy", sr.policy)):
+    for label, outcome in pairs:
         verdict = VERDICT_BY_STATUS.get(outcome.status, "FAIL")
         if order[verdict] > order[worst]:
             worst, detail = verdict, f"{label} {outcome.status}: {outcome.detail}"
     return worst, detail
+
+
+def verdict_for(sr: ServerResult) -> tuple[str, str]:
+    """(verdict, detail) for one row: FAIL beats MISSING beats SKIP beats PASS."""
+    return _worst_verdict((("strong account", sr.secret), ("target set", sr.target_set), ("policy", sr.policy)))
+
+
+def verdict_for_account(ar: AccountResult) -> tuple[str, str]:
+    """(verdict, detail) for one strong account of an accounts-only run: its Vault stage (n/a passes) and its SIA secret."""
+    return _worst_verdict((("Vault account", ar.vault), ("strong account", ar.secret)))
 
 
 def verify_rows(result: RunResult) -> list[list[str]]:
@@ -374,37 +453,55 @@ def verify_rows(result: RunResult) -> list[list[str]]:
     return rows
 
 
+def account_verify_rows(result: RunResult) -> list[list[str]]:
+    rows = []
+    for ar in result.accounts:
+        verdict, detail = verdict_for_account(ar)
+        rows.append(sanitize([ar.name, ar.type, ar.sia_name, ar.username, ar.address, ar.vault.status, ar.secret.status,
+                              verdict, ar.secret.ref or "", detail]))
+    return rows
+
+
 def print_verify(result: RunResult, out: TextIO | None = None, *, max_rows: int = 200, verbose: bool = False) -> int:
-    """Print the PASS/FAIL table; returns the number of rows that are not PASS."""
+    """Print the PASS/FAIL table; returns the number of rows (accounts, with --accounts) that are not PASS."""
     out = out or sys.stdout
-    rows = verify_rows(result)
+    if result.accounts_only:
+        rows, verdict_at, unit = account_verify_rows(result), 7, "accounts"
+        headers = ("Account", "Type", "SIA name", "Server", "Vault", "SIA status", "Verdict")
+        columns, name_at, label_at, detail_at = (0, 1, 2, 4, 5, 6, 7), 0, 2, 9
+    else:
+        rows, verdict_at, unit = verify_rows(result), 6, "rows"
+        headers = ("Server", "Policy", "Strong account", "Secret", "Target set", "Policy", "Verdict")
+        columns, name_at, label_at, detail_at = (0, 1, 2, 3, 4, 5, 6), 0, 1, 8
     counts: dict[str, int] = {}
     for row in rows:
-        counts[row[6]] = counts.get(row[6], 0) + 1
+        counts[row[verdict_at]] = counts.get(row[verdict_at], 0) + 1
     print("\n== VERIFY ==", file=out)
     if result.lookup_mode:
         print(f"Lookup mode: {result.lookup_mode}", file=out)
-    problems = [row for row in rows if row[6] != "PASS"]
+    if result.accounts_only:
+        print(ACCOUNTS_SCOPE_LINE, file=out)
+    problems = [row for row in rows if row[verdict_at] != "PASS"]
     shown = problems if len(rows) > max_rows else rows
     if shown:
-        headers = ("Server", "Policy", "Strong account", "Secret", "Target set", "Policy", "Verdict")
-        widths = [max(len(h), *(len(r[i]) for r in shown)) for i, h in enumerate(headers)]
+        table = [[row[i] for i in columns] for row in shown]
+        widths = [max(len(h), *(len(r[i]) for r in table)) for i, h in enumerate(headers)]
         line = "  ".join(f"{h:<{w}}" for h, w in zip(headers, widths, strict=True))
         print(f"  {line}\n  {'-' * len(line)}", file=out)
-        for row in shown[:max_rows]:
-            print("  " + "  ".join(f"{c:<{w}}" for c, w in zip(row[:7], widths, strict=True)), file=out)
+        for row in table[:max_rows]:
+            print("  " + "  ".join(f"{c:<{w}}" for c, w in zip(row, widths, strict=True)), file=out)
         if len(shown) > max_rows:
             print(f"  ... {len(shown) - max_rows} more (see the CSV)", file=out)
     if problems:
         print("\nDetails:", file=out)
         for row in problems[:max_rows]:
-            print(f"  {row[0]} [{row[1]}]: {row[6]} — {row[8]}", file=out)
+            print(f"  {row[name_at]} [{row[label_at]}]: {row[verdict_at]} — {row[detail_at]}", file=out)
     if result.warnings:
         print("\nWarnings:", file=out)
         for w in result.warnings[:max_rows]:
             print(f"  - {sanitize(w)}", file=out)
     _print_result_diagnostics(result, out, max_rows, verbose)
-    print("\nVerify: " + ", ".join(f"{k}={v}" for k, v in sorted(counts.items())) + f" (rows={len(rows)})", file=out)
+    print("\nVerify: " + ", ".join(f"{k}={v}" for k, v in sorted(counts.items())) + f" ({unit}={len(rows)})", file=out)
     return len(problems)
 
 
@@ -414,8 +511,12 @@ def write_verify_csv(result: RunResult, path: str | Path) -> Path:
     try:
         buffer = io.StringIO(newline="")
         writer = csv.writer(buffer)
-        writer.writerow(VERIFY_COLUMNS)
-        writer.writerows(verify_rows(result))
+        if result.accounts_only:
+            writer.writerow(ACCOUNT_VERIFY_COLUMNS)
+            writer.writerows(account_verify_rows(result))
+        else:
+            writer.writerow(VERIFY_COLUMNS)
+            writer.writerows(verify_rows(result))
         write_artifacts([(path, buffer.getvalue().encode("utf-8"))])
     except (OSError, csv.Error) as exc:
         raise ReportWriteError(path, exc, paths=paths) from exc

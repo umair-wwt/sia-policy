@@ -539,7 +539,7 @@ def test_malformed_dotenv_can_be_ignored_for_current_session(tmp_path, monkeypat
 
 def test_workflow_validates_fqdn_and_preserves_windows_path(tmp_path, monkeypatch, capsys):
     args = args_for(tmp_path)
-    answers(monkeypatch, ["2", "bad host", "web01.example.com", "Server Admins", "no", "no",
+    answers(monkeypatch, ["", "2", "bad host", "web01.example.com", "Server Admins", "no", "no",
                           r"C:\Users\operator\SIA Input", "", "run"])
     argv = terminal.workflow("verify", args)
     assert argv == ["verify", "--server", "web01.example.com", "--principal", "Server Admins",
@@ -548,14 +548,14 @@ def test_workflow_validates_fqdn_and_preserves_windows_path(tmp_path, monkeypatc
 
 
 def test_workflow_back_revisits_previous_answer_with_its_default(tmp_path, monkeypatch):
-    answers(monkeypatch, ["2", "web01.example.com", "/back", "", "Server Admins", "no", "no", "", "", "run"])
+    answers(monkeypatch, ["", "2", "web01.example.com", "/back", "", "Server Admins", "no", "no", "", "", "run"])
     argv = terminal.workflow("verify", args_for(tmp_path))
     assert argv[argv.index("--server") + 1] == "web01.example.com"
     assert argv[argv.index("--principal") + 1] == "Server Admins"
 
 
 def test_workflow_reprompts_for_every_invalid_advanced_choice(tmp_path, monkeypatch, capsys):
-    answers(monkeypatch, ["1", "", "no", "no", "yes",
+    answers(monkeypatch, ["", "1", "", "no", "no", "yes",
                           "-1", "0", "not-a-number", "0", "0", "16",
                           "wrong", "auto", "wrong", "all", "-2", "100",
                           "", "", "no", "run"])
@@ -567,7 +567,7 @@ def test_workflow_reprompts_for_every_invalid_advanced_choice(tmp_path, monkeypa
 
 
 def test_workflow_review_can_jump_to_one_answer(tmp_path, monkeypatch):
-    answers(monkeypatch, ["1", "first input", "", "edit", "2", "second input", "", "run"])
+    answers(monkeypatch, ["", "1", "first input", "", "edit", "3", "second input", "", "run"])
     argv = terminal.workflow("verify", args_for(tmp_path))
     assert argv[argv.index("--input") + 1] == "second input"
 
@@ -664,3 +664,27 @@ def test_credentials_reprompt_for_a_secret_that_cannot_be_stored(tmp_path, monke
     assert output.count("no control characters") == 2
     assert "tab\there" not in output
     assert read_dotenv(path)["SIA_CLIENT_SECRET"] == "usable-secret"
+
+
+def test_workflow_accounts_only_argv(tmp_path, monkeypatch, capsys):
+    """Scope 2 onboards strong accounts only: --accounts, no principal question, no --drift."""
+    answers(monkeypatch, ["2", "1", "", "no", "run"])
+    assert terminal.workflow("plan", args_for(tmp_path)) == ["plan", "--accounts", "--input", str(tmp_path / "input")]
+    answers(monkeypatch, ["2", "2", "srv09.example.com", "yes", "", "no", "run"])
+    assert terminal.workflow("apply", args_for(tmp_path)) == [
+        "apply", "--accounts", "--server", "srv09.example.com", "--workgroup", "--input", str(tmp_path / "input")]
+    answers(monkeypatch, ["2", "1", "", "", "run"])
+    argv = terminal.workflow("verify", args_for(tmp_path))
+    assert argv == ["verify", "--accounts", "--input", str(tmp_path / "input")] and "--drift" not in argv
+    # advanced options: the stage choice offers the account stages only, and no checkpoint is asked for
+    answers(monkeypatch, ["2", "1", "", "yes", "0", "0", "2", "auto", "policies", "secrets", "100", "", "no", "run"])
+    argv = terminal.workflow("plan", args_for(tmp_path))
+    assert argv[argv.index("--only") + 1] == "secrets" and "--checkpoint" not in argv and "--resume" not in argv
+    assert "needs attention" in capsys.readouterr().out
+
+
+def test_home_forwards_accounts_flag(tmp_path, monkeypatch):
+    answers(monkeypatch, ["/verify --accounts", "/exit"])
+    called = []
+    assert terminal.home(args_for(tmp_path), Session(shell_env={}), lambda argv: called.append(argv) or 0) == 0
+    assert called == [["verify", "--accounts", "--input", str(tmp_path / "input")]]

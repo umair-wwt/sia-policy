@@ -31,7 +31,9 @@ enable_reconnect = false
 # Leave blank when server/principal/account mappings are provided in the input CSV files. With a blank
 # strong_account_template every servers.csv row must name its strong account (or its domain must be listed in
 # domains.csv). To derive one per server instead, set for example strong_account_template = "ADM-{hostname}",
-# strong_account_type = "vault" and the safe/account-name templates documented in config.example.toml.
+# strong_account_type = "vault" and the safe/account-name templates documented in config.example.toml, or
+# strong_account_type = "credentials" for standalone servers whose local administrator is stored in SIA
+# (onboard those first with `sia apply --accounts`).
 # Policies grant access to an Identity role by default; set principal_type = "group" to name Identity groups instead.
 principal_type = "role"
 principal_template = ""

@@ -182,7 +182,7 @@ app-lnx01.corp.example.com,,SIA-Linux-Admins,,,,,,ssh,ec2-user,
 | Column | Fill in |
 |---|---|
 | `fqdn` | The server name exactly as users will connect to it. **The only required column.** |
-| `principal` | The Identity role that may connect (several: `SIA-Web-Admins;SIA-Platform-Ops`); with `principal_type = "group"` in `config.toml` it names an Identity group instead. Leave empty to derive it from the server name — see below. |
+| `principal` | The Identity role that may connect (several: `SIA-Web-Admins;SIA-Platform-Ops`); with `principal_type = "group"` in `config.toml` it names an Identity group instead. Leave empty to derive it from the server name — see below. Not needed with `--accounts`. |
 | `policy_suffix` | Only for a second policy on the same server, e.g. `-ops`. |
 | `assign_groups` | Local groups the temporary user joins; empty = `Administrators`. |
 | `protocol`, `ssh_username` | `ssh` and the certificate user name for Linux servers; empty = Windows/RDP. |
@@ -347,6 +347,61 @@ python sia_onboard.py apply --server web09.corp.example.com --yes --json --no-re
 `--json` puts a valid result on stdout for both success and failure (the table and prompts go to stderr) and the
 exit code is `0` success, `1` something needs attention, `2` bad input or configuration. Add `--principal NAME` to name the role (or group) explicitly,
 `--workgroup` for a server that is not domain-joined.
+
+## Standalone servers: onboard the strong accounts first
+
+A workgroup (standalone) server has no domain account to borrow: its strong account is its own local administrator,
+which already exists on the server. Those accounts can be onboarded into SIA on their own, before anyone decides
+which role gets a policy, from a list that holds nothing but server names:
+
+```csv
+fqdn,domain_joined
+dmz-app01.example.com,no
+dmz-app02.example.com,no
+```
+
+`domain_joined = no` is optional here; it keeps the same file correct for the later server run. The account name,
+the Windows user name and the `local` domain come from the naming convention in `config.toml`; `credentials` stores
+the user name and password in the SIA service (the *Stored in SIA* option of the portal), which is what a server
+outside any Vault needs:
+
+```toml
+[defaults]
+strong_account_template = "ADM-{hostname}"
+strong_account_type = "credentials"
+strong_account_username_template = "Administrator"
+strong_account_domain = "local"
+```
+
+Passwords come from the password file (`name,password`, kept outside the repository), where the name may be the
+account name **or the server FQDN**, so the list and the password file can be exported from the same inventory:
+
+```csv
+name,password
+dmz-app01.example.com,current-password-1
+dmz-app02.example.com,current-password-2
+```
+
+Then:
+
+```text
+sia plan   --input input --accounts
+sia apply  --input input --accounts --passwords /secure/passwords.csv
+sia verify --input input --accounts
+sia apply  --accounts --server dmz-app09.example.com --workgroup --yes --json --no-report   # from a build job
+```
+
+`--accounts` creates strong accounts only: no target set, no policy, no checkpoint, and no principal is needed
+(`--update`, `--drift`, `--adopt`, `--set-policy-status`, `--resume` and `--principal` are rejected; `--only vault`
+or `--only secrets` still limit the account stages). The table, the reports (`plan-accounts-*.json/.csv`) and the
+`verify` verdicts are per account. Run it again and every account says `exists`; the later `sia apply` for the
+same servers finds the account, reports it as `exists`, and creates only the target set and the policy.
+
+Before the run, on each server: the account is in the local *Administrators* group,
+`LocalAccountTokenFilterPolicy = 1` is set (there is no GPO to push it on a workgroup machine), and the SIA
+connector reaches the server over WinRM. A `credentials` account is stored in SIA and not rotated; see
+[Standalone (workgroup) servers](docs/OPERATIONS.md#4-strong-accounts-in-detail) for the details and for vaulting
+the accounts later.
 
 ## Behind a TLS-inspecting proxy
 

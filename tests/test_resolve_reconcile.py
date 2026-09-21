@@ -1335,3 +1335,155 @@ def test_ambiguous_role_stops_the_run_before_writes():
     with pytest.raises(ResolveError, match="role 'SIA-Web-Admins' is ambiguous"):
         rec.run()
     assert calls(uap, "create_policy") == [] and not sia.secrets and not sia.target_sets
+
+
+# ------------------------------------------------------------ accounts-only run (--accounts)
+SRV01, SRV02 = "srv01.example.com", "srv02.example.com"
+LOCAL_CREDS = sa("ADM-srv01", "credentials", username="Administrator", password_env="SIA_SA_ADM_SRV01_PASSWORD", address=SRV01)
+LOCAL_CREDS_2 = sa("ADM-srv02", "credentials", username="Administrator", password_env="SIA_SA_ADM_SRV02_PASSWORD", address=SRV02)
+ACCOUNT_ROWS = Inputs(servers=(srv(SRV01, "ADM-srv01", [], domain_joined=False), srv(SRV02, "ADM-srv02", [], domain_joined=False)),
+                      strong_accounts={"ADM-srv01": LOCAL_CREDS, "ADM-srv02": LOCAL_CREDS_2}, groups={}, accounts_only=True)
+PASSWORDS = {"ADM-srv01": "pw-1", "ADM-srv02": "pw-2"}
+
+
+def test_accounts_only_plan_reads_secrets_only():
+    rec, sia, uap, identity = make(ACCOUNT_ROWS, dry_run=True, accounts_only=True, passwords=PASSWORDS)
+    result = rec.run()
+    assert result.accounts_only and result.servers == [] and result.failures == 0 and result.mode == "plan"
+    assert [(a.name, a.secret.status, a.vault.status) for a in result.accounts] == [("ADM-srv01", "planned", "n/a"),
+                                                                                    ("ADM-srv02", "planned", "n/a")]
+    first = result.accounts[0]
+    assert first.address == SRV01 and first.username == "Administrator" and first.sia_name == "ADM-srv01" and first.type == "credentials"
+    assert "type=credentials" in first.vault.detail
+    assert sia.calls == [("list_secrets", None)] and uap.calls == [] and identity.queries == []
+    rec, sia, _, _ = make(ACCOUNT_ROWS, dry_run=True, accounts_only=True, passwords=PASSWORDS, lookup="search")
+    rec.run()
+    assert [c[0] for c in sia.calls] == ["find_secret", "find_secret", "list_secrets"]
+
+
+def test_accounts_only_apply_creates_then_exists_then_server_run_sees_it():
+    rec, sia, uap, identity = make(ACCOUNT_ROWS, accounts_only=True, passwords=PASSWORDS)
+    result = rec.run()
+    assert [a.secret.status for a in result.accounts] == ["created", "created"] and result.failures == 0
+    created = calls(sia, "create_secret")
+    assert [c["secret_name"] for c in created] == ["ADM-srv01", "ADM-srv02"]
+    assert created[0]["secret_type"] == "ProvisionerUser" and created[0]["is_active"] is True
+    assert created[0]["secret"] == {"secret_data": {"username": "Administrator", "password": "pw-1"}, "tenant_encrypted": False}
+    assert created[0]["secret_details"] == {"account_domain": "local", "ephemeral_domain_user_data": {}}
+    assert result.accounts[0].secret.ref == "sec-1" and uap.calls == [] and identity.queries == []
+    result = make(ACCOUNT_ROWS, sia=sia, accounts_only=True, passwords=PASSWORDS)[0].run()
+    assert [a.secret.status for a in result.accounts] == ["exists", "exists"] and len(calls(sia, "create_secret")) == 2
+    # The later server run finds the account and adds only the target set and the policy.
+    server_rows = inputs([srv(SRV01, "ADM-srv01", ["SIA-Web-Admins"], domain_joined=False)], [LOCAL_CREDS])
+    result = make(server_rows, sia=sia, passwords=PASSWORDS)[0].run()
+    assert result.secrets["ADM-srv01"].status == "exists" and result.servers[0].target_set.status == "created"
+    assert result.servers[0].policy.status == "created" and len(sia.secrets) == 2
+    assert [a.name for a in result.accounts] == ["ADM-srv01"] and not result.accounts_only
+
+
+def test_accounts_only_password_matrix():
+    result = make(ACCOUNT_ROWS, dry_run=True, accounts_only=True, passwords={})[0].run()
+    assert all(a.secret.status == "planned" and "not available now" in a.secret.detail for a in result.accounts)
+    assert result.failures == 0
+    result = make(ACCOUNT_ROWS, accounts_only=True, passwords={})[0].run()
+    assert all(a.secret.status == "failed" for a in result.accounts) and result.failures == 2
+    detail = result.accounts[0].secret.detail
+    assert "SIA_SA_ADM_SRV01_PASSWORD" in detail and "server FQDN" in detail
+
+
+def test_accounts_only_type_mismatch_and_inactive_fail():
+    sia = FakeSIA([{"secret_id": "s1", "secret_name": "ADM-srv01", "secret_type": "PCloudAccount", "is_active": True}])
+    result = make(ACCOUNT_ROWS, sia=sia, accounts_only=True, passwords=PASSWORDS)[0].run()
+    assert result.accounts[0].secret.status == "failed" and "is a PCloudAccount" in result.accounts[0].secret.detail
+    assert result.accounts[1].secret.status == "created" and result.failures == 1
+    sia = FakeSIA([{"secret_id": "s1", "secret_name": "ADM-srv01", "secret_type": "ProvisionerUser", "is_active": False}])
+    result = make(ACCOUNT_ROWS, dry_run=True, sia=sia, accounts_only=True, passwords=PASSWORDS)[0].run()
+    assert result.accounts[0].secret.status == "inactive" and result.failures == 1
+
+
+def _many_accounts(count):
+    accounts = {f"ADM-srv{i:02d}": sa(f"ADM-srv{i:02d}", "credentials", username="Administrator",
+                                      password_env=f"SIA_SA_ADM_SRV{i:02d}_PASSWORD", address=f"srv{i:02d}.example.com")
+                for i in range(count)}
+    rows = Inputs(servers=tuple(srv(f"srv{i:02d}.example.com", f"ADM-srv{i:02d}", [], domain_joined=False) for i in range(count)),
+                  strong_accounts=accounts, groups={}, accounts_only=True)
+    return rows, {name: "pw" for name in accounts}
+
+
+def test_accounts_only_fail_fast_canary_and_workers():
+    rows, passwords = _many_accounts(12)
+    sia = FakeSIA()
+    sia.raise_on_create_secret = err(400, "bad request")
+    result = make(rows, sia=sia, accounts_only=True, passwords=passwords, workers=4)[0].run()
+    statuses = [a.secret.status for a in result.accounts]
+    assert statuses.count("failed") == 1 and statuses.count("blocked") == 11 and result.aborted and result.failures == 12
+    assert len(calls(sia, "create_secret")) == 1
+    sia = FakeSIA()
+    sia.raise_on_create_secret = err(400, "bad request")
+    result = make(rows, sia=sia, accounts_only=True, passwords=passwords, workers=4, fail_fast=False)[0].run()
+    assert [a.secret.status for a in result.accounts].count("failed") == 12 and not result.aborted
+    result = make(rows, accounts_only=True, passwords=passwords, workers=4)[0].run()
+    assert [a.secret.status for a in result.accounts] == ["created"] * 12 and result.failures == 0
+    sia = FakeSIA()
+    sia.raise_on_create_secret = err(500, "boom")
+    result = make(rows, sia=sia, accounts_only=True, passwords=passwords, fail_fast=False)[0].run()
+    assert all(a.secret.status == "uncertain" for a in result.accounts) and result.failures == 12
+
+
+def test_accounts_only_wave_ssh_rows_and_stage_gating():
+    rows = Inputs(servers=(*ACCOUNT_ROWS.servers, srv("lnx01.example.com", None, [], protocol="ssh", ssh_username="ec2-user")),
+                  strong_accounts=dict(ACCOUNT_ROWS.strong_accounts), groups={}, accounts_only=True)
+    result = make(rows.window(1, 1), dry_run=True, accounts_only=True, passwords=PASSWORDS)[0].run()
+    assert [a.name for a in result.accounts] == ["ADM-srv02"]
+    result = make(rows, dry_run=True, accounts_only=True, passwords=PASSWORDS)[0].run()
+    assert [a.name for a in result.accounts] == ["ADM-srv01", "ADM-srv02"]
+    assert any("ssh row(s) skipped" in w for w in result.warnings)
+    result = make(ACCOUNT_ROWS, accounts_only=True, only="vault", passwords=PASSWORDS)[0].run()
+    assert [a.secret.status for a in result.accounts] == ["skipped", "skipped"] and result.failures == 0
+    assert any("[pvwa] is not configured" in w for w in result.warnings)
+    result = make(ACCOUNT_ROWS, accounts_only=True, only="secrets", passwords=PASSWORDS)[0].run()
+    assert [a.secret.status for a in result.accounts] == ["created", "created"]
+    for kwargs in (dict(only="policies"), dict(only="targetsets"), dict(update=True), dict(resume=True)):
+        with pytest.raises(ValueError):
+            make(ACCOUNT_ROWS, accounts_only=True, **kwargs)
+    with pytest.raises(ValueError, match="accounts_only=True"):
+        make(ACCOUNT_ROWS)
+
+
+def test_accounts_only_runs_the_vault_stage_and_reports_after_a_crash():
+    local = sa("ADM-web01", "vault", safe="SIA-LocalAdmins", account_name="web01-Administrator", username="Administrator")
+    rows = Inputs(servers=(srv(WEB01_FQDN, "ADM-web01", [], domain_joined=False),), strong_accounts={"ADM-web01": local},
+                  groups={}, accounts_only=True)
+    result = make(rows, dry_run=True, accounts_only=True)[0].run()
+    assert result.accounts[0].vault.status == "n/a" and "[pvwa] not configured" in result.accounts[0].vault.detail
+    pvwa = FakePVWA()
+    result = make(rows, accounts_only=True, pvwa=pvwa, passwords={"ADM-web01": "pw"})[0].run()
+    account = result.accounts[0]
+    assert account.vault.status == "created" and calls(pvwa, "add_account")[0]["address"] == WEB01_FQDN
+    assert account.secret.status == "created" and account.sia_name == "web01-Administrator_SIA-LocalAdmins"
+    assert account.address == WEB01_FQDN and result.failures == 0
+    pvwa = FakePVWA()
+    pvwa.raise_on_add = err(403, "forbidden safe")
+    result = make(rows, accounts_only=True, pvwa=pvwa, passwords={"ADM-web01": "pw"})[0].run()
+    assert result.accounts[0].vault.status == "failed" and result.accounts[0].secret.status == "blocked" and result.failures == 1
+    # A run that dies inside a create still reports every account, as blocked or uncertain.
+    sia = FakeSIA()
+
+    def boom(payload):
+        raise RuntimeError("connection reset")
+
+    sia.create_secret = boom
+    rec = make(rows, sia=sia, accounts_only=True, pvwa=FakePVWA(), passwords={"ADM-web01": "pw"})[0]
+    with pytest.raises(RuntimeError) as exc:
+        rec.run()
+    partial = exc.value.partial_result
+    assert partial.incomplete and partial.accounts_only and partial.accounts[0].secret.bad and partial.failures == 1
+
+
+def test_account_results_are_present_in_server_mode_too():
+    result = make()[0].run()
+    assert sorted(a.name for a in result.accounts) == ["SA-corp-rdp", "SA-dmz"] and not result.accounts_only
+    assert result.failures == sum(1 for s in result.servers if not s.ok)
+    by_name = {a.name: a for a in result.accounts}
+    assert by_name["SA-dmz"].address == DMZ_FQDN and by_name["SA-corp-rdp"].address == "corp.example.com"
+    assert by_name["SA-corp-rdp"].sia_name == VAULT_SIA_NAME and by_name["SA-dmz"].vault.status == "n/a"

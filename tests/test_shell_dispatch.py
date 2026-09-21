@@ -30,7 +30,7 @@ def test_child_help_returns_to_home_and_another_command_runs(monkeypatch, capsys
     assert sia_onboard.main(["shell"]) == 0
     assert completed == [0, 0]
     output = capsys.readouterr().out
-    assert "--server" in output and "--set-policy-status" in output
+    assert "--server" in output and "--set-policy-status" in output and "--accounts" in output
     assert "Settings" in output
 
 

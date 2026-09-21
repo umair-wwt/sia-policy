@@ -342,3 +342,18 @@ def test_interrupt_during_mutation_is_partial_json_with_exit_130(workspace, monk
     assert data["interrupted"] is True and data["complete"] is False
     assert len(tenant.policies) == 1
     assert any(item["code"] == "SIA-INTERRUPTED" and item["mutation_state"] == "unknown" for item in data["diagnostics"])
+
+
+def test_doctor_accounts_validates_an_fqdn_only_list(workspace, monkeypatch, capsys):
+    monkeypatch.setattr(sia_onboard, "Context", lambda cfg: pytest.fail("Local doctor authenticated"))
+    cfg = workspace / "config.toml"
+    cfg.write_text(cfg.read_text().replace('strong_account_type = "vault"', 'strong_account_type = "credentials"'), encoding="utf-8")
+    inp = workspace / "input"
+    inp.mkdir()
+    (inp / "servers.csv").write_text("fqdn,domain_joined\nsrv01.example.com,no\n", encoding="utf-8")
+    assert run(workspace, "doctor", "--accounts", "--input", str(inp), "--json") == 0
+    check = next(c for c in json.loads(capsys.readouterr().out)["checks"] if c["name"] == "Server input")
+    assert check["status"] == "passed" and "1 servers" in check["message"]
+    assert run(workspace, "doctor", "--input", str(inp), "--json") == 1
+    check = next(c for c in json.loads(capsys.readouterr().out)["checks"] if c["name"] == "Server input")
+    assert check["status"] == "failed" and "principal is required" in check["message"]

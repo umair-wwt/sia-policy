@@ -683,3 +683,56 @@ def test_shipped_sample_input_loads_with_the_example_configuration():
     # The bundled starter leaves strong_account_template blank: rows must then name their account.
     with pytest.raises(InputError, match="strong_account is required"):
         load_inputs(ROOT / "input")
+
+
+# --------------------------------------------------------------------------- accounts-only parse mode (--accounts)
+CREDS_SPEC = StrongAccountTemplate(name="ADM-{hostname}", type="credentials", username="Administrator")
+WG_HDR = "fqdn,strong_account,principal,domain_joined\n"
+
+
+def test_accounts_only_accepts_an_fqdn_only_list(tmp_path):
+    (tmp_path / "servers.csv").write_text("fqdn,domain_joined\nsrv01.example.com,no\nSRV02.example.com,no\n", encoding="utf-8")
+    inputs = load_inputs(tmp_path, strong_account_template=CREDS_SPEC, accounts_only=True)
+    assert inputs.accounts_only and [s.principals for s in inputs.servers] == [(), ()] and inputs.referenced_principals == []
+    account = inputs.strong_accounts["ADM-srv01"]
+    assert account.type == "credentials" and account.username == "Administrator" and account.account_domain == "local"
+    assert account.password_env == "SIA_SA_ADM_SRV01_PASSWORD" and account.address == "srv01.example.com"
+    assert account.secret_type == "ProvisionerUser" and account.sia_name == "ADM-srv01"
+    assert inputs.strong_accounts["ADM-srv02"].address == "srv02.example.com"
+    assert inputs.window(1, 1).accounts_only and inputs.window(1, 1).unique_fqdns == ("srv02.example.com",)
+    with pytest.raises(InputError, match="principal is required"):     # a server run still needs a principal
+        load_inputs(tmp_path, strong_account_template=CREDS_SPEC)
+
+
+def test_accounts_only_keeps_workgroup_and_domain_rules(tmp_path):
+    path = make_inputs(tmp_path, "web01.corp.example.com,,,yes\ndmz01.corp.example.com,,,no\nfs01.corp.example.com,SA-legacy,,no\n",
+                       "SA-legacy,existing,,,,,\n", servers_hdr=WG_HDR, domains="corp.example.com,SA-CORP-SIA,,Domain,\n")
+    inputs = load_inputs(path, strong_account_template=CREDS_SPEC, accounts_only=True)
+    joined, workgroup, explicit = inputs.servers
+    assert joined.strong_account == "SA-CORP-SIA" and inputs.strong_accounts["SA-CORP-SIA"].type == "existing"
+    assert workgroup.strong_account == "ADM-dmz01" and inputs.strong_accounts["ADM-dmz01"].is_local
+    assert explicit.strong_account == "SA-legacy" and not workgroup.domain_joined
+    make_inputs(tmp_path, "fs01.corp.example.com,SA-typo,,no\n", "SA-legacy,existing,,,,,\n", servers_hdr=WG_HDR)
+    with pytest.raises(InputError, match="not defined in strong_accounts.csv"):
+        load_inputs(tmp_path, strong_account_template=CREDS_SPEC, accounts_only=True)
+
+
+def test_accounts_only_tolerates_a_repeated_fqdn_but_not_conflicting_accounts(tmp_path):
+    make_inputs(tmp_path, "srv01.example.com,,,no\nsrv01.example.com,,,no\n", "", servers_hdr=WG_HDR)
+    inputs = load_inputs(tmp_path, strong_account_template=CREDS_SPEC, accounts_only=True)
+    assert inputs.unique_fqdns == ("srv01.example.com",) and list(inputs.strong_accounts) == ["ADM-srv01"]
+    with pytest.raises(InputError, match="collides"):    # a server run still rejects the duplicate policy name
+        load_inputs(tmp_path, strong_account_template=CREDS_SPEC, principal_template="SIA-{hostname_upper}")
+    make_inputs(tmp_path, "srv01.example.com,,,no\nsrv01.example.com,SA-other,,no\n", "SA-other,existing,,,,,\n", servers_hdr=WG_HDR)
+    with pytest.raises(InputError, match="conflicts with line"):
+        load_inputs(tmp_path, strong_account_template=CREDS_SPEC, accounts_only=True)
+
+
+def test_inline_accounts_only_matches_the_csv_path(tmp_path):
+    from dataclasses import replace
+    (tmp_path / "servers.csv").write_text("fqdn,domain_joined\nsrv09.example.com,no\n", encoding="utf-8")
+    from_csv = load_inputs(tmp_path, strong_account_template=CREDS_SPEC, accounts_only=True)
+    inline = inline_inputs(tmp_path, [{"fqdn": "srv09.example.com", "domain_joined": "no", "principal": ""}],
+                           strong_account_template=CREDS_SPEC, accounts_only=True)
+    assert [replace(s, line=0) for s in inline.servers] == [replace(s, line=0) for s in from_csv.servers]
+    assert inline.strong_accounts == from_csv.strong_accounts and inline.accounts_only

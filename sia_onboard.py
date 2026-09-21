@@ -8,6 +8,7 @@ Commands:
   plan  --input DIR       dry run: what would be created / already exists / drifted
   apply --input DIR       create missing objects (idempotent); --update also fixes drift on managed/adopted objects
   verify --input DIR      PASS/FAIL per row: every object present and the policy Active (read-only)
+  ... --accounts          plan/apply/verify the listed servers' strong accounts only (no target sets or policies)
   connect-info --input DIR  what end users need to connect: gateway, ZSP user name, optional .rdp files (read-only)
 """
 from __future__ import annotations
@@ -49,7 +50,7 @@ from sia.http import HttpClient, RateLimiter, SIAApiError
 from sia.inputs import LIST_SEPARATOR, InputError, Inputs, StrongAccountRow, inline_inputs, load_inputs
 from sia.payloads import is_owned_policy, policy_name_for, target_set_field_report, tenant_only_fields
 from sia.pvwa import PVWAClient
-from sia.reconcile import LOOKUP_MODES, MAX_WORKERS, STAGES, ReconcileError, Reconciler
+from sia.reconcile import ACCOUNT_STAGES, LOOKUP_MODES, MAX_WORKERS, STAGES, ReconcileError, Reconciler
 from sia.redact import RedactingFilter, redact, register_secret, scrub_identity
 from sia.report import exit_code, print_summary, print_verify, result_dict, write_reports, write_verify_csv
 from sia.resolve import PrincipalResolver, pick
@@ -154,6 +155,10 @@ def add_global_flags(parser: argparse.ArgumentParser, *, root: bool = False) -> 
     parser.add_argument("--json", action="store_true", default=default(False), help="machine-readable result on stdout; messages on stderr")
 
 
+ACCOUNTS_HELP = ("onboard only the strong accounts of the listed servers ([defaults] strong_account_*), stored in SIA; no target "
+                 "sets or policies. A later plan/apply for the same servers reports them as exists")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = ArgumentParser(prog="sia", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     add_global_flags(parser, root=True)
@@ -189,6 +194,7 @@ def build_parser() -> argparse.ArgumentParser:
     for name, help_text in (("plan", "dry run"), ("apply", "create/update objects")):
         p = sub.add_parser(name, help=help_text)
         add_input_flags(p)
+        p.add_argument("--accounts", action="store_true", help=ACCOUNTS_HELP)
         p.add_argument("--only", choices=STAGES, default="all", help="restrict writes to one stage (lookups still run)")
         p.add_argument("--update", action="store_true",
                        help="also fix drift on objects this tool manages (owner tag/marker) or that you --adopt")
@@ -202,7 +208,7 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--passwords", metavar="FILE",
                        help="CSV (name,password) with strong-account passwords; overrides [auth] password_file")
         p.add_argument("--resume", action="store_true", help="skip rows the checkpoint file records as complete")
-        p.add_argument("--checkpoint", metavar="FILE", help=f"checkpoint file (default: <input>/{CHECKPOINT_NAME})")
+        p.add_argument("--checkpoint", metavar="FILE", help=f"checkpoint file (default: <input>/{CHECKPOINT_NAME}); not used with --accounts")
         p.add_argument("--progress-every", type=int, default=100, metavar="N", help="log progress every N objects (0 = off)")
         p.add_argument("--set-policy-status", choices=("Active", "Suspended"),
                        help="explicitly set the selected policies' status (requires --update)")
@@ -211,6 +217,7 @@ def build_parser() -> argparse.ArgumentParser:
             p.add_argument("--yes", "-y", action="store_true", help="do not ask for confirmation")
     vp = sub.add_parser("verify", help="check that every row's objects exist and its policy is Active (read-only)")
     add_input_flags(vp)
+    vp.add_argument("--accounts", action="store_true", help=ACCOUNTS_HELP)
     vp.add_argument("--drift", action="store_true", help="also compare policy targets (one extra read per policy)")
     vp.add_argument("--out", metavar="FILE", help="write the PASS/FAIL table as CSV")
     cp = sub.add_parser("connect-info", help="export what end users need to connect (read-only, no secrets)")
@@ -225,6 +232,8 @@ def build_parser() -> argparse.ArgumentParser:
     settings.add_argument("--show", action="store_true", help="show values and their sources without prompting")
     doctor = sub.add_parser("doctor", help="check local setup; --online also checks tenant access")
     add_input_flags(doctor)
+    doctor.add_argument("--accounts", action="store_true",
+                        help="validate the input files for an accounts-only run (--accounts): no principal is required")
     doctor.add_argument("--online", action="store_true", help="authenticate and run read-only tenant checks")
     shell = sub.add_parser("shell", help="open the terminal home screen")
     shell.add_argument("--input", default="input", help="default input directory for this session")
@@ -420,7 +429,9 @@ def make_password_source(allow_prompt: bool, file_passwords: dict[str, str] | No
     """Strong-account passwords, in order: environment variable, password file, then (interactive apply only) a
     no-echo prompt -- at most `max_prompts` prompts per run, after which the password file is the answer. Every
     value is registered with the redactor."""
-    file_passwords = file_passwords or {}
+    # The file is keyed by the account name or, for a per-server local account, by its server FQDN; both are matched
+    # case-insensitively (FQDNs are lower-cased on the way in, the file keeps the operator's spelling).
+    folded = {name.casefold(): password for name, password in (file_passwords or {}).items()}
     cache: dict[str, str] = {}
     prompted: list[str] = []
 
@@ -428,13 +439,16 @@ def make_password_source(allow_prompt: bool, file_passwords: dict[str, str] | No
         env_name = account.password_env or ""
         value = os.environ.get(env_name, "") if env_name else ""
         if not value:
-            value = file_passwords.get(account.name, "")
+            value = folded.get(account.name.casefold(), "")
+        if not value and account.address:
+            value = folded.get(account.address.casefold(), "")
         if not value:
             value = cache.get(account.name, "")
         if not value and allow_prompt and interactive():
             if len(prompted) < max_prompts:
                 prompted.append(account.name)
-                value = prompt_secret(f"Password for strong account {account.name} (user {account.username}, not echoed): ")
+                where = f" on {account.address}" if account.address else ""
+                value = prompt_secret(f"Password for strong account {account.name} (user {account.username}{where}, not echoed): ")
                 cache[account.name] = value
             elif len(prompted) == max_prompts:
                 prompted.append("-")
@@ -463,6 +477,25 @@ def check_server_flags(args: argparse.Namespace) -> None:
                           "principals come from servers.csv")
 
 
+ACCOUNTS_INCOMPATIBLE = (("update", "--update"), ("drift", "--drift"), ("adopt", "--adopt"), ("adopt_all", "--adopt-all"),
+                         ("set_policy_status", "--set-policy-status"), ("resume", "--resume"), ("principal", "--principal"))
+
+
+def check_accounts_flags(args: argparse.Namespace) -> None:
+    """--accounts onboards strong accounts only: flags about target sets, policies or principals would be silent no-ops."""
+    if not getattr(args, "accounts", False):
+        return
+    used = [flag for attr, flag in ACCOUNTS_INCOMPATIBLE if getattr(args, attr, None)]
+    only = getattr(args, "only", "all")
+    if only not in ACCOUNT_STAGES:
+        used.append(f"--only {only}")
+    if used:
+        raise ConfigError(f"{', '.join(used)} do not apply with --accounts: this mode onboards strong accounts only and "
+                          "creates no target set or policy. Use --only vault or --only secrets to limit the account stages.")
+    if getattr(args, "protocol", None) == "ssh" or getattr(args, "ssh_username", None):
+        raise ConfigError("--protocol ssh does not apply with --accounts: Linux ZSP uses an SSH certificate, not a strong account")
+
+
 def inline_rows(args: argparse.Namespace) -> list[dict[str, str]]:
     """--server FQDN [...] as servers.csv rows, so both paths run through the same validation."""
     shared = {
@@ -481,9 +514,11 @@ def load_wave(ctx: Context, args: argparse.Namespace) -> Inputs:
         return args._loaded_inputs
     d = ctx.cfg.defaults
     check_server_flags(args)
+    check_accounts_flags(args)
     common = dict(strong_account_template=d.strong_account_spec or "", ssh_username_default=d.ssh_username,
                   policy_name_template=d.policy_name_template, principal_template=d.principal_template,
-                  principal_type=d.principal_type, target_set_scope=d.target_set_scope)
+                  principal_type=d.principal_type, target_set_scope=d.target_set_scope,
+                  accounts_only=getattr(args, "accounts", False))
     if args.server:
         inputs = inline_inputs(args.input, inline_rows(args), **common)
     else:
@@ -493,9 +528,10 @@ def load_wave(ctx: Context, args: argparse.Namespace) -> Inputs:
         if args.offset < 0 or args.limit < 0:
             raise ConfigError("--offset and --limit must be >= 0")
         inputs = inputs.window(args.offset, args.limit or None)
-    log.info("Loaded %d rows for %d servers (%d ssh), %d strong accounts, %d directory pins%s", len(inputs.servers),
+    log.info("Loaded %d rows for %d servers (%d ssh), %d strong accounts, %d directory pins%s%s", len(inputs.servers),
              len(inputs.unique_fqdns), sum(1 for s in inputs.servers if s.is_ssh), len(inputs.strong_accounts), len(inputs.groups),
-             f" -- wave {args.offset}..{args.offset + len(inputs.unique_fqdns)} of {total} servers" if (args.offset or args.limit) else "")
+             f" -- wave {args.offset}..{args.offset + len(inputs.unique_fqdns)} of {total} servers" if (args.offset or args.limit) else "",
+             " -- strong accounts only" if inputs.accounts_only else "")
     for warning in inputs.warnings:
         log.warning("%s", warning)
     if not 1 <= args.workers <= MAX_WORKERS:
@@ -513,29 +549,33 @@ def cmd_plan_apply(ctx: Context, args: argparse.Namespace, dry_run: bool) -> int
     password_file = args.passwords or ctx.cfg.auth.password_file
     if password_file:
         file_passwords = load_password_file(password_file)
-        unknown = sorted(set(file_passwords) - set(inputs.strong_accounts))
+        known = {a.name.casefold() for a in inputs.strong_accounts.values()}
+        known |= {a.address.casefold() for a in inputs.strong_accounts.values() if a.address}
+        unknown = sorted(name for name in file_passwords if name.casefold() not in known)
         log.info("Loaded passwords for %d strong account(s) from %s", len(file_passwords), password_file)
         if unknown:
-            log.warning("password file lists %d name(s) not in strong_accounts.csv: %s", len(unknown), ", ".join(unknown[:10]))
+            log.warning("password file lists %d name(s) that match no strong account name or server FQDN: %s",
+                        len(unknown), ", ".join(unknown[:10]))
     checkpoint_path = Path(args.checkpoint) if args.checkpoint else Path(args.input) / CHECKPOINT_NAME
-    checkpoint = Checkpoint(checkpoint_path)
-    if not dry_run:
+    # --accounts completes no server row, so it neither reads nor writes the checkpoint.
+    checkpoint: Checkpoint | None = None if args.accounts else Checkpoint(checkpoint_path)
+    if not dry_run and checkpoint is not None:
         writable, reason = checkpoint.check_writable()
         if not writable:
             raise ConfigError(f"Cannot write checkpoint {checkpoint_path}: {reason}. Choose --checkpoint with a writable path before applying.")
-        if not args.no_report:
-            directory = Path(args.report_dir)
-            try:
-                directory.mkdir(parents=True, exist_ok=True)
-                with tempfile.TemporaryFile(dir=directory):
-                    pass
-            except OSError as exc:
-                raise ConfigError(f"Cannot save reports in {directory}: {exc}. Choose --report-dir before applying, or explicitly use --no-report.") from exc
-    if checkpoint_path.is_file():
+    if not dry_run and not args.no_report:
+        directory = Path(args.report_dir)
+        try:
+            directory.mkdir(parents=True, exist_ok=True)
+            with tempfile.TemporaryFile(dir=directory):
+                pass
+        except OSError as exc:
+            raise ConfigError(f"Cannot save reports in {directory}: {exc}. Choose --report-dir before applying, or explicitly use --no-report.") from exc
+    if checkpoint is not None and checkpoint_path.is_file():
         finished = checkpoint.done_count()
         if finished and not args.resume:
             log.info("checkpoint %s records %d finished row(s); pass --resume to skip them", checkpoint_path, finished)
-    if not dry_run:
+    if not dry_run and checkpoint is not None:
         _active_checkpoint = checkpoint_path
     resolver = PrincipalResolver(ctx.identity, inputs.pinned_directory, principal_type=ctx.cfg.defaults.principal_type)
     needs_vault = ctx.cfg.pvwa.enabled and args.only in ("all", "vault") and any(
@@ -550,7 +590,8 @@ def cmd_plan_apply(ctx: Context, args: argparse.Namespace, dry_run: bool) -> int
                      pvwa=pvwa, pvwa_platform_id=ctx.cfg.pvwa.platform_id, pvwa_cpm_managed=ctx.cfg.pvwa.cpm_managed,
                      set_policy_status=args.set_policy_status, suspended_ok=d.policy_status == "Suspended",
                      reconciliation_context={"tenant": asdict(ctx.cfg.tenant), "pvwa": asdict(ctx.cfg.pvwa)},
-                     get_password=make_password_source(allow_prompt=not dry_run, file_passwords=file_passwords))
+                     get_password=make_password_source(allow_prompt=not dry_run, file_passwords=file_passwords),
+                     accounts_only=args.accounts)
     result = None
     run_stopped = False
     cleanup_interrupted = False
@@ -677,7 +718,7 @@ def cmd_plan_apply(ctx: Context, args: argparse.Namespace, dry_run: bool) -> int
             if completed:
                 print("Completed report output(s): " + ", ".join(map(str, completed)), file=human)
             print("The operation results above still apply. A report-saving failure does not undo tenant changes.", file=human)
-        if not dry_run and checkpoint_path.is_file():
+        if not dry_run and checkpoint is not None and checkpoint_path.is_file():
             print(f"Checkpoint: {checkpoint_path} ({checkpoint.done_count()} row(s) complete; re-run with --resume to skip them)",
                   file=human)
     except KeyboardInterrupt:
@@ -718,21 +759,27 @@ def cmd_verify(ctx: Context, args: argparse.Namespace) -> int:
     rec = Reconciler(sia=ctx.sia, uap=ctx.uap, resolver=resolver, inputs=inputs, defaults=ctx.cfg.defaults, dry_run=True,
                      drift=bool(args.drift), lookup=args.lookup, lookup_search_max_rows=ctx.cfg.http.lookup_search_max_rows,
                      workers=args.workers, status_polls=1, progress_every=0,
-                     get_password=make_password_source(allow_prompt=False))
+                     get_password=make_password_source(allow_prompt=False), accounts_only=args.accounts)
     result = rec.run()
     args._result_data = result_dict(result)
     args._result_data["mode"] = "verify"
     problems = print_verify(result, verbose=args.verbose)
+    missing_items: list[tuple[str, str]] = []
     for row in result.servers:
         missing = [name for name, outcome in (("strong account", row.secret), ("target set", row.target_set), ("policy", row.policy))
                    if outcome.status == "planned"]
         if missing:
-            diagnostic = Diagnostic(code="SIA-MISSING", message=f"Missing {', '.join(missing)} for {row.fqdn}.",
-                                    actions=("Run plan with the same configuration and input/server options to review what is missing.",
-                                             "Apply the reviewed plan, then run verify again."), stage="Verification", object_name=row.fqdn,
-                                    mutation_state="not_applicable")
-            args._result_data.setdefault("diagnostics", []).append(diagnostic.to_dict())
-            render_diagnostic(diagnostic, sys.stdout, verbose=args.verbose)
+            missing_items.append((row.fqdn, f"Missing {', '.join(missing)} for {row.fqdn}."))
+    if result.accounts_only:
+        missing_items += [(a.name, f"Missing strong account {a.name} for {a.address}.")
+                          for a in result.accounts if a.secret.status == "planned"]
+    for object_name, message in missing_items:
+        diagnostic = Diagnostic(code="SIA-MISSING", message=message,
+                                actions=("Run plan with the same configuration and input/server options to review what is missing.",
+                                         "Apply the reviewed plan, then run verify again."), stage="Verification", object_name=object_name,
+                                mutation_state="not_applicable")
+        args._result_data.setdefault("diagnostics", []).append(diagnostic.to_dict())
+        render_diagnostic(diagnostic, sys.stdout, verbose=args.verbose)
     args._result_data["ok"] = not problems
     args._result_data["exit_code"] = EXIT_FAILURES if problems else EXIT_OK
     if args.out:

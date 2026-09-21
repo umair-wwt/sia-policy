@@ -137,6 +137,11 @@ Details worth knowing:
 - Principal resolution stays single-threaded (the resolver cache is not thread-safe and principals are few); reads,
   creates and existing-policy comparisons fan out on a `ThreadPoolExecutor`.
 - `--only <stage>` disables writes for the other stages; lookups and comparisons still run for everything.
+- **Accounts-only variant (`--accounts`).** Step 1 parses the rows without principals or policy names
+  (`ParseContext.accounts_only`), step 2 reads strong accounts only (no template policy, no target sets, no
+  policies, no principals), and reconciliation runs 5a and 5b only. `result.servers` stays empty and
+  `RunResult.accounts` (one `AccountResult` per active strong account, filled in both modes) is the unit of the
+  table, the reports and the verify verdicts; nothing is checkpointed. Linux rows are skipped with a warning.
 - A row is written to the checkpoint only after every stage has a complete good status and required object reference
   (apply only). `uncertain`, `unverified`, malformed and incomplete outcomes are reconciled again.
 
@@ -199,6 +204,25 @@ with different strong accounts or types. Every row sharing a target set therefor
 | Not found, `vault`/`credentials`, apply | `created` |
 | Not found, plan | `planned` (credentials without a password: `planned` with a note) |
 | `credentials` without a password, apply | `failed` (password order: env var → password file → interactive prompt, at most five prompts) |
+
+### Accounts-only onboarding (`--accounts`)
+
+The same `_ensure_vault` / `_ensure_secrets` matrix, keyed on the accounts the listed non-SSH rows resolve to
+(`_active_accounts()`), without the stages that need a principal. `Reconciler(accounts_only=True)` refuses
+`resume`, `update`, `set_policy_status` and any `only` outside `ACCOUNT_STAGES` (`all`, `vault`, `secrets`), and a
+server-mode reconciler refuses inputs parsed with `accounts_only` (their rows carry no principals). The CLI
+mirrors this in `check_accounts_flags()`.
+
+| Situation | `AccountResult` |
+|---|---|
+| Vault stage not configured, or the account is not `type=vault` | `vault = n/a`, secret as in the strong-account table |
+| Vault stage failed | `vault` bad, `secret = blocked` |
+| Run stopped before the account was reached | `secret = blocked` (abort reason) |
+| verify verdict | worst of the two outcomes: `n/a`/`exists`/`created` → PASS, `planned` → MISSING, `skipped` → SKIP, the rest FAIL |
+
+`RunResult.failures` counts not-ok accounts in this mode, so the exit code is 1 when any account failed.
+The JSON report carries `scope: "accounts"` and `accounts: [...]`; `mode` stays `plan`/`apply`/`verify` and the
+report files are `plan-accounts-<stamp>` / `apply-accounts-<stamp>`.
 
 ### Target set (`_ensure_target_sets` / `_reconcile_existing_target_set`)
 
@@ -480,6 +504,10 @@ PascalCase; PVWA uses camelCase.
 
 Headers on every call: `Authorization: Bearer <token>` (PVWA: the raw token), `Accept: application/json`, `X-IDAP-NATIVE-CLIENT: true`.
 
+An accounts-only run (`--accounts`) adds no call: it uses the strong-account reads and creates above and nothing else.
+The local-account body is the `credentials` one below with `"account_domain": "local"`, which is exactly the
+`LocalSecretDetails` example of CyberArk's strong-account OpenAPI spec (`20260125_dpa-rdp-strong-account-public-api.json`).
+
 **Strong account (vault reference)** — `POST /api/secrets/public/v1` (or `/api/secrets`):
 
 ```json
@@ -612,7 +640,8 @@ python -m pytest                 # fully offline
   two policies per server, snapshot-once preview + apply, checkpoint/resume with edited rows, progress, per-account
   target-set listing, conflict reclassification, bounded drift reads, rename detection with claimed names,
   fail-fast vs `--keep-going`, uncertain 5xx, ownership and adoption, the vault stage, template cloning, SSH rows,
-  `--workers` with the canary, `--only`.
+  `--workers` with the canary, `--only`; the accounts-only run (secrets-only snapshot, the password matrix, type
+  mismatch, canary + workers, waves, stage gating, the vault stage, `AccountResult` in both modes).
 - `tests/test_http_auth_clients.py`: both auth adapters, the retry policy, the rate limiter, redaction, the SIA
   probe and both path families, secrets v2/v1 pagination, per-account target sets, UAP filters, PVWA calls.
 - `tests/test_inputs.py` / `tests/test_config.py` / `tests/test_settings.py`: strict types and semantic validation,
@@ -632,8 +661,9 @@ python -m pytest                 # fully offline
 - `tests/test_console.py`, `tests/test_starter.py`, `tests/test_shell_dispatch.py`: completion and history boundaries,
   narrow/plain rendering, starter-file preservation and concurrent creation, and help/parser recovery in the shell.
 - `tests/test_cli.py`: the real CLI against the fake tenant (legacy and new commands, structured/JSON failures,
-  prompts, exit codes, resume, waves, the vault stage, redacted unexpected errors). CLI tests pass `--checkpoint`
-  so nothing is written into `input/`.
+  prompts, exit codes, resume, waves, the vault stage, redacted unexpected errors, `--accounts` plan/apply/verify
+  end to end with the password file keyed by FQDN, the account reports and the rejected flag combinations). CLI
+  tests pass `--checkpoint` so nothing is written into `input/`.
 - `tests/conftest.py` resets the redaction registry between tests.
 - `tests/test_windows_install.py`: interpreter/runtime selection, pip repair, source fingerprints, failed-candidate
   cleanup, pointer publication, and preservation of user files. Subprocess boundaries are injected for offline tests.
@@ -688,6 +718,7 @@ table before the first bulk `apply`.
 |---|---|
 | New policy field or behaviour (e.g. domain ephemeral user) | `payloads.build_policy` (+ golden test), possibly a new `servers.csv` column in `inputs.py` |
 | Another way to derive a row's principal / account / target set | `inputs._resolve_principals` / `_resolve_strong_account` / `_resolve_target_set` — one function each, called from `_build_server_row` |
+| A new onboarding scope (e.g. target sets only, like `--accounts`) | `ParseContext`/`Inputs.accounts_only` (what a row needs), `Reconciler(accounts_only=)` and the stage list in `reconcile()`, the `RunResult.accounts_only` branches in `report.py`, `sia_onboard.check_accounts_flags`, the `scope` step in `terminal._workflow_steps`, a `help.py` topic |
 | A new name-template placeholder | three places in step: `config.TEMPLATE_PLACEHOLDERS`, `inputs._render_name`, `payloads.render` |
 | Credentials from a secret store instead of `.env` | a `sia/ccp.py` sibling of `sia/pvwa.py`, called from `sia_onboard.resolve_client_secret` |
 | New strong-account option (e.g. ephemeral domain user settings) | `payloads.build_secret_payload` `secret_details`, `inputs.StrongAccountRow`, `config.StrongAccountTemplate` |

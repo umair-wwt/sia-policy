@@ -56,6 +56,7 @@ from .redact import register_secret
 from .resolve import PrincipalResolver, ResolveError, SecretIndex, pick, secret_id_of, secret_type_of
 
 STAGES = ("all", "vault", "secrets", "targetsets", "policies")
+ACCOUNT_STAGES = ("all", "vault", "secrets")   # what an accounts-only run (--accounts) can write
 LOOKUP_MODES = ("auto", "search", "list")
 BULK_CHUNK = 50
 MAX_WORKERS = 16
@@ -227,6 +228,22 @@ class ServerResult:
 
 
 @dataclass
+class AccountResult:
+    """One strong account of an accounts-only run (--accounts): its Vault stage and its SIA secret."""
+    name: str
+    type: str
+    sia_name: str
+    username: str
+    address: str
+    vault: Outcome = field(default_factory=Outcome)
+    secret: Outcome = field(default_factory=Outcome)
+
+    @property
+    def ok(self) -> bool:
+        return not (self.vault.bad or self.secret.bad)
+
+
+@dataclass
 class RunResult:
     mode: str
     servers: list[ServerResult] = field(default_factory=list)
@@ -239,10 +256,15 @@ class RunResult:
     incomplete: bool = False
     interrupted: bool = False
     diagnostics: list[dict[str, Any]] = field(default_factory=list)
+    accounts: list[AccountResult] = field(default_factory=list)   # one per active strong account, in both modes
+    accounts_only: bool = False                                    # --accounts: servers is empty, accounts are the unit
 
     @property
     def failures(self) -> int:
-        """Rows that are not fully OK. A failed strong account always surfaces here through the rows it blocks."""
+        """Rows that are not fully OK. A failed strong account always surfaces here through the rows it blocks.
+        An accounts-only run has no rows, so its accounts are counted instead."""
+        if self.accounts_only:
+            return sum(1 for a in self.accounts if not a.ok)
         return sum(1 for s in self.servers if not s.ok)
 
     def by_key(self) -> dict[tuple[str, str], ServerResult]:
@@ -259,7 +281,7 @@ class Reconciler:
                  checkpoint: Checkpoint | None = None, resume: bool = False, progress_every: int = 100,
                  pvwa: Any = None, pvwa_platform_id: str = "WinServerLocal", pvwa_cpm_managed: bool = True,
                  set_policy_status: str | None = None, suspended_ok: bool = False,
-                 reconciliation_context: dict[str, Any] | None = None):
+                 reconciliation_context: dict[str, Any] | None = None, accounts_only: bool = False):
         if only not in STAGES:
             raise ValueError(f"only must be one of {STAGES}")
         if lookup not in LOOKUP_MODES:
@@ -272,6 +294,14 @@ class Reconciler:
             raise ValueError("set_policy_status requires update=True")
         if set_policy_status is not None and only not in ("all", "policies"):
             raise ValueError("set_policy_status requires only='all' or only='policies'")
+        if accounts_only:
+            if only not in ACCOUNT_STAGES:
+                raise ValueError(f"an accounts-only run can write only these stages: {ACCOUNT_STAGES}")
+            if resume or update or set_policy_status is not None:
+                raise ValueError("accounts_only cannot be combined with resume, update or set_policy_status")
+        elif getattr(inputs, "accounts_only", False):
+            # Rows parsed for --accounts carry no principals; a server run would build policies nobody may use.
+            raise ValueError("inputs were parsed for accounts-only onboarding (no principals); pass accounts_only=True")
         self.sia, self.uap, self.resolver, self.inputs, self.defaults = sia, uap, resolver, inputs, defaults
         self.dry_run, self.update, self.only, self.fail_fast = dry_run, update, only, fail_fast
         self.drift = update if drift is None else drift
@@ -282,6 +312,7 @@ class Reconciler:
         self.progress_every = max(0, progress_every)
         self.pvwa, self.pvwa_platform_id, self.pvwa_cpm_managed = pvwa, pvwa_platform_id, pvwa_cpm_managed
         self.set_policy_status = set_policy_status
+        self.accounts_only = accounts_only
         # plan/apply with [defaults] policy_status = "Suspended" (a staged rollout): an existing Suspended policy is
         # the requested state. verify never sets this -- users still cannot connect through a suspended policy.
         self.suspended_ok = suspended_ok
@@ -321,7 +352,8 @@ class Reconciler:
         """Read the tenant once: template policy, strong accounts, target sets and policies for the rows to process."""
         self._snapshot_warnings = []
         self._secret_listing = None
-        self._template = self._load_template()
+        # An accounts-only run builds no policy, so the template policy (a UAP read) is not needed.
+        self._template = None if self.accounts_only else self._load_template()
         self._checkpoint_context = self._build_checkpoint_context()
         self._plan_rows()
         if self.checkpoint is not None:
@@ -337,21 +369,26 @@ class Reconciler:
         # Per-stage timings: a slow tenant read is otherwise a single unbroken gap in the log, with nothing to say
         # which of the four reads spent the time.
         timings: list[str] = []
-        for label, read in (("secrets", lambda: self._snapshot_secrets(accounts)),
-                            ("target sets", lambda: self._snapshot_target_sets(target_set_names, accounts,
-                                                                              target_set_spellings)),
-                            ("policies", lambda: self._snapshot_policies(fqdns)),
-                            ("principals", self._snapshot_principals)):
+        reads: list[tuple[str, Callable[[], None]]] = [("secrets", lambda: self._snapshot_secrets(accounts))]
+        if not self.accounts_only:   # --accounts touches no target set, policy or principal, so it reads none
+            reads += [("target sets", lambda: self._snapshot_target_sets(target_set_names, accounts, target_set_spellings)),
+                      ("policies", lambda: self._snapshot_policies(fqdns)),
+                      ("principals", self._snapshot_principals)]
+        for label, read in reads:
             started = time.monotonic()
             pages_before = self._pages_read()
             read()
             pages = self._pages_read() - pages_before
             elapsed = f"{time.monotonic() - started:.1f}s"
             timings.append(f"{label} {elapsed}/{pages} page{'s' if pages != 1 else ''}" if pages else f"{label} {elapsed}")
-        self._log.info("Tenant snapshot (%s lookup): %d strong accounts, %d target sets, %d policies read for %d rows "
-                       "(%d resumed) [%s]",
-                       self._lookup_mode, len(self._secrets), len(self._target_sets), len(self._policies), len(self._rows),
-                       len(self._resumed), ", ".join(timings))
+        if self.accounts_only:
+            self._log.info("Tenant snapshot (%s lookup): %d strong accounts read for %d servers [%s]",
+                           self._lookup_mode, len(self._secrets), len(fqdns), ", ".join(timings))
+        else:
+            self._log.info("Tenant snapshot (%s lookup): %d strong accounts, %d target sets, %d policies read for %d rows "
+                           "(%d resumed) [%s]",
+                           self._lookup_mode, len(self._secrets), len(self._target_sets), len(self._policies), len(self._rows),
+                           len(self._resumed), ", ".join(timings))
         self._snapshotted = True
 
     def reconcile(self, dry_run: bool | None = None) -> RunResult:
@@ -360,7 +397,8 @@ class Reconciler:
             self.dry_run = dry_run
         if not self._snapshotted:
             self.snapshot()
-        result = RunResult(mode="plan" if self.dry_run else "apply", resumed=len(self._resumed), lookup_mode=self._lookup_mode)
+        result = RunResult(mode="plan" if self.dry_run else "apply", resumed=len(self._resumed), lookup_mode=self._lookup_mode,
+                           accounts_only=self.accounts_only)
         result.warnings.extend(self.inputs.warnings)
         result.warnings.extend(self._snapshot_warnings)
         self._result = result
@@ -388,15 +426,24 @@ class Reconciler:
             ordered[key] = sr
         for _server, sr in self._rows:
             ordered[sr.key] = sr
-        # keep CSV order
-        result.servers = [ordered[(s.fqdn, policy_name_for(s, self.defaults))] for s in self.inputs.servers
-                          if (s.fqdn, policy_name_for(s, self.defaults)) in ordered]
+        # keep CSV order; an accounts-only run reports accounts, not rows
+        if not self.accounts_only:
+            result.servers = [ordered[(s.fqdn, policy_name_for(s, self.defaults))] for s in self.inputs.servers
+                              if (s.fqdn, policy_name_for(s, self.defaults)) in ordered]
         try:
-            self._flag_duplicate_policy_names(result)
-            self._ensure_vault(result)
-            self._ensure_secrets(result)
-            self._ensure_target_sets(result)
-            self._ensure_policies(result)
+            if self.accounts_only:
+                skipped = sum(1 for s, _ in self._rows if s.is_ssh)
+                if skipped:
+                    result.warnings.append(f"{skipped} ssh row(s) skipped: Linux ZSP uses an SSH certificate, not a strong account")
+                self._ensure_vault(result)
+                self._ensure_secrets(result)
+            else:
+                self._flag_duplicate_policy_names(result)
+                self._ensure_vault(result)
+                self._ensure_secrets(result)
+                self._ensure_target_sets(result)
+                self._ensure_policies(result)
+            result.accounts = self._account_results(result)
         except (Exception, KeyboardInterrupt) as exc:
             self._abort("Interrupted by operator" if isinstance(exc, KeyboardInterrupt) else str(exc))
             self._finish_partial(result, exc)
@@ -421,6 +468,7 @@ class Reconciler:
                                  self._blocked_by_abort())
             if sr.policy.status == "pending":
                 sr.policy = self._blocked_by_abort()
+        result.accounts = self._account_results(result)
         outcomes = [o for sr in result.servers for o in (sr.secret, sr.target_set, sr.policy)]
         outcomes += list(result.secrets.values()) + list(result.vault.values())
         state = ("unknown" if any(o.status == "uncertain" for o in outcomes) else
@@ -478,6 +526,27 @@ class Reconciler:
     def _active_accounts(self) -> list[StrongAccountRow]:
         names = {s.strong_account for s, _ in self._rows if s.strong_account and not s.is_ssh}
         return [a for n, a in self.inputs.strong_accounts.items() if n in names]
+
+    def _account_results(self, result: RunResult) -> list[AccountResult]:
+        """One AccountResult per active strong account, in the order the servers list first names them: the unit
+        of an accounts-only run, informational in a server run."""
+        first_seen: dict[str, int] = {}
+        for server, _ in self._rows:
+            if server.strong_account and not server.is_ssh:
+                first_seen.setdefault(server.strong_account, len(first_seen))
+        out: list[AccountResult] = []
+        for account in sorted(self._active_accounts(), key=lambda a: first_seen.get(a.name, len(first_seen))):
+            secret = result.secrets.get(account.name)
+            if secret is None:   # the run stopped before this account was reached
+                secret = self._blocked_by_abort() if self._abort_reason else Outcome("unverified", "no result recorded")
+            vault = result.vault.get(account.name)
+            if vault is None:
+                vault = Outcome(NOT_APPLICABLE, "Vault stage off ([pvwa] not configured)" if account.type == "vault"
+                                else f"Vault stage not applicable (type={account.type})")
+            out.append(AccountResult(name=account.name, type=account.type, sia_name=account.sia_name,
+                                     username=account.username or "", address=account.address or self._address_for(account),
+                                     vault=vault, secret=secret))
+        return out
 
     def _choose_lookup(self, unique_fqdns: int) -> str:
         if self.lookup != "auto":
@@ -1048,7 +1117,8 @@ class Reconciler:
                     result.vault[account.name] = Outcome("planned", f"would onboard {what} for {address} (password from the password file, not available now)")
                     continue
                 result.vault[account.name] = Outcome(
-                    "failed", f"{what} is missing and its current password is not available: add {account.name!r} to the password file")
+                    "failed", f"{what} is missing and its current password is not available: add {account.name!r} "
+                              "(or its server FQDN) to the password file")
                 continue
             if self.dry_run:
                 result.vault[account.name] = Outcome("planned", f"would onboard {what} for {address} (platform {self.pvwa_platform_id})")
@@ -1162,8 +1232,8 @@ class Reconciler:
                     continue
                 if not password:
                     result.secrets[account.name] = Outcome(
-                        "failed", f"password not available: set env var {account.password_env}, add {account.name!r} to the password file, "
-                                  "or run interactively to be prompted")
+                        "failed", f"password not available: set env var {account.password_env}, add {account.name!r} "
+                                  "(or its server FQDN) to the password file, or run interactively to be prompted")
                     continue
             if self.dry_run:
                 result.secrets[account.name] = Outcome("planned", f"would create {what}")
