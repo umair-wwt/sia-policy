@@ -32,7 +32,10 @@ every possible tenant response, operating-system failure, or abrupt process term
 | Policy listing omits principals | Read full details; report unverified if the full response still cannot establish the principals. |
 | Accepted policy write or target-set update reads back different settings | Retry reads within the polling limit; retain the object reference and report unverified (naming each differing policy field as `tenant -> requested`) without a completed checkpoint if it does not match. |
 | Version-2 checkpoint | Preserve the file and reconcile the row again under version-3 verification rules. |
+| Checkpoint written before or by 4b5eacc | Inferred account addresses are kept out of the fingerprint, so records written before 4b5eacc resume unchanged. Records 4b5eacc itself wrote for inputs with a declared local account used by one server are rechecked once on `apply --resume` after the upgrade; nothing is recreated and the rows report `exists`. |
 | Interrupted run or checkpoint failure | Stop new write scheduling, retain in-flight results, block unattempted work, and keep partial object references. |
+| Interrupted or uncertain `--accounts` run | No checkpoint exists and `--drift`/`--resume` are rejected, so the advice is `sia plan --accounts` with the same input; `apply --accounts` again reports existing accounts as `exists` and creates only missing ones. |
+| Interrupted `plan` or `verify` | Nothing was changed; the advice is to run the same command again, not `apply --resume`. |
 | Failed or interrupted report publication | Preserve tenant results and list completed output paths; local output failure does not undo tenant changes. |
 | Closed console pipe after tenant work | Attempt durable reports before rendering the final summary. |
 | Export collision or staging failure | Preserve existing generated outputs, reserve distinct names, and stage complete files before publication. |

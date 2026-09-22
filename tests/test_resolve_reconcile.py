@@ -1388,7 +1388,7 @@ def test_accounts_only_password_matrix():
     result = make(ACCOUNT_ROWS, accounts_only=True, passwords={})[0].run()
     assert all(a.secret.status == "failed" for a in result.accounts) and result.failures == 2
     detail = result.accounts[0].secret.detail
-    assert "SIA_SA_ADM_SRV01_PASSWORD" in detail and "server FQDN" in detail
+    assert "SIA_SA_ADM_SRV01_PASSWORD" in detail and "(or 'srv01.example.com')" in detail
 
 
 def test_accounts_only_type_mismatch_and_inactive_fail():

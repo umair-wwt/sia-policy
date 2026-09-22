@@ -38,13 +38,14 @@ from collections import Counter
 from dataclasses import asdict, replace
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Iterable
 
 from sia.auth import AuthError, PlatformTokenProvider, make_identity_token_provider
 from sia.checkpoint import DEFAULT_NAME as CHECKPOINT_NAME
 from sia.checkpoint import Checkpoint
 from sia.clients import IdentityClient, PerAccountTargetSetListingRequired, SIAClient, UAPClient
 from sia.config import PRINCIPAL_RENAME_HINT, Config, ConfigError, load_config, load_password_file
-from sia.diagnostics import Diagnostic, diagnose, render_diagnostic, sanitize
+from sia.diagnostics import Diagnostic, diagnose, for_accounts_scope, render_diagnostic, sanitize
 from sia.connect import build_rows, login_suffix, write_connection_outputs
 from sia.http import HttpClient, RateLimiter, SIAApiError
 from sia.inputs import LIST_SEPARATOR, InputError, Inputs, StrongAccountRow, inline_inputs, load_inputs
@@ -155,8 +156,10 @@ def add_global_flags(parser: argparse.ArgumentParser, *, root: bool = False) -> 
     parser.add_argument("--json", action="store_true", default=default(False), help="machine-readable result on stdout; messages on stderr")
 
 
-ACCOUNTS_HELP = ("onboard only the strong accounts of the listed servers ([defaults] strong_account_*), stored in SIA; no target "
-                 "sets or policies. A later plan/apply for the same servers reports them as exists")
+ACCOUNTS_HELP = ("onboard only the strong accounts of the listed servers ([defaults] strong_account_*; set domain_joined = no "
+                 "for standalone servers), no target sets or policies. A later plan/apply for the same servers reports them as exists")
+VERIFY_ACCOUNTS_HELP = ("check only the strong accounts of the listed servers (and, with [pvwa] configured, their Vault "
+                        "accounts); no target sets or policies")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -217,7 +220,7 @@ def build_parser() -> argparse.ArgumentParser:
             p.add_argument("--yes", "-y", action="store_true", help="do not ask for confirmation")
     vp = sub.add_parser("verify", help="check that every row's objects exist and its policy is Active (read-only)")
     add_input_flags(vp)
-    vp.add_argument("--accounts", action="store_true", help=ACCOUNTS_HELP)
+    vp.add_argument("--accounts", action="store_true", help=VERIFY_ACCOUNTS_HELP)
     vp.add_argument("--drift", action="store_true", help="also compare policy targets (one extra read per policy)")
     vp.add_argument("--out", metavar="FILE", help="write the PASS/FAIL table as CSV")
     cp = sub.add_parser("connect-info", help="export what end users need to connect (read-only, no secrets)")
@@ -425,13 +428,20 @@ def cmd_show_policy(ctx: Context, name: str, from_list: bool = False, save: str 
     return EXIT_OK
 
 
-def make_password_source(allow_prompt: bool, file_passwords: dict[str, str] | None = None, max_prompts: int = MAX_PASSWORD_PROMPTS):
+def make_password_source(allow_prompt: bool, file_passwords: dict[str, str] | None = None, max_prompts: int = MAX_PASSWORD_PROMPTS,
+                         shared_addresses: Iterable[str] = ()):
     """Strong-account passwords, in order: environment variable, password file, then (interactive apply only) a
     no-echo prompt -- at most `max_prompts` prompts per run, after which the password file is the answer. Every
-    value is registered with the redactor."""
-    # The file is keyed by the account name or, for a per-server local account, by its server FQDN; both are matched
-    # case-insensitively (FQDNs are lower-cased on the way in, the file keeps the operator's spelling).
+    value is registered with the redactor.
+
+    shared_addresses: addresses (casefolded) that several strong accounts carry (Inputs.address_owners); a file row
+    keyed by one of them is nobody's password."""
+    # The file is keyed by the account name or by its address -- the server FQDN of a local account used by one
+    # server, or a declared account's explicit address -- both case-insensitively (FQDNs are lower-cased on the way
+    # in, the file keeps the operator's spelling). An address several accounts share (every per-host account of one
+    # AD domain carries the domain) selects none of them: one row must never become many accounts' password.
     folded = {name.casefold(): password for name, password in (file_passwords or {}).items()}
+    shared = frozenset(shared_addresses)
     cache: dict[str, str] = {}
     prompted: list[str] = []
 
@@ -440,7 +450,7 @@ def make_password_source(allow_prompt: bool, file_passwords: dict[str, str] | No
         value = os.environ.get(env_name, "") if env_name else ""
         if not value:
             value = folded.get(account.name.casefold(), "")
-        if not value and account.address:
+        if not value and account.address and account.address.casefold() not in shared:
             value = folded.get(account.address.casefold(), "")
         if not value:
             value = cache.get(account.name, "")
@@ -463,6 +473,40 @@ def make_password_source(allow_prompt: bool, file_passwords: dict[str, str] | No
 
 SERVER_ONLY_FLAGS = (("principal", "--principal"), ("strong_account", "--strong-account"), ("server_domain", "--server-domain"),
                      ("workgroup", "--workgroup"), ("protocol", "--protocol"), ("ssh_username", "--ssh-username"))
+
+
+def password_file_warnings(file_passwords: dict[str, str], inputs: Inputs) -> list[str]:
+    """What the password file's keys fail to select, and why: an address that keys no password (several accounts
+    carry it, or it is a templated domain account's AD domain), a listed server whose account no FQDN selects
+    (shared by several servers, or not a local account), or nothing at all."""
+    owners = inputs.address_owners()
+    shared_addresses = inputs.shared_addresses()
+    names = {a.name.casefold() for a in inputs.strong_accounts.values()}
+    servers = {s.fqdn.casefold(): s.strong_account for s in inputs.servers if s.strong_account and not s.is_ssh}
+    shared, unkeyed, unknown = [], [], []
+    for key in sorted(file_passwords):
+        folded = key.casefold()
+        if folded in names or (folded in owners and folded not in shared_addresses):
+            continue
+        if folded in owners:
+            shared.append(f"{key} ({', '.join(sorted(owners[folded])[:3])}{' ...' if len(owners[folded]) > 3 else ''})")
+        elif folded in servers:
+            unkeyed.append(f"{key} ({servers[folded]})")
+        else:
+            unknown.append(key)
+    warnings = []
+    if shared:
+        warnings.append(f"password file key(s) carried as address by several strong accounts (or a templated domain "
+                        f"account's AD domain), so ignored for all of them: {', '.join(shared[:10])}; key those "
+                        "passwords by account name")
+    if unkeyed:
+        warnings.append(f"password file key(s) name a listed server whose strong account no server FQDN selects (an account "
+                        f"shared by several servers, or a domain account): {', '.join(unkeyed[:10])}; key it by account "
+                        "name, or set its address in strong_accounts.csv")
+    if unknown:
+        warnings.append(f"password file lists {len(unknown)} name(s) that match no strong account name or address: "
+                        f"{', '.join(unknown[:10])}")
+    return warnings
 
 
 def check_server_flags(args: argparse.Namespace) -> None:
@@ -547,15 +591,12 @@ def cmd_plan_apply(ctx: Context, args: argparse.Namespace, dry_run: bool) -> int
     inputs = load_wave(ctx, args)
     file_passwords: dict[str, str] = {}
     password_file = args.passwords or ctx.cfg.auth.password_file
+    shared_addresses = inputs.shared_addresses()
     if password_file:
         file_passwords = load_password_file(password_file)
-        known = {a.name.casefold() for a in inputs.strong_accounts.values()}
-        known |= {a.address.casefold() for a in inputs.strong_accounts.values() if a.address}
-        unknown = sorted(name for name in file_passwords if name.casefold() not in known)
         log.info("Loaded passwords for %d strong account(s) from %s", len(file_passwords), password_file)
-        if unknown:
-            log.warning("password file lists %d name(s) that match no strong account name or server FQDN: %s",
-                        len(unknown), ", ".join(unknown[:10]))
+        for warning in password_file_warnings(file_passwords, inputs):
+            log.warning("%s", warning)
     checkpoint_path = Path(args.checkpoint) if args.checkpoint else Path(args.input) / CHECKPOINT_NAME
     # --accounts completes no server row, so it neither reads nor writes the checkpoint.
     checkpoint: Checkpoint | None = None if args.accounts else Checkpoint(checkpoint_path)
@@ -590,8 +631,9 @@ def cmd_plan_apply(ctx: Context, args: argparse.Namespace, dry_run: bool) -> int
                      pvwa=pvwa, pvwa_platform_id=ctx.cfg.pvwa.platform_id, pvwa_cpm_managed=ctx.cfg.pvwa.cpm_managed,
                      set_policy_status=args.set_policy_status, suspended_ok=d.policy_status == "Suspended",
                      reconciliation_context={"tenant": asdict(ctx.cfg.tenant), "pvwa": asdict(ctx.cfg.pvwa)},
-                     get_password=make_password_source(allow_prompt=not dry_run, file_passwords=file_passwords),
-                     accounts_only=args.accounts)
+                     get_password=make_password_source(allow_prompt=not dry_run, file_passwords=file_passwords,
+                                                       shared_addresses=shared_addresses),
+                     accounts_only=args.accounts, pvwa_configured=ctx.cfg.pvwa.enabled)
     result = None
     run_stopped = False
     cleanup_interrupted = False
@@ -693,7 +735,8 @@ def cmd_plan_apply(ctx: Context, args: argparse.Namespace, dry_run: bool) -> int
             diagnostic = (Diagnostic(
                 code="SIA-INTERRUPTED",
                 message="Report publication was interrupted; tenant results were retained below.",
-                actions=("Keep any completed report paths listed in the diagnostic, then run plan --drift before another apply.",),
+                actions=("Keep any completed report paths listed in the diagnostic, then run "
+                         + ("`sia plan --accounts`" if args.accounts else "plan --drift") + " before another apply.",),
                 stage="Saving reports",
                 mutation_state=mutation_state,
                 details=base.details,
@@ -767,7 +810,8 @@ def cmd_verify(ctx: Context, args: argparse.Namespace) -> int:
                          drift=bool(args.drift), lookup=args.lookup, lookup_search_max_rows=ctx.cfg.http.lookup_search_max_rows,
                          workers=args.workers, status_polls=1, progress_every=0,
                          pvwa=pvwa, pvwa_platform_id=ctx.cfg.pvwa.platform_id, pvwa_cpm_managed=ctx.cfg.pvwa.cpm_managed,
-                         get_password=make_password_source(allow_prompt=False), accounts_only=args.accounts)
+                         get_password=make_password_source(allow_prompt=False), accounts_only=args.accounts,
+                         pvwa_configured=ctx.cfg.pvwa.enabled)
         result = rec.run()
     except (Exception, KeyboardInterrupt) as exc:
         result = getattr(exc, "partial_result", None)
@@ -808,7 +852,8 @@ def cmd_verify(ctx: Context, args: argparse.Namespace) -> int:
             missing = [name for name, outcome in (("Vault account", account.vault), ("strong account", account.secret))
                        if outcome.status == "planned"]
             if missing:
-                missing_items.append((account.name, f"Missing {', '.join(missing)} {account.name} for {account.address}."))
+                where = f"for {account.address}" if account.address else "(a local account shared by several servers)"
+                missing_items.append((account.name, f"Missing {', '.join(missing)} {account.name} {where}."))
     for object_name, message in missing_items:
         diagnostic = Diagnostic(code="SIA-MISSING", message=message,
                                 actions=("Run plan with the same configuration and input/server options to review what is missing.",
@@ -899,10 +944,14 @@ def emit_failure(exc: BaseException, args, session: Session, *, code: int | None
     if isinstance(exc, (EOFError, KeyboardInterrupt)):
         diagnostic = Diagnostic(code="SIA-INTERRUPTED" if code == 130 else "SIA-CANCELLED",
                                 message="Operation interrupted." if code == 130 else "Input closed; the operation was cancelled.",
-                                actions=("Run plan --drift to check current state before continuing." if mutation_state else "Run the command again when ready.",),
+                                actions=((f"Run {'`sia plan --accounts`' if getattr(args, 'accounts', False) else 'plan --drift'} "
+                                          "to check current state before continuing.") if mutation_state else
+                                         "Run the command again when ready.",),
                                 mutation_state=mutation_state or "not_applied")
     else:
         diagnostic = diagnose(exc, stage=getattr(args, "command", "Command") or "Command", mutation_state=mutation_state)
+        if getattr(args, "accounts", False):
+            diagnostic = for_accounts_scope(diagnostic)
         if interrupted:
             diagnostic = replace(
                 diagnostic, code="SIA-INTERRUPTED", message="Output publication was interrupted.",
@@ -918,6 +967,9 @@ def emit_failure(exc: BaseException, args, session: Session, *, code: int | None
                           "diagnostics": session.last_diagnostics}, indent=2))
     log.debug("diagnostic traceback:\n%s", redact("".join(traceback.format_exception(exc))))
     return code
+
+
+SERVER_RUN_CHECKS = ("Targets", "Policies", "Identity")
 
 
 def run_doctor(args, session: Session) -> int:
@@ -936,13 +988,27 @@ def run_doctor(args, session: Session) -> int:
             render_diagnostic(diagnostic, human, verbose=args.verbose)
             online_checks.append({"name": "Tenant authentication", "status": "failed", "message": diagnostic.message,
                                   "diagnostic": diagnostic.to_dict()})
+        if getattr(args, "accounts", False):
+            # An accounts-only run reads strong accounts (and the Vault) only; target sets, policies and Identity
+            # matter to the later server run for the same servers, so they are reported, not failed.
+            later = [check for check in online_checks
+                     if check["name"] in SERVER_RUN_CHECKS and check["status"] == "failed"]
+            for check in later:
+                check["status"] = "warning"
+                check["message"] = f"not used by --accounts; the later server run needs it: {check['message']}"
+                if check.get("diagnostic"):
+                    check["diagnostic"] = {**check["diagnostic"], "severity": "warning"}
+            if later:
+                print(f"[NOTE] --accounts: {', '.join(c['name'] for c in later)} failed, which the later server run needs "
+                      "but this accounts-only run does not", file=human)
         checks.extend(online_checks)
     else:
         check = {"name": "Tenant checks", "status": "not checked", "message": "Fix configuration first." if args.online else "Use doctor --online or preflight to check tenant access."}
         checks.append(check)
         print(f"[NOT CHECKED] {check['name']}: {check['message']}", file=human)
     code = EXIT_FAILURES if any(check["status"] == "failed" for check in checks) else EXIT_OK
-    session.last_diagnostics = [check["diagnostic"] for check in checks if check.get("diagnostic")]
+    # Only what failed becomes the terminal's "last problem"; a downgraded check is a note for the later server run.
+    session.last_diagnostics = [check["diagnostic"] for check in checks if check.get("diagnostic") and check["status"] == "failed"]
     print("\nDoctor: " + ("some checks need attention" if code else "checks completed; review warnings and items not checked"), file=human)
     if args.json:
         print(json.dumps(sanitize({"ok": code == 0, "mode": "doctor", "exit_code": code, "checks": checks}), indent=2))
@@ -996,6 +1062,9 @@ def execute(args: argparse.Namespace, session: Session) -> int:
                 return EXIT_USAGE
         if args.command == "doctor":
             return run_doctor(args, session)
+        if args.command in ("plan", "apply", "verify"):
+            # The terminal's guided /doctor offers --accounts after an accounts run (parsed, so --acc counts too).
+            session.last_scope_accounts = bool(getattr(args, "accounts", False))
         cfg = read_config(args)
         if args.command in ("plan", "apply", "verify", "connect-info"):
             # Every CSV is validated before authentication or tenant reads.

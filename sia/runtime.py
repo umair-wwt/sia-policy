@@ -40,6 +40,7 @@ class Session:
     secrets: dict[str, str] = field(default_factory=dict)
     last_diagnostics: list[dict] = field(default_factory=list)
     last_exit_code: int | None = None
+    last_scope_accounts: bool = False   # the last plan/apply/verify onboarded strong accounts only (--accounts)
     in_home: bool = False
     # Non-secret, in-memory editing state.  Keys are resolved configuration
     # paths so two projects can never resume one another's draft.

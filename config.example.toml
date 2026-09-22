@@ -72,7 +72,12 @@ target_set_scope = "server"
 #   strong_account_type       existing    = only look it up in SIA (it was onboarded there already)
 #                             vault       = create a SIA reference to the account in your Vault (safe + account name)
 #                             credentials = store user name + password in SIA (password from the password file)
-#   For standalone (workgroup) servers, `sia plan/apply --accounts` onboards only these accounts, from a list of FQDNs.
+#   For standalone (workgroup) servers, `sia plan/apply --accounts` onboard only these accounts, from a list of
+#   standalone servers (domain_joined = no in servers.csv, or --workgroup with --server); `sia verify --accounts`
+#   checks them.
+# Two strong-account names that render the same Vault object (safe + account name) would share one credential: for
+# local accounts the input check stops the run (each server's administrator is a different account), for domain
+# accounts it warns. Keep {hostname} (or {fqdn}) in the account-name template.
 strong_account_template = "ADM-{hostname}"
 strong_account_type = "vault"
 strong_account_safe_template = "SIA-LocalAdmins"              # vault: the Safe holding the account
@@ -100,8 +105,10 @@ template_policy = ""
 identity_auth = "platform_token"
 oidc_application = "__idaptive_cybr_user_oidc"
 # Optional CSV with columns name,password (name = strong_accounts.csv name, the name rendered from
-# strong_account_template, or the server FQDN of a per-server local account). Used for type=credentials accounts
-# and for onboarding into the Vault.
+# strong_account_template, or the account's address: the server FQDN of a local account used by one server, or an
+# explicit address). The name is looked up first; an address shared by several credentials/vault accounts, or the AD
+# domain of templated domain accounts, is ignored, so key those by name. Used for type=credentials accounts and for
+# onboarding into the Vault.
 # Keep it OUTSIDE the repository with owner-only permissions; --passwords FILE on the command line overrides this.
 # A relative path here is resolved beside this config.toml file, not beside the shell's working directory.
 password_file = ""
@@ -144,6 +151,9 @@ network = ""              # connector network name to add as "/n <network>" (opt
 [pvwa]
 # Optional: PAM Self-Hosted REST API, used by the `vault` stage to onboard local administrator accounts that are
 # not in the Vault yet (credentials PVWA_USER / PVWA_PASSWORD in .env; passwords of the accounts from the password file).
+# `sia verify --accounts` also uses it, read-only, to look up each selected Vault account; plain verify does not.
+# A local account shared by several servers is found in the Vault without an address, but needs an explicit address
+# in strong_accounts.csv before it is onboarded.
 # Leave base_url empty to disable the stage.
 base_url = ""             # e.g. "https://pvwa.corp.example.com"
 auth_type = "cyberark"    # cyberark | ldap

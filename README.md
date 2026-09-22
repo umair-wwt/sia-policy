@@ -164,8 +164,9 @@ Use `.venv/bin/sia` again in a new terminal, or activate `.venv` to use the shor
 
 **Before the first server**, three things must be true on your side: a local administrator account for every
 server exists in the Vault under the naming convention above (the tool can onboard missing ones through PVWA, see
-the operations guide), the SIA connectors reach the servers over WinRM (TCP 5985/5986), and local accounts have
-`LocalAccountTokenFilterPolicy = 1` (a GPO setting).
+the operations guide), the SIA connectors reach the servers on TCP 445 (SMB, which SIA uses to create and remove the
+temporary user) and TCP 3389 (RDP), and local accounts have `LocalAccountTokenFilterPolicy = 1` (a GPO setting on
+domain-joined servers). WinRM (TCP 5985/5986) is needed only for policies that use ephemeral domain users.
 
 ## Your list: `input/servers.csv`
 
@@ -187,7 +188,7 @@ app-lnx01.corp.example.com,,SIA-Linux-Admins,,,,,,ssh,ec2-user,
 | `assign_groups` | Local groups the temporary user joins; empty = `Administrators`. |
 | `protocol`, `ssh_username` | `ssh` and the certificate user name for Linux servers; empty = Windows/RDP. |
 | `strong_account` | Leave empty. Only for the few servers that need a specific account declared in `strong_accounts.csv`. |
-| `domain_joined` | `no` for a workgroup server, so it gets its own local account instead of its domain's. |
+| `domain_joined` | `no` for a workgroup (standalone) server, so it gets its own local account instead of its domain's. Required for every standalone server in an `--accounts` run. |
 | `policy_name`, `domain`, `description` | Optional overrides; the example file shows them. |
 
 Column names must match exactly; every problem is reported with its line number and nothing is touched until
@@ -330,7 +331,11 @@ Start with one server, test the login as a member of the role, then load the rea
 - Interrupted? Run the same `apply` again with `--resume`. Only complete, verified rows from a matching version-3
   checkpoint are skipped; changed tenant/config/template/input fingerprints, a different `--update`/`--drift`
   choice, and malformed or older records are reconciled again. Version-2 records are preserved and rechecked
-  because their completion checks did not confirm the saved fields after policy and target-set updates.
+  because their completion checks did not confirm the saved fields after policy and target-set updates. Inferred
+  account addresses are not part of the fingerprint, so checkpoints written before 4b5eacc resume unchanged; rows
+  that 4b5eacc itself recorded for a declared local account used by one server are rechecked once (they report
+  `exists`, nothing is recreated). An `--accounts` run has no checkpoint: after an interruption, run
+  `sia plan --accounts` with the same input.
 
 More in [Large rollouts](docs/OPERATIONS.md#6-large-rollouts).
 
@@ -338,7 +343,8 @@ More in [Large rollouts](docs/OPERATIONS.md#6-large-rollouts).
 
 `--server` replaces `servers.csv` for a single run, so a newly built server can be onboarded from the same
 job that builds it. `domains.csv`, `strong_accounts.csv` and `groups.csv` are still read, so the principal and
-strong account resolve exactly as they would in a bulk run:
+strong account resolve exactly as they would in a bulk run. `servers.csv`, when present, is read only to count
+which servers share a declared account (see the password file under *Standalone servers*):
 
 ```bash
 python sia_onboard.py apply --server web09.corp.example.com --yes --json --no-report
@@ -360,12 +366,14 @@ dmz-app01.example.com,no
 dmz-app02.example.com,no
 ```
 
-Set `domain_joined = no` for every standalone server, including an accounts-only run; use `--workgroup` with
-`--server`. Without it, a matching DNS suffix in `domains.csv` can select the domain account instead of the
-server's local account. The account name, the Windows user name and the `local` domain come from the naming
-convention in `config.toml`; `credentials` stores
-the user name and password in the SIA service (the *Stored in SIA* option of the portal), which is what a server
-outside any Vault needs:
+`domain_joined = no` is required for every standalone server, including an accounts-only run; use `--workgroup`
+with `--server`. Without it, a row whose DNS suffix is in `domains.csv` takes that domain's strong account (and a
+row may name another non-local account): an `--accounts` run warns, naming the servers and the account, and does
+not onboard a local administrator per server. A normal server run does not warn, since that is the expected case
+for a domain-joined server. In both modes, a `domain_joined = no` row whose strong account is a domain account
+warns: a workgroup server cannot log on with a domain account. The account name, the Windows user name and the
+`local` domain come from the naming convention in `config.toml`; `credentials` stores the user name and password in
+the SIA service (the *Stored in SIA* option of the portal), which is what a server outside any Vault needs:
 
 ```toml
 [defaults]
@@ -376,7 +384,8 @@ strong_account_domain = "local"
 ```
 
 Passwords come from the password file (`name,password`, kept outside the repository), where the name may be the
-account name **or the server FQDN**, so the list and the password file can be exported from the same inventory:
+account name **or, for a local account used by one server, the server FQDN**, so the list and the password file can
+be exported from the same inventory:
 
 ```csv
 name,password
@@ -384,11 +393,23 @@ dmz-app01.example.com,current-password-1
 dmz-app02.example.com,current-password-2
 ```
 
-For local `credentials` or `vault` accounts declared in `strong_accounts.csv`, a missing `address` is inferred
-when the complete input maps the account to one distinct server. Repeated policy rows for that server count
-once, and wave selection does not change the inference. An explicit address takes precedence. For an account
-shared by several servers, key its password by account name or set an explicit address. In the password file,
-an account-name entry takes precedence over an address entry; both are matched case-insensitively.
+A password-file entry is looked up by the account name first, then by the account's address; both are matched
+case-insensitively. The address of a templated local account is its server's FQDN. So is the address of a local
+`credentials` or `vault` account declared in `strong_accounts.csv` without an `address`, when the complete input
+maps it to exactly one server; repeated policy rows for that server count once, and wave selection does not change
+this. A filled-in `address` is used as given (a declared domain account usually has the AD domain).
+
+An address entry is used only when exactly one `credentials` or `vault` account in the complete input carries that
+address. A templated domain account's address is its AD domain, which every per-host account of that domain
+carries, so it never keys a password, also in a `--server` run that shows only one host. A declared account's
+`address` keys a password only when no other account carries it. When several accounts share an address, the entry
+is ignored for all of them and the run warns: key those passwords by account name. A local account shared by
+several servers has no address, so no FQDN entry reaches it; key its password by account name, or set an explicit
+`address`. A `--server` run resolves the rows of `servers.csv` (when it is in `--input`) as a CSV run would, to see
+which servers use each declared account; if `servers.csv` exists but cannot be read, the run warns and treats
+declared local accounts without an `address` as shared. A shared local `vault` account without an `address` is
+still found in the Vault; only when it is missing there and would be onboarded do `plan` and `apply` report it
+`failed`, because the tool does not pick one of its servers.
 
 Then:
 
@@ -400,16 +421,29 @@ sia apply  --accounts --server dmz-app09.example.com --workgroup --yes --json --
 ```
 
 `--accounts` creates strong accounts only: no target set, no policy, no checkpoint, and no principal is needed
-(`--update`, `--drift`, `--adopt`, `--set-policy-status`, `--resume` and `--principal` are rejected; `--only vault`
-or `--only secrets` still limit the account stages). The table, the reports (`plan-accounts-*.json/.csv`) and the
-`verify` verdicts are per account. Run it again and every account says `exists`; the later `sia apply` for the
-same servers finds the account, reports it as `exists`, and creates only the target set and the policy.
-With `[pvwa]` configured, `verify --accounts` checks each selected Vault account as well as its SIA reference;
-a missing or unreadable Vault account cannot pass verification.
+(`--update`, `--drift`, `--adopt`, `--adopt-all`, `--set-policy-status`, `--resume`, `--principal`,
+`--only targetsets`, `--only policies`, `--protocol ssh` and `--ssh-username` are rejected; `--only vault` or
+`--only secrets` still limit the account stages). The table, the reports (`plan-accounts-*` and
+`apply-accounts-*`, JSON and CSV) and the `verify` verdicts are per account. Run it again and every account says
+`exists`; the later `sia apply` for the same servers finds the account, reports it as `exists`, and creates only the
+target set and the policy.
+With `[pvwa]` configured and a `vault` account selected, `verify --accounts` also logs on to PVWA
+(`PVWA_USER` / `PVWA_PASSWORD`, a user that can list the accounts in the Safe; exit 2 without them) and checks each
+selected Vault account as well as its SIA reference; a missing or unreadable Vault account cannot pass
+verification. Plain `verify` does not check the Vault.
+
+`sia doctor --accounts --input input` validates such a list offline without asking for a principal, and shows
+the domain-account warnings described above. With `--online` it adds the tenant checks; those only the later server
+run needs (Identity, target sets, policies) are reported as warnings.
+
+If an accounts run is interrupted or reports `uncertain`, run `sia plan --accounts` with the same input
+(`--drift` and `--resume` do not apply in this mode); `sia apply --accounts` again reports existing accounts as
+`exists` and creates only the missing ones. An interrupted `plan` or `verify` changed nothing: run it again.
 
 Before the run, on each server: the account is in the local *Administrators* group,
 `LocalAccountTokenFilterPolicy = 1` is set (there is no GPO to push it on a workgroup machine), and the SIA
-connector reaches the server over WinRM. A `credentials` account is stored in SIA and not rotated; see
+connector reaches the server on TCP 445 (SMB) and TCP 3389 (RDP); WinRM is not needed for the temporary local
+user. A `credentials` account is stored in SIA and not rotated; see
 [Standalone (workgroup) servers](docs/OPERATIONS.md#4-strong-accounts-in-detail) for the details and for vaulting
 the accounts later.
 

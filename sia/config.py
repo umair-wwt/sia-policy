@@ -934,8 +934,10 @@ def _warn_if_readable_by_others(path: Path) -> None:
 
 
 def load_password_file(path: str | Path) -> dict[str, str]:
-    """Strong-account passwords from a CSV with columns name,password (name = strong_accounts.csv `name`, or the
-    name rendered from strong_account_template).
+    """Strong-account passwords from a CSV with columns name,password (name = strong_accounts.csv `name`, the name
+    rendered from strong_account_template, or the account's address: the server FQDN of a local account used by one
+    server, or an explicit address -- used only while no other account carries that address, see
+    Inputs.shared_addresses).
 
     Keep this file outside the repository with owner-only permissions. Every password is registered with the
     redactor so it can never appear in logs or error messages.

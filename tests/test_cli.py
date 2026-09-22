@@ -578,7 +578,7 @@ def test_apply_accounts_creates_then_exists_then_server_apply_sees_it(workspace,
     assert "pw-1" not in captured.out + captured.err + caplog.text and "pw-2" not in captured.out + captured.err
     assert not Path(cp(workspace)).exists()
     warnings = [r.getMessage() for r in caplog.records if "password file lists" in r.getMessage()]
-    assert warnings == ["password file lists 1 name(s) that match no strong account name or server FQDN: unrelated"]
+    assert warnings == ["password file lists 1 name(s) that match no strong account name or address: unrelated"]
     # Second run: everything exists, nothing is created.
     assert run(workspace, "apply", "--accounts", "--yes", "--input", str(inp), "--passwords", str(pwfile), "--no-report",
                "--checkpoint", cp(workspace)) == 0
@@ -600,7 +600,7 @@ def test_apply_accounts_without_password_fails_where_plan_only_plans(workspace, 
     assert run(workspace, "apply", "--accounts", "--yes", "--input", str(inp), "--no-report", "--json") == 1
     data = json.loads(capsys.readouterr().out)
     assert data["failures"] == 2 and all(a["secret_status"] == "failed" for a in data["accounts"])
-    assert "server FQDN" in data["accounts"][0]["secret_detail"]
+    assert "(or 'srv01.example.com')" in data["accounts"][0]["secret_detail"]
 
 
 def test_accounts_single_server_from_a_build_job(workspace, monkeypatch, capsys):

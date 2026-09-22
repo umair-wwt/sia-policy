@@ -12,7 +12,7 @@ import json
 import re
 import socket
 import ssl
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Mapping, TextIO
 
 import requests
@@ -296,6 +296,28 @@ def search_diagnostic_help(query: str = "") -> list[dict[str, Any]]:
         if all(term in haystack for term in terms):
             matches.append(sanitize({"code": code, **entry}))
     return matches
+
+
+# An accounts-only run (--accounts) creates no target set, policy or checkpoint: --drift and --resume are rejected
+# with it, and a plain `sia plan` needs a principal on every row. Its way to re-read the tenant is `sia plan --accounts`.
+_ACCOUNTS_RECOVERY = (
+    (re.compile(r"`sia plan(?: --drift)?`"), "`sia plan --accounts`"),
+    (re.compile(r"\bplan --drift before (?:using )?apply --resume\b"), "`sia plan --accounts` before `sia apply --accounts`"),
+    (re.compile(r"\bplan --drift\b"), "`sia plan --accounts`"),
+    (re.compile(r"\bapply (?:with )?--resume\b"), "`sia apply --accounts`"),
+    (re.compile(r"\b([Rr])un plan again\b"), r"\1un `sia plan --accounts` again"),
+    (re.compile(r"`sia doctor( --online)?`"), r"`sia doctor --accounts\1`"),
+)
+
+
+def for_accounts_scope(diagnostic: Diagnostic) -> Diagnostic:
+    """The same diagnostic with its recovery commands rewritten for an accounts-only run (idempotent)."""
+    actions = []
+    for action in diagnostic.actions:
+        for pattern, replacement in _ACCOUNTS_RECOVERY:
+            action = pattern.sub(replacement, action)
+        actions.append(action)
+    return replace(diagnostic, actions=tuple(actions))
 
 
 # Convenient names for callers implementing an interactive help browser.

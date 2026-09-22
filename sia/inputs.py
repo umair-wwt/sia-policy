@@ -144,6 +144,11 @@ class Inputs:
     warnings: tuple[str, ...] = field(default=())
     domains: dict[str, DomainRow] = field(default_factory=dict)
     accounts_only: bool = False   # parsed for --accounts: the rows carry no principals and name no policies
+    # Local accounts whose address _finish inferred from their one server (kept out of checkpoint fingerprints), and
+    # local credentials/vault accounts that several servers share (no server FQDN selects them). Both are computed
+    # from the complete input before wave slicing.
+    inferred_addresses: frozenset[str] = frozenset()
+    shared_local_accounts: frozenset[str] = frozenset()
 
     def strong_account_for(self, server: ServerRow) -> StrongAccountRow:
         if server.strong_account is None:
@@ -165,6 +170,26 @@ class Inputs:
     def referenced_strong_accounts(self) -> list[StrongAccountRow]:
         names = {s.strong_account for s in self.servers if s.strong_account}
         return [sa for name, sa in self.strong_accounts.items() if name in names]
+
+    def address_owners(self) -> dict[str, tuple[str, ...]]:
+        """The credentials/vault accounts carrying each address (casefolded). A password-file row keyed by an address
+        selects an account only while exactly one account carries it: every per-host account of one AD domain has
+        that domain as its address, and one row must not become all of their passwords."""
+        owners: dict[str, list[str]] = {}
+        for account in self.strong_accounts.values():
+            if account.address and account.type in ("credentials", "vault"):
+                owners.setdefault(account.address.casefold(), []).append(account.name)
+        return {address: tuple(names) for address, names in owners.items()}
+
+    def shared_addresses(self) -> frozenset[str]:
+        """Addresses (casefolded) that key no password: carried by several accounts, or the AD domain of a templated
+        domain account -- every per-host account of that domain carries it, also when this input (one --server run)
+        shows only one of them."""
+        shared = {address for address, names in self.address_owners().items() if len(names) > 1}
+        shared |= {account.address.casefold() for account in self.strong_accounts.values()
+                   if account.address and account.type in ("credentials", "vault") and _templated(account)
+                   and not account.is_local}
+        return frozenset(shared)
 
     @property
     def referenced_principals(self) -> list[str]:
@@ -199,6 +224,11 @@ class Inputs:
         fqdns = self.unique_fqdns[offset:(offset + limit) if limit else None]
         keep = set(fqdns)
         return replace(self, servers=tuple(s for s in self.servers if s.fqdn in keep))
+
+
+def _templated(account: StrongAccountRow) -> bool:
+    """Rendered from [defaults] strong_account_template (line 0), not read from a CSV row."""
+    return account.line == 0
 
 
 def _split_list(value: str | None) -> tuple[str, ...]:
@@ -369,7 +399,8 @@ def _resolve_principals(cell: str | None, fqdn: str, dns_domain: str, entry: Dom
     if not template:
         problems.append(f"{where}: principal is required (separate several with '{LIST_SEPARATOR}'), or set "
                         "[defaults] principal_template (or a principal_template for this domain in domains.csv) to "
-                        "derive it from the server name")
+                        "derive it from the server name; to onboard only the strong accounts of these servers, run "
+                        "with --accounts")
         return ()
     try:
         rendered = _render_name(template, fqdn, dns_domain)
@@ -539,12 +570,13 @@ def _check_row_agreement(row: ServerRow, where: str, first_row: dict[str, Server
             problems.append(f"{where}: {label} {mine!r} conflicts with line {first.line} ({theirs!r}) for the same fqdn {row.fqdn}")
 
 
+SERVER_COLUMNS = ("strong_account", "principal", "policy_name", "policy_suffix", "assign_groups", "domain",
+                  "description", "protocol", "ssh_username", "domain_joined")
+
+
 def _parse_servers(path: Path, problems: list[str], warnings: list[str],
                    ctx: ParseContext) -> tuple[list[ServerRow], dict[str, StrongAccountRow]]:
-    rows = read_csv(path, ("fqdn",),
-                    ("strong_account", "principal", "policy_name", "policy_suffix", "assign_groups", "domain",
-                     "description", "protocol", "ssh_username", "domain_joined"), require_rows=True,
-                    renamed={"group": "principal"})
+    rows = read_csv(path, ("fqdn",), SERVER_COLUMNS, require_rows=True, renamed={"group": "principal"})
     servers: list[ServerRow] = []
     templated: dict[str, StrongAccountRow] = {}
     first_row: dict[str, ServerRow] = {}
@@ -753,8 +785,14 @@ def _parse_context(input_dir: Path, problems: list[str], *, strong_account_templ
 
 
 def _finish(servers: list[ServerRow], templated: dict[str, StrongAccountRow], ctx: ParseContext, input_dir: Path,
-            problems: list[str], warnings: list[str], origin: str) -> Inputs:
-    """Merge the account sources, check every referenced account is declared, and raise all problems at once."""
+            problems: list[str], warnings: list[str], origin: str,
+            other_usage: dict[str, set[str]] | None = None) -> Inputs:
+    """Merge the account sources, check every referenced account is declared, and raise all problems at once.
+
+    other_usage: account name (casefolded) -> FQDNs of the servers.csv rows that use it, for a --server run, so that
+    an account servers.csv shares is not mistaken for a one-server account; None when that usage is unknown (then a
+    declared local account is treated as shared: no server FQDN is inferred for it).
+    """
     accounts = _parse_strong_accounts(input_dir / "strong_accounts.csv", problems)
     groups_path = input_dir / "groups.csv"
     groups = _parse_groups(groups_path, problems) if ctx.principal_type == "group" else {}
@@ -790,20 +828,95 @@ def _finish(servers: list[ServerRow], templated: dict[str, StrongAccountRow], ct
                 f"{origin}:{server.line}: strong_account {server.strong_account!r} is not defined in strong_accounts.csv "
                 f"or domains.csv (add a row with type=existing if it already exists in SIA)")
     _check_target_set_definitions(servers, origin, problems)
+    account_servers: dict[str, set[str]] = {}
+    for server in servers:
+        if server.strong_account and not server.is_ssh and server.strong_account in accounts:
+            account_servers.setdefault(server.strong_account, set()).add(server.fqdn)
+    _check_shared_vault_objects(account_servers, accounts, problems, warnings)
     if problems:
         raise InputError("\n".join(problems))
     # Resolve from the full inventory before wave slicing: a shared local account must not acquire whichever
     # server happens to be in the current wave. Repeated policy rows for one server still give one address.
-    account_servers: dict[str, set[str]] = {}
-    for server in servers:
-        if server.strong_account and not server.is_ssh:
-            account_servers.setdefault(server.strong_account, set()).add(server.fqdn)
+    inferred: set[str] = set()
+    shared: set[str] = set()
     for name, fqdns in account_servers.items():
         account = accounts[name]
-        if account.address is None and account.is_local and account.type in ("credentials", "vault") and len(fqdns) == 1:
-            accounts[name] = replace(account, address=next(iter(fqdns)))
+        if not (account.is_local and account.type in ("credentials", "vault")):
+            continue
+        # A --server run sees one server; servers.csv (when there is one) says whether others use the account too.
+        users = fqdns | (other_usage or {}).get(name.casefold(), set())
+        if len(users) > 1 or (other_usage is None and account.address is None and not _templated(account)):
+            shared.add(name)
+        elif account.address is None:
+            accounts[name] = replace(account, address=next(iter(users)))
+            inferred.add(name)
+    _warn_non_local_accounts(servers, accounts, ctx, origin, warnings)
     return Inputs(servers=tuple(servers), strong_accounts=accounts, groups=groups, warnings=tuple(warnings),
-                  domains=ctx.domains, accounts_only=ctx.accounts_only)
+                  domains=ctx.domains, accounts_only=ctx.accounts_only, inferred_addresses=frozenset(inferred),
+                  shared_local_accounts=frozenset(shared))
+
+
+def _warn_non_local_accounts(servers: list[ServerRow], accounts: dict[str, StrongAccountRow], ctx: ParseContext,
+                             origin: str, warnings: list[str]) -> None:
+    """A standalone server's strong account is its own local administrator. Two input shapes silently use a domain
+    account instead: a workgroup row (domain_joined = no) naming a domain account, which cannot log on to a machine
+    outside the domain; and, in an --accounts run, a row not marked domain_joined = no whose DNS suffix is in
+    domains.csv, so the run looks up that domain account and never onboards the server's local administrator."""
+    workgroup: dict[str, list[ServerRow]] = {}
+    joined: dict[str, list[ServerRow]] = {}
+    for server in servers:
+        account = accounts.get(server.strong_account or "")
+        if server.is_ssh or account is None:
+            continue
+        entry = ctx.domain_row(server.dns_domain)
+        from_domains_csv = bool(entry and entry.strong_account
+                                and entry.strong_account.casefold() == account.name.casefold())
+        if not server.domain_joined and not account.is_local:
+            workgroup.setdefault(account.name, []).append(server)
+        elif ctx.accounts_only and server.domain_joined and (from_domains_csv or not account.is_local):
+            joined.setdefault(account.name, []).append(server)
+
+    def which(rows: list[ServerRow]) -> str:
+        first: dict[str, int] = {}
+        for row in rows:
+            first.setdefault(row.fqdn, row.line)
+        shown = [f"{fqdn} ({origin}:{line})" if origin == "servers.csv" else fqdn for fqdn, line in first.items()]
+        return ", ".join(shown[:3]) + (f" and {len(shown) - 3} more" if len(shown) > 3 else "")
+
+    for name, rows in workgroup.items():
+        warnings.append(f"{which(rows)}: domain_joined = no, but strong account {name!r} is a domain account "
+                        f"({accounts[name].account_domain}); a workgroup server's strong account is its local "
+                        "administrator (account_domain = local)")
+    for name, rows in joined.items():
+        kind = "domain" if not accounts[name].is_local else "domains.csv"
+        warnings.append(f"--accounts: {which(rows)} not marked domain_joined = no, so this run uses the {kind} strong "
+                        f"account {name!r} ({accounts[name].account_domain}) and does not onboard a local administrator "
+                        "per server; set domain_joined = no (or --workgroup) for a standalone server")
+
+
+def _check_shared_vault_objects(account_servers: dict[str, set[str]], accounts: dict[str, StrongAccountRow],
+                                problems: list[str], warnings: list[str]) -> None:
+    """Two strong-account names that reference one Vault account (same safe and account name, so one SIA secret)
+    share a credential: usually an account-name template without {hostname}. For local accounts that is wrong --
+    each server's local administrator is its own account, and the Vault object (address, CPM rotation) belongs to
+    one of them -- so it stops the run; domain accounts can legitimately share one."""
+    by_object: dict[tuple[str, str], list[str]] = {}
+    for name in account_servers:
+        account = accounts[name]
+        if account.type == "vault" and account.safe and account.account_name:
+            by_object.setdefault((account.safe.casefold(), account.account_name.casefold()), []).append(name)
+    for names in by_object.values():
+        if len(names) < 2:
+            continue
+        account = accounts[names[0]]
+        shown = ", ".join(sorted(names)[:3]) + (f" and {len(names) - 3} more" if len(names) > 3 else "")
+        message = (f"strong accounts {shown} all reference Vault account {account.account_name!r} in safe "
+                   f"{account.safe!r} (SIA name {account.sia_name!r}), so they share one credential; include "
+                   "{hostname} in strong_account_account_name_template, or declare one shared account")
+        if any(accounts[name].is_local for name in names):
+            problems.append(message + " (local accounts are one per server, so one Vault account cannot hold them)")
+        else:
+            warnings.append(message)
 
 
 def load_inputs(input_dir: str | Path, *, strong_account_template: str | StrongAccountTemplate = "",
@@ -831,7 +944,7 @@ def load_inputs(input_dir: str | Path, *, strong_account_template: str | StrongA
                          principal_template=principal_template, principal_type=principal_type,
                          target_set_scope=target_set_scope, accounts_only=accounts_only)
     servers, templated = _parse_servers(input_dir / "servers.csv", problems, warnings, ctx)
-    return _finish(servers, templated, ctx, input_dir, problems, warnings, "servers.csv")
+    return _finish(servers, templated, ctx, input_dir, problems, warnings, "servers.csv", other_usage={})
 
 
 def inline_inputs(input_dir: str | Path, servers: list[dict[str, str]], *,
@@ -861,4 +974,30 @@ def inline_inputs(input_dir: str | Path, servers: list[dict[str, str]], *,
             _check_policy_name(row, where, ctx, policy_names, problems)
         _check_row_agreement(row, where, first_row, problems)
         rows.append(row)
-    return _finish(rows, templated, ctx, input_dir, problems, warnings, "--server")
+    usage, unreadable = _servers_csv_usage(input_dir / "servers.csv", ctx)
+    if unreadable:
+        warnings.append(f"servers.csv could not be read to see which servers share a declared account ({unreadable}); "
+                        "in this --server run a declared local account without an address is treated as shared: key "
+                        "its password by account name, and set its address before it is onboarded into the Vault")
+    return _finish(rows, templated, ctx, input_dir, problems, warnings, "--server", other_usage=usage)
+
+
+def _servers_csv_usage(path: Path, ctx: ParseContext) -> tuple[dict[str, set[str]] | None, str]:
+    """Account name (casefolded) -> FQDNs of the servers.csv rows that use it, for a --server run: the declared
+    account it names may be shared by servers it cannot see. Each row is resolved exactly as a CSV run resolves it
+    (strong_account column, domains.csv, template). ({}, "") without a servers.csv, where the command line is the
+    whole input; (None, reason) when servers.csv cannot be read, so no address is inferred from a partial view."""
+    if not path.is_file():
+        return {}, ""
+    try:
+        rows = read_csv(path, ("fqdn",), SERVER_COLUMNS, renamed={"group": "principal"})
+    except InputError as exc:
+        return None, str(exc).splitlines()[0]
+    # A throwaway context: principals and problems of rows this run does not process are none of its business.
+    scratch = replace(ctx, accounts_only=True, generated_origins={})
+    usage: dict[str, set[str]] = {}
+    for line, cells in rows:
+        row = _build_server_row(cells, f"{path.name}:{line}", line, scratch, [], [], {})
+        if row.strong_account and not row.is_ssh:
+            usage.setdefault(row.strong_account.casefold(), set()).add(row.fqdn)
+    return usage, ""

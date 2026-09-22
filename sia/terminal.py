@@ -1058,7 +1058,11 @@ def _workflow_steps(command: str, args, answers: dict[str, Any]) -> list[dict[st
         if answers.get("ssh") is True and not accounts:
             steps.append({"key": "ssh_username", "label": "SSH username", "kind": "required_text"})
         else:
-            steps.append({"key": "workgroup", "label": "Is this a workgroup server (not domain-joined)?",
+            # In accounts scope a "no" makes a domains.csv suffix select the domain account, so the question says what
+            # yes is for; the default stays no because domain-joined servers can be listed too.
+            steps.append({"key": "workgroup", "label": ("Is this a standalone (workgroup) server? Answer yes to onboard its "
+                                                        "local administrator" if accounts else
+                                                        "Is this a workgroup server (not domain-joined)?"),
                           "default": False, "kind": "bool"})
     steps.append({"key": "input", "label": "Folder containing your CSV files",
                   "default": getattr(args, "input", "input"), "kind": "path"})
@@ -1358,6 +1362,9 @@ def home(args, session, run: Callable[[list[str]], int]) -> int:
                 for item in session.last_diagnostics:
                     panel(f"Last problem · {item['code']}", "\n".join([item['message'], *item.get('actions', [])]), tone="warning")
                 argv = ["doctor", "--input", getattr(args, "input", "input")]
+                # An FQDN-only accounts list has no principals, which a plain doctor reports as a problem.
+                if yes("Check the input for a strong-accounts-only run (--accounts)?", default=session.last_scope_accounts):
+                    argv.append("--accounts")
                 if yes("Also check sign-in and tenant access?"):
                     argv.append("--online")
             elif command in ("plan", "apply", "verify", "connect-info"):

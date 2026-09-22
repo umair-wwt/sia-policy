@@ -177,7 +177,10 @@ def build_secret_payload(account: StrongAccountRow, password: str | None = None)
         "secret_type": account.secret_type,
         "is_active": True,
         "secret": {"secret_data": secret_data, "tenant_encrypted": False},
-        "secret_details": {"account_domain": account.account_domain or "local", "ephemeral_domain_user_data": {}},
+        # CyberArk's strong-account API documents a local account as account_domain "local"; the input keeps the
+        # operator's spelling (LOCAL, Local) so checkpoint fingerprints do not move with it.
+        "secret_details": {"account_domain": "local" if account.is_local else account.account_domain,
+                           "ephemeral_domain_user_data": {}},
     }
 
 

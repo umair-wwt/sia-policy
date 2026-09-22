@@ -36,13 +36,13 @@ import os
 import threading
 import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from typing import Any, Callable, Iterable, NamedTuple
 
 from .checkpoint import Checkpoint, fingerprint, is_done, row_key
 from .clients import UAP_VM_FILTER, SIAClient, UAPClient, owned_vm_filter
 from .config import Defaults
-from .diagnostics import Diagnostic, diagnose
+from .diagnostics import Diagnostic, diagnose, for_accounts_scope
 from .http import SIAApiError
 from .inputs import Inputs, ServerRow, StrongAccountRow
 from .payloads import (
@@ -281,7 +281,8 @@ class Reconciler:
                  checkpoint: Checkpoint | None = None, resume: bool = False, progress_every: int = 100,
                  pvwa: Any = None, pvwa_platform_id: str = "WinServerLocal", pvwa_cpm_managed: bool = True,
                  set_policy_status: str | None = None, suspended_ok: bool = False,
-                 reconciliation_context: dict[str, Any] | None = None, accounts_only: bool = False):
+                 reconciliation_context: dict[str, Any] | None = None, accounts_only: bool = False,
+                 pvwa_configured: bool | None = None):
         if only not in STAGES:
             raise ValueError(f"only must be one of {STAGES}")
         if lookup not in LOOKUP_MODES:
@@ -311,6 +312,9 @@ class Reconciler:
         self.checkpoint, self.resume = checkpoint, resume
         self.progress_every = max(0, progress_every)
         self.pvwa, self.pvwa_platform_id, self.pvwa_cpm_managed = pvwa, pvwa_platform_id, pvwa_cpm_managed
+        # Whether [pvwa] is configured at all (None: not said). With it and no session, the Vault stage was not
+        # selected or not run by this command -- a different reason from a missing [pvwa] section.
+        self.pvwa_configured = pvwa_configured
         self.set_policy_status = set_policy_status
         self.accounts_only = accounts_only
         # plan/apply with [defaults] policy_status = "Suspended" (a staged rollout): an existing Suspended policy is
@@ -331,6 +335,7 @@ class Reconciler:
         self._refs: dict[str, tuple[str | None, str]] = {}
         self._secrets: SecretIndex = SecretIndex([])
         self._secret_listing: list[dict[str, Any]] | None = None
+        self._shared_addresses: frozenset[str] | None = None
         self._template: dict[str, Any] | None = None
         self._principal_errors: dict[str, ResolveError] = {}
         self._checkpoint_context: dict[str, Any] = {}
@@ -469,6 +474,12 @@ class Reconciler:
             if sr.policy.status == "pending":
                 sr.policy = self._blocked_by_abort()
         result.accounts = self._account_results(result)
+        if self.accounts_only:
+            # Accounts are the unit here, so the ones the run never reached belong in the totals and diagnostics too.
+            for account in result.accounts:
+                result.secrets.setdefault(account.name, account.secret)
+                if account.vault.status != NOT_APPLICABLE:
+                    result.vault.setdefault(account.name, account.vault)
         outcomes = [o for sr in result.servers for o in (sr.secret, sr.target_set, sr.policy)]
         outcomes += list(result.secrets.values()) + list(result.vault.values())
         state = ("unknown" if any(o.status == "uncertain" for o in outcomes) else
@@ -476,11 +487,20 @@ class Reconciler:
                                   (o.diagnostic or {}).get("mutation_state") == "applied" for o in outcomes) else
                  "unknown" if any(o.status == "unverified" for o in outcomes) else "not_applied")
         if isinstance(exc, KeyboardInterrupt):
+            if self.dry_run:   # plan or verify: nothing was written
+                stage, action = "Reading tenant", "Nothing was changed; run the command again when ready."
+            elif self.accounts_only:
+                stage, action = "Apply", ("Review the partial results, then run `sia plan --accounts` with the same input: "
+                                          "accounts created before the interruption report exists, and `sia apply "
+                                          "--accounts` creates only the missing ones.")
+            else:
+                stage, action = "Apply", "Review the partial results and run plan --drift before apply --resume."
             diagnostic = Diagnostic(code="SIA-INTERRUPTED", message="Run interrupted; in-flight results have been collected.",
-                                    stage="Apply", mutation_state=state,
-                                    actions=("Review the partial results and run plan --drift before apply --resume.",))
+                                    stage=stage, mutation_state=state, actions=(action,))
         else:
             diagnostic = diagnose(exc, stage="Completing run", mutation_state=state)
+            if self.accounts_only:
+                diagnostic = for_accounts_scope(diagnostic)
         result.diagnostics.append(diagnostic.to_dict())
 
     # ------------------------------------------------------------ snapshot
@@ -491,7 +511,7 @@ class Reconciler:
             "defaults": asdict(self.defaults),
             "template": self._template,
             "input_mappings": {
-                "strong_accounts": {key: asdict(value) for key, value in self.inputs.strong_accounts.items()},
+                "strong_accounts": {key: asdict(self._fingerprinted(value)) for key, value in self.inputs.strong_accounts.items()},
                 "groups": {key: asdict(value) for key, value in self.inputs.groups.items()},
                 "domains": {key: asdict(value) for key, value in self.inputs.domains.items()},
             },
@@ -507,6 +527,14 @@ class Reconciler:
             "drift": self.drift,
         }
 
+    def _fingerprinted(self, account: StrongAccountRow | None) -> StrongAccountRow | None:
+        """The account as a checkpoint fingerprint sees it. An address the inputs inferred (a declared local account
+        used by one server) only keys the password file and names the Vault address the run derived anyway, so it
+        must not make records written before that inference existed look stale."""
+        if account is not None and account.name in getattr(self.inputs, "inferred_addresses", ()):
+            return replace(account, address=None)
+        return account
+
     def _plan_rows(self) -> None:
         self._rows, self._resumed = [], {}
         for server in self.inputs.servers:
@@ -515,7 +543,7 @@ class Reconciler:
                               protocol=server.protocol, line=server.line,
                               target_set_name=("" if server.is_ssh else target_set_name_for(server)))
             if self.resume and self.checkpoint is not None:
-                account = self.inputs.strong_accounts.get(server.strong_account or "")
+                account = self._fingerprinted(self.inputs.strong_accounts.get(server.strong_account or ""))
                 record = self.checkpoint.get(
                     row_key(server.fqdn, name), fingerprint(server, account, name, self._checkpoint_context))
                 if record and is_done(record):
@@ -541,12 +569,45 @@ class Reconciler:
                 secret = self._blocked_by_abort() if self._abort_reason else Outcome("unverified", "no result recorded")
             vault = result.vault.get(account.name)
             if vault is None:
-                vault = Outcome(NOT_APPLICABLE, "Vault stage off ([pvwa] not configured)" if account.type == "vault"
-                                else f"Vault stage not applicable (type={account.type})")
+                vault = self._vault_not_run(account)
+            # A local account several servers share has no one server; naming the first of this wave would mislead.
+            address = account.address or ("" if self._shared_local(account) else self._address_for(account))
             out.append(AccountResult(name=account.name, type=account.type, sia_name=account.sia_name,
-                                     username=account.username or "", address=account.address or self._address_for(account),
-                                     vault=vault, secret=secret))
+                                     username=account.username or "", address=address, vault=vault, secret=secret))
         return out
+
+    def _vault_not_run(self, account: StrongAccountRow) -> Outcome:
+        """Why a strong account has no Vault result: only the true reason, never '[pvwa] not configured' by default."""
+        if account.type != "vault":
+            return Outcome(NOT_APPLICABLE, f"Vault stage not applicable (type={account.type})")
+        if self.pvwa is None:   # the stage never runs without a session, whatever else stopped the run
+            if not self._writes("vault"):
+                return Outcome(NOT_APPLICABLE, f"Vault stage not run (--only {self.only})")
+            if self.pvwa_configured:
+                return Outcome(NOT_APPLICABLE, "Vault not checked by this command (verify --accounts checks it)")
+            return Outcome(NOT_APPLICABLE, "Vault stage off ([pvwa] not configured)")
+        if self._abort_reason:
+            return self._blocked_by_abort()
+        return Outcome("unverified", "no Vault result recorded")
+
+    def _shared_local(self, account: StrongAccountRow) -> bool:
+        return account.is_local and account.name in getattr(self.inputs, "shared_local_accounts", ())
+
+    def _password_hint(self, account: StrongAccountRow) -> str:
+        """Where a missing password can come from. The password file's second key is the account's address, and only
+        while no other account carries that address (sia_onboard.make_password_source)."""
+        name = repr(account.name)
+        if account.address:
+            if self._shared_addresses is None:   # once per run: a run may report thousands of missing passwords
+                self._shared_addresses = (self.inputs.shared_addresses() if hasattr(self.inputs, "shared_addresses")
+                                          else frozenset())
+            if account.address.casefold() in self._shared_addresses:
+                return (f"add {name} to the password file (its address {account.address!r} is shared with other "
+                        "accounts, so it keys no password)")
+            return f"add {name} (or {account.address!r}) to the password file"
+        if self._shared_local(account):
+            return f"add {name} to the password file (it is shared by several servers, so no server FQDN selects it)"
+        return f"add {name} to the password file"
 
     def _choose_lookup(self, unique_fqdns: int) -> str:
         if self.lookup != "auto":
@@ -1062,7 +1123,7 @@ class Reconciler:
     def _checkpoint_row(self, server: ServerRow, sr: ServerResult) -> None:
         if self.checkpoint is None or self.dry_run:
             return
-        account = self.inputs.strong_accounts.get(server.strong_account or "")
+        account = self._fingerprinted(self.inputs.strong_accounts.get(server.strong_account or ""))
         try:
             self.checkpoint.record(
                 row_key(sr.fqdn, sr.policy_name), fingerprint(server, account, sr.policy_name, self._checkpoint_context),
@@ -1084,7 +1145,13 @@ class Reconciler:
         accounts = [a for a in self._active_accounts() if a.type == "vault"]
         if self.pvwa is None:
             if self.only == "vault":
-                result.warnings.append("[pvwa] is not configured; the vault stage cannot run")
+                if self.pvwa_configured:   # the CLI opens no PVWA session when no selected account needs one
+                    result.warnings.append("no selected strong account is type=vault; the vault stage had nothing to do")
+                elif self.pvwa_configured is None and not accounts:
+                    result.warnings.append("[pvwa] is not configured, or no selected strong account is type=vault; "
+                                           "the vault stage did not run")
+                else:
+                    result.warnings.append("[pvwa] is not configured; the vault stage cannot run")
             return
         # Preview and apply share a client, but each pass must observe changes made during confirmation.
         self.pvwa.reset_lookup_cache()
@@ -1106,6 +1173,12 @@ class Reconciler:
             if not self._writes("vault"):
                 result.vault[account.name] = Outcome("skipped", f"missing; onboarding disabled by --only {self.only}")
                 continue
+            if not account.address and self._shared_local(account):
+                result.vault[account.name] = Outcome(
+                    "failed", f"{what} is missing, and it is a local account shared by several servers, so its Vault "
+                              "address is ambiguous: set address in strong_accounts.csv (the server the Vault manages "
+                              "it on) before onboarding it")
+                continue
             address = account.address or self._address_for(account)
             if not account.username:
                 result.vault[account.name] = Outcome("failed", f"{what} is missing and has no username to onboard it with "
@@ -1117,8 +1190,7 @@ class Reconciler:
                     result.vault[account.name] = Outcome("planned", f"would onboard {what} for {address} (password from the password file, not available now)")
                     continue
                 result.vault[account.name] = Outcome(
-                    "failed", f"{what} is missing and its current password is not available: add {account.name!r} "
-                              "(or its server FQDN) to the password file")
+                    "failed", f"{what} is missing and its current password is not available: {self._password_hint(account)}")
                 continue
             if self.dry_run:
                 result.vault[account.name] = Outcome("planned", f"would onboard {what} for {address} (platform {self.pvwa_platform_id})")
@@ -1232,8 +1304,8 @@ class Reconciler:
                     continue
                 if not password:
                     result.secrets[account.name] = Outcome(
-                        "failed", f"password not available: set env var {account.password_env}, add {account.name!r} "
-                                  "(or its server FQDN) to the password file, or run interactively to be prompted")
+                        "failed", f"password not available: set env var {account.password_env}, "
+                                  f"{self._password_hint(account)}, or run interactively to be prompted")
                     continue
             if self.dry_run:
                 result.secrets[account.name] = Outcome("planned", f"would create {what}")

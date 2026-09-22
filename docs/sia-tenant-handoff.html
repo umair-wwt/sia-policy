@@ -741,9 +741,10 @@
           <span class="tick">5.2</span>
           <div class="item-body">
             <p class="lede">Confirm connectors are deployed and reach the target servers</p>
-            <p class="note">The connector opens WinRM to each Windows server to create and remove the temporary
-            user. This is a connection-time dependency, not an onboarding one — policies will be created
-            successfully and then fail to connect if it is missing.</p>
+            <p class="note">The connector reaches each Windows server over SMB (TCP 445) to create and remove the
+            temporary user, and over RDP (TCP 3389) for the session itself. This is a connection-time dependency,
+            not an onboarding one — policies will be created successfully and then fail to connect if it is
+            missing.</p>
           </div>
         </div>
       </section>
@@ -801,9 +802,12 @@
         <div class="item">
           <span class="tick">7.1</span>
           <div class="item-body">
-            <p class="lede">WinRM reachable from the connectors</p>
-            <p class="note">TCP 5985 (HTTP) or 5986 (HTTPS). If certificates are valid on the targets, say so —
-            we can turn on certificate validation for the target sets rather than leaving it off.</p>
+            <p class="lede">SMB and RDP reachable from the connectors</p>
+            <p class="note">TCP 445 (SMB), which SIA uses for user and group management on the server, and TCP 3389
+            (RDP); TCP 135 (RPC endpoint mapper) is recommended. Source: CyberArk, <em>SIA configure inbound network
+            traffic</em>. WinRM, TCP 5985 (HTTP) or 5986 (HTTPS), is needed only if policies use ephemeral domain
+            users, to clean up their profiles. If the targets have valid WinRM certificates, say so — we can turn on
+            certificate validation for the target sets rather than leaving it off.</p>
           </div>
         </div>
 
@@ -811,8 +815,10 @@
           <span class="tick">7.2</span>
           <div class="item-body">
             <p class="lede"><span class="mono">LocalAccountTokenFilterPolicy = 1</span> via GPO</p>
-            <p class="note">Local accounts cannot be used remotely without it. Push it before the first
-            connection test, not after.</p>
+            <p class="note">Without it, a local administrator gets a filtered, non-administrative token on network
+            logons, so SIA cannot use it to create the temporary user. Push it before the first
+            connection test, not after. Workgroup servers receive no GPO: set it on each of them by hand (the
+            PowerShell line is in the operations guide, section 4).</p>
           </div>
         </div>
 
@@ -820,8 +826,10 @@
           <span class="tick">7.3</span>
           <div class="item-body">
             <p class="lede">Local admin account state on each server</p>
-            <p class="note">In the local <span class="mono">Administrators</span> group, marked
-            <span class="mono">Account is sensitive and cannot be delegated</span>, and <em>not</em> a member of
+            <p class="note">In the local <span class="mono">Administrators</span> group.
+            <span class="mono">Account is sensitive and cannot be delegated</span> and
+            <span class="mono">Protected Users</span> are Active Directory settings: they do not apply to a local
+            account. A domain account used as a strong account is marked sensitive and is <em>not</em> a member of
             <span class="mono">Protected Users</span>.</p>
           </div>
         </div>

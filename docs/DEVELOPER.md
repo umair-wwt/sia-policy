@@ -111,13 +111,13 @@ flowchart TD
     A["1 - Read and validate the CSVs<br/>(--offset/--limit slice by server)"] -->|any problem| X["exit 2: every error listed with file:line<br/>tenant not contacted"]
     A --> B["2 - snapshot(): authenticate, load template,<br/>drop checkpointed rows (--resume),<br/>read the wave's secrets, target sets and policies<br/>(search per server, or one filtered list)"]
     B --> C["3 - reconcile(dry_run=True): preview<br/>principal name -> role/group id · account -> secret · compare"]
-    C -->|plan / verify / connect-info| R1["print table / verdicts / connection CSV, exit 0/1"]
+    C -->|plan / verify / connect-info| R1["print table / verdicts / connection CSV, exit 0/1 (130 interrupted)"]
     C -->|apply, after 'yes'| D["4 - reconcile(dry_run=False), same snapshot"]
     D --> E["5a - Vault accounts (PVWA POST Accounts), optional<br/>canary, then --workers threads"]
     E --> F["5b - Strong accounts (POST secrets)<br/>canary, then --workers threads"]
     F --> G["5c - Target sets (POST targetsets/bulk, chunks of 50)<br/>one per target-set name"]
     G --> H["5d - Policies: compare existing in parallel,<br/>create missing (canary, then --workers), verify saved fields and status;<br/>checkpoint every finished row"]
-    H --> R2["print table, write report, exit 0/1"]
+    H --> R2["print table, write report, exit 0/1 (130 interrupted)"]
 ```
 
 Details worth knowing:
@@ -139,9 +139,15 @@ Details worth knowing:
 - `--only <stage>` disables writes for the other stages; lookups and comparisons still run for everything.
 - **Accounts-only variant (`--accounts`).** Step 1 parses the rows without principals or policy names
   (`ParseContext.accounts_only`), step 2 reads strong accounts only (no template policy, no target sets, no
-  policies, no principals), and reconciliation runs 5a and 5b only. `result.servers` stays empty and
-  `RunResult.accounts` (one `AccountResult` per active strong account, filled in both modes) is the unit of the
-  table, the reports and the verify verdicts; nothing is checkpointed. Linux rows are skipped with a warning.
+  policies, no principals), and reconciliation runs 5a and 5b only. `verify --accounts` passes the PVWA client too
+  when `[pvwa]` is configured and a `vault` account is selected, so 5a runs there as a read-only lookup.
+  `result.servers` stays empty and `RunResult.accounts` (one `AccountResult` per active strong account, filled in
+  both modes) is the unit of the table, the reports and the verify verdicts; nothing is checkpointed. Linux rows are
+  skipped with a warning. In this mode only, rows not marked `domain_joined = no` that take the domains.csv strong
+  account (local or not) or any other non-local account add an `Inputs.warnings` entry naming the servers and the
+  account, since no local administrator is onboarded for them; a server run does not warn (the expected case for a
+  domain-joined server). In both modes, a `domain_joined = no` row whose strong account is a domain account warns
+  as well, because a workgroup server cannot log on with it. Both checks are `inputs._warn_non_local_accounts`.
 - A row is written to the checkpoint only after every stage has a complete good status and required object reference
   (apply only). `uncertain`, `unverified`, malformed and incomplete outcomes are reconciled again.
 
@@ -165,18 +171,25 @@ as failures) and the policy is built with `behavior.connectAs.ssh.username` (row
 ### Vault account (`_ensure_vault`, optional)
 
 Runs only when a `PVWAClient` is given (`[pvwa] base_url` set) and only for referenced `type=vault` accounts.
+`plan` and `apply` pass one; `verify` passes one only with `--accounts`, where the stage is a read-only lookup, and
+fails with a configuration error (exit 2) when `PVWA_USER` / `PVWA_PASSWORD` are not set. In a dry run (`plan`,
+`verify --accounts`) a missing account is `planned` (`MISSING`) unless it cannot be onboarded at all (no
+`username`, or a shared local account without `address`), which is `failed` (`FAIL`).
 
 | Situation | Status |
 |---|---|
-| `find_account(safe, name)` finds it | `exists` |
+| `find_account(safe, name)` finds it (with or without an address) | `exists` |
 | Missing, `--only` excludes the stage | `skipped` |
-| Missing, no `username` on the account | `failed` |
+| Missing, shared local account without `address` (plan and apply) | `failed`: set an explicit `address` |
+| Missing, no `username` on the account (plan and apply) | `failed` |
 | Missing, password from the password file (or env/prompt), apply | `created` via `POST /PasswordVault/API/Accounts` |
-| Missing, plan | `planned` (with or without a password) |
+| Missing, plan (otherwise) | `planned` (with or without a password) |
 | Missing, no password, apply | `failed` → the SIA secret is `blocked`, the row's target set and policies too |
 
-The address is the account's `address` column, else the AD domain for domain accounts, else the FQDN of the
-first server using the account.
+The address is the account's `address` (explicit, templated, or inferred by `inputs._finish`), else the AD domain
+for a domain account. A local account that still has no address is shared by several servers (or `servers.csv`
+could not be read on the `--server` path); the lookup still finds it, but the stage refuses to onboard it rather
+than taking the first server of the wave.
 
 ### Principal, strong account and target set of a row (`inputs.py`)
 
@@ -193,6 +206,32 @@ A strong account named only in domains.csv is materialised as a `type=existing` 
 means operationally. An explicit `strong_accounts.csv` row of the same name wins.
 Shared target-set validation rejects domain definitions or effective server rows that point at one target set
 with different strong accounts or types. Every row sharing a target set therefore agrees on its account and scope.
+
+**Account addresses.** A templated `credentials`/`vault` account gets its address when it is rendered: the FQDN
+for a local account, the rendered domain otherwise. `inputs._finish` infers the address of a declared local
+`credentials`/`vault` account (no `address` column) used by exactly one server, counting from the complete input
+before `window()` slices a wave; repeated policy rows for one server count once, and an account used by several
+servers keeps no address. An explicit `address` is used as given. The `--server` path (`inline_inputs`) reads
+`<input>/servers.csv` when the file exists and resolves each row exactly like a CSV run (`strong_account` column,
+domains.csv, template) to count the servers that use each declared account, so an account servers.csv shares is
+treated as shared and is not given the single CLI server. If servers.csv exists but cannot be read, the run warns
+and declared local accounts without an address are treated as shared (no FQDN key; onboarding into the Vault needs
+an explicit address). Inferred addresses are recorded on `Inputs` and kept out of the checkpoint context and
+fingerprint, so checkpoints written before 4b5eacc resume unchanged; see *Checkpoint / resume* for the one-time
+recheck of records 4b5eacc itself wrote. `account_domain` keeps the operator's spelling (e.g. `LOCAL`) in the input,
+so fingerprints do not move with it; a local account is recognised case-insensitively, and
+`payloads.build_secret_payload` always sends `local` for it. Two referenced `vault` accounts that render the same
+Vault object (safe + account name, casefolded) are checked by `inputs._check_shared_vault_objects`: for local
+accounts it is an input problem and the run stops before any tenant contact, because each server's local
+administrator is a different account and one Vault object cannot hold them all; for domain accounts it is a
+warning, since they share one credential.
+
+The address is also the second password-file key. `Inputs.address_owners()` groups the `credentials`/`vault`
+accounts of the complete inventory by casefolded address, and `Inputs.shared_addresses()` lists the addresses that
+key no password: those with several owners, and a templated domain account's AD domain (every per-host account of
+the domain carries it, also on a `--server` run that shows one host). `make_password_source` skips those
+addresses. `sia_onboard.password_file_warnings` (called by `cmd_plan_apply`) warns about a key that is a shared
+address, a key that names a listed server whose account no FQDN selects, and a key that matches nothing.
 
 ### Strong account (`_ensure_secrets`)
 
@@ -215,14 +254,22 @@ mirrors this in `check_accounts_flags()`.
 
 | Situation | `AccountResult` |
 |---|---|
-| Vault stage not configured, or the account is not `type=vault` | `vault = n/a`, secret as in the strong-account table |
+| The account is not `type=vault`, or no Vault session: `[pvwa]` not configured, `--only secrets`, or a plain `verify` (the detail says which) | `vault = n/a`, secret as in the strong-account table |
+| The run stopped before the Vault stage reached the account | `vault = blocked` |
 | Vault stage failed | `vault` bad, `secret = blocked` |
 | Run stopped before the account was reached | `secret = blocked` (abort reason) |
 | verify verdict | worst of the two outcomes: `n/a`/`exists`/`created` → PASS, `planned` → MISSING, `skipped` → SKIP, the rest FAIL |
 
 `RunResult.failures` counts not-ok accounts in this mode, so the exit code is 1 when any account failed.
 The JSON report carries `scope: "accounts"` and `accounts: [...]`; `mode` stays `plan`/`apply`/`verify` and the
-report files are `plan-accounts-<stamp>` / `apply-accounts-<stamp>`.
+report files are `plan-accounts-<stamp>` / `apply-accounts-<stamp>`. Server-mode JSON (`scope: "servers"`) also
+carries an informational `accounts` array, so consumers must use `scope`, not the presence of `accounts`, to tell
+the two schemas apart. The accounts files also match the `plan-*` / `apply-*` prefixes and do not sort by time
+among them: check `scope` rather than sorting names.
+
+Recovery advice is scope- and mode-aware: after an interrupted or uncertain accounts run, `_finish_partial` and the
+report diagnostics name `sia plan --accounts` with the same input (never `plan --drift` or `apply --resume`, which
+this mode rejects); an interrupted dry run (`plan`, `verify`) reports that nothing was changed.
 
 ### Target set (`_ensure_target_sets` / `_reconcile_existing_target_set`)
 
@@ -372,12 +419,15 @@ same-name policy hidden from the owner-tag listing — is looked up by name and 
 **Checkpoint / resume.** Version 3 records append `{version, key, fingerprint, statuses, refs, at}` only for rows
 whose exact `secret`, `target_set` and `policy` stages are complete and whose non-`n/a` stages have references.
 The fingerprint covers the tenant URLs, all effective object-shaping settings, sanitized template content, account
-mapping, full row input and the `update`/`drift` options the row was checked with (a row verified by a lighter
-run is reconciled again by `--update`). `--resume` drops only a matching complete record before the snapshot. Older, malformed,
+mapping (without inferred addresses), full row input and the `update`/`drift` options the row was checked with
+(a row verified by a lighter run is reconciled again by `--update`). `--resume` drops only a matching complete record before the snapshot. Older, malformed,
 incomplete and mismatched records emit a warning and are reconciled. `uncertain`/`unverified` outcomes are never a
 successful record. A checkpoint is a local cache of an earlier verified result, not proof of current tenant state.
 `verify` and `connect-info` never use it. Version-2 records remain in the file but cannot skip verification;
-the next successful apply appends a version-3 record for that row.
+the next successful apply appends a version-3 record for that row. Release note: inferred addresses are kept out of
+the fingerprint, so checkpoints written before 4b5eacc resume unchanged; records written by 4b5eacc itself for
+inputs with a declared local account used by one server are rechecked once on `apply --resume` after this upgrade
+(safe: nothing is recreated, the rows report `exists`).
 
 **Parallelism and pacing.** `_parallel()` for reads (no canary), `_execute()` for writes (canary first, then the
 pool). `RateLimiter` (token bucket at `[http] max_requests_per_second`, shared by every `HttpClient`) is acquired
@@ -623,7 +673,8 @@ target_set_status, policy_status, policy_id, portal_url, gateway_host, rdp_usern
   with CRLF line endings — the same gateway parameters the portal puts into its generated files, minus the
   single-use token.
 - `verify` maps outcomes to verdicts (`report.verdict_for`): created/exists/updated/n/a → PASS, planned → MISSING,
-  drift/failed/blocked/inactive → FAIL, skipped → SKIP; exit 1 when anything is not PASS.
+  drift/failed/blocked/inactive/uncertain/unverified → FAIL, skipped → SKIP. Exit `0` when every verdict is PASS,
+  `1` when anything is not PASS or the result is incomplete, `130` when interrupted.
 
 ## 9. Tests and development workflow
 
@@ -642,6 +693,18 @@ python -m pytest                 # fully offline
   fail-fast vs `--keep-going`, uncertain 5xx, ownership and adoption, the vault stage, template cloning, SSH rows,
   `--workers` with the canary, `--only`; the accounts-only run (secrets-only snapshot, the password matrix, type
   mismatch, canary + workers, waves, stage gating, the vault stage, `AccountResult` in both modes).
+- `tests/test_verify_accounts_pvwa.py`: `verify --accounts` with `[pvwa]` configured: existing, missing and
+  unreadable Vault accounts (never PASS without the Vault account), no PVWA session when none is needed, logoff
+  after snapshot and lookup failures, cleanup errors and interrupts that keep the partial results.
+- `tests/test_accounts_gaps.py`: the accounts-mode gaps: the template-policy guard, no checkpoint and the
+  report-dir precheck, `--ssh-username` rejection, first-appearance account order, the confirmation prompt
+  (declined and preview), skipped ssh rows, the `help accounts` topic.
+- `tests/test_accounts_fixes.py`: the accounts-mode fixes from the review of e5dc22d/4b5eacc: password-file address
+  keys (one or several owners, templated domain accounts, the `--server` path), address inference and servers.csv
+  usage on the `--server` path, shared local accounts (password hint, Vault refusal), the domain-account warnings,
+  shared Vault objects, the `local` spelling in the payload, inferred addresses and checkpoints, `plan --accounts`
+  recovery advice, Vault reasons and totals after `--only secrets` or an interrupt, capped tables,
+  `doctor --accounts --online`, the guided /doctor default.
 - `tests/test_http_auth_clients.py`: both auth adapters, the retry policy, the rate limiter, redaction, the SIA
   probe and both path families, secrets v2/v1 pagination, per-account target sets, UAP filters, PVWA calls.
 - `tests/test_inputs.py` / `tests/test_config.py` / `tests/test_settings.py`: strict types and semantic validation,
@@ -718,7 +781,8 @@ table before the first bulk `apply`.
 |---|---|
 | New policy field or behaviour (e.g. domain ephemeral user) | `payloads.build_policy` (+ golden test), possibly a new `servers.csv` column in `inputs.py` |
 | Another way to derive a row's principal / account / target set | `inputs._resolve_principals` / `_resolve_strong_account` / `_resolve_target_set` — one function each, called from `_build_server_row` |
-| A new onboarding scope (e.g. target sets only, like `--accounts`) | `ParseContext`/`Inputs.accounts_only` (what a row needs), `Reconciler(accounts_only=)` and the stage list in `reconcile()`, the `RunResult.accounts_only` branches in `report.py`, `sia_onboard.check_accounts_flags`, the `scope` step in `terminal._workflow_steps`, a `help.py` topic |
+| A new onboarding scope (e.g. target sets only, like `--accounts`) | `ParseContext`/`Inputs.accounts_only` (what a row needs), `Reconciler(accounts_only=)` and the stage list in `reconcile()`, the `RunResult.accounts_only` branches in `report.py` (including the recovery actions in the diagnostics), `reconcile._finish_partial`, `sia_onboard.check_accounts_flags`, the `scope` step in `terminal._workflow_steps`, a `help.py` topic |
+| How a declared account gets its address (Vault address, password-file key) | `inputs._finish` (inference from the complete input, before wave slicing; `inline_inputs` resolves servers.csv rows to count usage), `Inputs.address_owners()` / `Inputs.shared_addresses()` (the addresses that key no password: several owners, or a templated domain account's AD domain), `sia_onboard.make_password_source` and `password_file_warnings`; keep inferred addresses out of the checkpoint context and fingerprint |
 | A new name-template placeholder | three places in step: `config.TEMPLATE_PLACEHOLDERS`, `inputs._render_name`, `payloads.render` |
 | Credentials from a secret store instead of `.env` | a `sia/ccp.py` sibling of `sia/pvwa.py`, called from `sia_onboard.resolve_client_secret` |
 | New strong-account option (e.g. ephemeral domain user settings) | `payloads.build_secret_payload` `secret_details`, `inputs.StrongAccountRow`, `config.StrongAccountTemplate` |

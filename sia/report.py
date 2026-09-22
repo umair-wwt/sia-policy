@@ -12,9 +12,9 @@ import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TextIO
+from typing import Callable, TextIO
 
-from .diagnostics import Diagnostic, render_diagnostic
+from .diagnostics import Diagnostic, for_accounts_scope, render_diagnostic
 from .reconcile import AccountResult, Outcome, RunResult, ServerResult
 from .redact import sanitize
 from .artifacts import ArtifactWriteError, write_artifacts
@@ -150,6 +150,8 @@ def result_diagnostics(result: RunResult) -> list[Diagnostic]:
         diagnostic = _diagnostic_from_outcome("policies", sr.policy_name, sr.policy)
         if diagnostic:
             found.append(diagnostic)
+    if result.accounts_only:   # --drift, --resume and a principal-less `sia plan` do not work for this run
+        found = [for_accounts_scope(diagnostic) for diagnostic in found]
     return found
 
 
@@ -174,14 +176,22 @@ def _noteworthy_account(ar: AccountResult) -> bool:
     return any(o.status not in _QUIET_STATUSES or o.notes for o in (ar.vault, ar.secret))
 
 
+def _capped(items: list, noteworthy: Callable[[object], bool], ok: Callable[[object], bool], max_rows: int) -> tuple[list, int, int]:
+    """The rows a capped table shows: all of them when they fit, else the noteworthy ones -- those needing attention
+    first, so a cap never hides a failure behind successes -- in their original order.
+
+    Returns (shown, noteworthy rows cut by the cap, rows with nothing to report)."""
+    if len(items) <= max_rows:
+        return items, 0, 0
+    notable = [item for item in items if noteworthy(item)]
+    keep = {id(item) for item in ([i for i in notable if not ok(i)] + [i for i in notable if ok(i)])[:max_rows]}
+    shown = [item for item in notable if id(item) in keep]
+    return shown, len(notable) - len(shown), len(items) - len(notable)
+
+
 def _print_account_table(result: RunResult, out: TextIO, max_rows: int) -> None:
     """The unit of an accounts-only run: one line per strong account, details under the table as for servers."""
-    accounts = result.accounts
-    hidden = 0
-    if len(accounts) > max_rows:
-        shown = [ar for ar in accounts if _noteworthy_account(ar)][:max_rows]
-        hidden = len(accounts) - len(shown)
-        accounts = shown
+    accounts, cut, hidden = _capped(result.accounts, _noteworthy_account, lambda ar: ar.ok, max_rows)
     rows = [(str(sanitize(ar.name)), ar.type, str(sanitize(ar.sia_name)), str(sanitize(ar.username)) or "-",
              str(sanitize(ar.address)) or "-", _cell(ar.vault), _cell(ar.secret)) for ar in accounts]
     widths = [max(len(h), *(len(r[i]) for r in rows)) if rows else len(h) for i, h in enumerate(ACCOUNT_HEADERS)]
@@ -189,6 +199,8 @@ def _print_account_table(result: RunResult, out: TextIO, max_rows: int) -> None:
     print(f"\nStrong accounts:\n  {line}\n  {'-' * len(line)}", file=out)
     for r in rows:
         print("  " + "  ".join(f"{c:<{w}}" for c, w in zip(r, widths, strict=True)), file=out)
+    if cut:
+        print(f"  ... {cut} more account(s) needing attention or with notes not shown (see the CSV report)", file=out)
     if hidden:
         print(f"  ... {hidden} account(s) with nothing to report not shown (see the CSV report)", file=out)
     details = []
@@ -235,12 +247,7 @@ def print_summary(result: RunResult, out: TextIO | None = None, *, max_rows: int
         _print_accounts("Vault accounts", result.vault, out, max_rows)
         _print_accounts("Strong accounts", result.secrets, out, max_rows)
     if result.servers:
-        servers = result.servers
-        hidden = 0
-        if len(servers) > max_rows:
-            shown = [sr for sr in servers if _noteworthy(sr)][:max_rows]
-            hidden = len(servers) - len(shown)
-            servers = shown
+        servers, cut, hidden = _capped(result.servers, _noteworthy, lambda sr: sr.ok, max_rows)
         headers = ("Server", "Strong account", "Policy", "Secret", "Target set", "Policy")
         rows = [(str(sanitize(sr.fqdn)), str(sanitize(sr.strong_account)), str(sanitize(sr.policy_name)),
                  _cell(sr.secret), _cell(sr.target_set), _cell(sr.policy))
@@ -250,6 +257,8 @@ def print_summary(result: RunResult, out: TextIO | None = None, *, max_rows: int
         print(f"\nServers:\n  {line}\n  {'-' * len(line)}", file=out)
         for r in rows:
             print("  " + "  ".join(f"{c:<{w}}" for c, w in zip(r, widths, strict=True)), file=out)
+        if cut:
+            print(f"  ... {cut} more row(s) needing attention or with notes not shown (see the CSV report)", file=out)
         if hidden:
             print(f"  ... {hidden} row(s) with nothing to report not shown (see the CSV report)", file=out)
         details = []
